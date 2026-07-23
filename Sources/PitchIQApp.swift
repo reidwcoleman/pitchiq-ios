@@ -65,6 +65,8 @@ struct MainTabs: View {
         TabView {
             SquadView()
                 .tabItem { Label("Optimal XV", systemImage: "sportscourt") }
+            PlannerView()
+                .tabItem { Label("Planner", systemImage: "point.topleft.down.curvedto.point.bottomright.up") }
             PlayersView()
                 .tabItem { Label("Players", systemImage: "list.number") }
             CaptainsView()

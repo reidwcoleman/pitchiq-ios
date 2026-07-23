@@ -9,6 +9,9 @@ final class AppState: ObservableObject {
     @Published var fixtures: [APIFixture] = []
     @Published var players: [Player] = []
     @Published var squad: SquadResult?
+    @Published var plan: SeasonPlan?
+
+    let planWindow = 6
 
     @Published var gwFrom = 1
     @Published var horizon = 3 { didSet { rebuild() } }
@@ -43,12 +46,17 @@ final class AppState: ObservableObject {
         let engine = ProjectionEngine(boot: boot, fixtures: fixtures, gwFrom: gwFrom, horizon: horizon)
         let budgetM = budget
         let fit = fitOnly
+        let gwFrom = gwFrom
+        let window = planWindow
         Task.detached(priority: .userInitiated) {
             let players = engine.buildPlayers()
             let squad = Optimizer.optimize(players: players, budgetM: budgetM, fitOnly: fit)
+            let plan = Planner.plan(players: players, budgetM: budgetM, fitOnly: fit,
+                                    from: gwFrom, window: window)
             await MainActor.run {
                 self.players = players
                 self.squad = squad
+                self.plan = plan
                 self.phase = .ready
             }
         }

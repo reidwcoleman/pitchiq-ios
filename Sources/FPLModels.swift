@@ -85,9 +85,19 @@ struct Player: Identifiable, Hashable {
     let flagged: Bool
     let mins: Int
     let fixtures: [FixtureInfo]
+    let projByGw: [Int: Double]   // per-GW projections across the planning window
 
     var price: String { String(format: "%.1f", Double(cost) / 10) }
     var posShort: String { Position(rawValue: pos)?.short ?? "?" }
+
+    /// Copy with a different headline projection — lets the optimizer and
+    /// best-XI picker run against GW-specific or transfer-weighted values.
+    func reprojected(_ v: Double) -> Player {
+        Player(id: id, name: name, pos: pos, team: team, teamShort: teamShort,
+               teamName: teamName, cost: cost, proj: v, perGw: perGw, ppg: ppg,
+               xgi90: xgi90, own: own, avail: avail, flagged: flagged, mins: mins,
+               fixtures: fixtures, projByGw: projByGw)
+    }
 
     static func == (l: Player, r: Player) -> Bool { l.id == r.id }
     func hash(into h: inout Hasher) { h.combine(id) }

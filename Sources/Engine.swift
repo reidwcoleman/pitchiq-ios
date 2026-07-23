@@ -110,8 +110,14 @@ struct ProjectionEngine {
                 return max(pts * avail, 0)
             }
 
+            // per-GW projections across the planning window (8 GWs) so the
+            // transfer planner can look ahead beyond the display horizon
+            var projByGw: [Int: Double] = [:]
+            for gw in gwFrom..<min(gwFrom + 8, 39) {
+                projByGw[gw] = teamFixtures(p.team, gw: gw).reduce(0) { $0 + perFixture($1) }
+            }
             let fxs = horizonFixtures(p.team)
-            let proj = fxs.reduce(0) { $0 + perFixture($1) }
+            let proj = (gwFrom..<min(gwFrom + horizon, 39)).reduce(0) { $0 + (projByGw[$1] ?? 0) }
             let t = teamById[p.team]
 
             return Player(
@@ -120,7 +126,8 @@ struct ProjectionEngine {
                 cost: p.now_cost, proj: proj, perGw: proj / Double(max(horizon, 1)),
                 ppg: ppg, xgi90: per90(p.expected_goal_involvements),
                 own: Double(p.selected_by_percent ?? "") ?? 0,
-                avail: avail, flagged: flagged, mins: p.minutes, fixtures: fxs
+                avail: avail, flagged: flagged, mins: p.minutes, fixtures: fxs,
+                projByGw: projByGw
             )
         }
         players.sort { $0.proj > $1.proj }
@@ -218,9 +225,9 @@ enum Optimizer {
                     guard !squad.contains(p), clubs[p.team, default: 0] < 3 else { continue }
                     let cost = squad.reduce(0) { $0 + $1.cost } + p.cost
                     needs[pos] -= 1
-                    let restMin = cheapestRest() - p.cost // p may be counted among cheapest remaining
+                    let restMin = cheapestRest()
                     needs[pos] += 1
-                    if cost + max(restMin, 0) <= budget {
+                    if cost + restMin <= budget {
                         squad.append(p)
                         clubs[p.team, default: 0] += 1
                         needs[pos] -= 1
