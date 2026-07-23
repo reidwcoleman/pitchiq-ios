@@ -1,0 +1,148 @@
+import SwiftUI
+
+@main
+struct PitchIQApp: App {
+    @StateObject private var state = AppState()
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environmentObject(state)
+                .preferredColorScheme(.dark)
+        }
+    }
+}
+
+struct ContentView: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        ZStack {
+            Theme.bg.ignoresSafeArea()
+            switch state.phase {
+            case .loading:
+                loadingView("Pulling live FPL data…")
+            case .error(let msg):
+                VStack(spacing: 16) {
+                    Text("⚠︎").font(.system(size: 40))
+                    Text(msg)
+                        .font(.system(size: 14))
+                        .foregroundColor(Theme.inkDim)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 40)
+                    Button("Retry") { Task { await state.load() } }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Theme.lime)
+                        .foregroundColor(.black)
+                }
+            default:
+                MainTabs()
+            }
+        }
+        .task { await state.load() }
+    }
+
+    func loadingView(_ msg: String) -> some View {
+        VStack(spacing: 18) {
+            ProgressView().tint(Theme.lime).scaleEffect(1.4)
+            Text(msg).font(.mono(13)).foregroundColor(Theme.inkDim)
+        }
+    }
+}
+
+struct MainTabs: View {
+    @EnvironmentObject var state: AppState
+
+    init() {
+        let appearance = UITabBarAppearance()
+        appearance.configureWithOpaqueBackground()
+        appearance.backgroundColor = UIColor(Theme.bg2)
+        UITabBar.appearance().standardAppearance = appearance
+        UITabBar.appearance().scrollEdgeAppearance = appearance
+    }
+
+    var body: some View {
+        TabView {
+            SquadView()
+                .tabItem { Label("Optimal XV", systemImage: "sportscourt") }
+            PlayersView()
+                .tabItem { Label("Players", systemImage: "list.number") }
+            CaptainsView()
+                .tabItem { Label("Captaincy", systemImage: "crown") }
+            FixturesView()
+                .tabItem { Label("Fixtures", systemImage: "calendar") }
+        }
+        .tint(Theme.lime)
+    }
+}
+
+// MARK: - shared header controls
+
+struct ControlsBar: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 0) {
+                        Text("PITCH").font(.system(size: 22, weight: .black))
+                        Text("IQ").font(.system(size: 22, weight: .black)).foregroundColor(Theme.lime)
+                    }
+                    Text(state.isPreseason ? "2026/27 · PRE-SEASON" : "2026/27 · LIVE")
+                        .font(.label(9)).tracking(2).foregroundColor(Theme.inkDim)
+                }
+                Spacer()
+                Button {
+                    state.rebuild()
+                } label: {
+                    Label("Rebuild", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 14).padding(.vertical, 9)
+                        .background(Theme.lime)
+                        .clipShape(Capsule())
+                }
+            }
+            HStack(spacing: 8) {
+                Menu {
+                    ForEach(state.gwOptions, id: \.id) { e in
+                        Button("GW \(e.id)\(e.is_next ? " (next)" : "")") {
+                            state.gwFrom = e.id
+                            state.rebuild()
+                        }
+                    }
+                } label: {
+                    chip("GW \(state.gwFrom)", icon: "chevron.down")
+                }
+                Menu {
+                    Button("This GW only") { state.horizon = 1 }
+                    Button("Next 3 GWs") { state.horizon = 3 }
+                    Button("Next 6 GWs") { state.horizon = 6 }
+                } label: {
+                    chip(state.horizon == 1 ? "1 GW" : "Next \(state.horizon)", icon: "chevron.down")
+                }
+                Button { state.fitOnly.toggle() } label: {
+                    chip(state.fitOnly ? "Fit only ✓" : "All players", icon: nil,
+                         color: state.fitOnly ? Theme.lime : Theme.inkDim)
+                }
+                Spacer()
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
+        .padding(.bottom, 10)
+    }
+
+    func chip(_ text: String, icon: String?, color: Color = Theme.ink) -> some View {
+        HStack(spacing: 5) {
+            Text(text).font(.mono(12))
+            if let icon { Image(systemName: icon).font(.system(size: 9, weight: .bold)) }
+        }
+        .foregroundColor(color)
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(Theme.panel)
+        .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
+        .clipShape(Capsule())
+    }
+}
