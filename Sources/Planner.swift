@@ -69,7 +69,7 @@ enum Planner {
 
         let pool = Optimizer.candidatePool(players, fitOnly: fitOnly)
         var bank = Int((budgetM * 10).rounded()) - squad.reduce(0) { $0 + $1.cost }
-        var fts = 1
+        var fts = 0 // opening squad isn't a transfer; the first FT arrives next GW
         var plans: [GWPlan] = []
         var totalPts = 0.0, totalTransfers = 0, totalHits = 0
 
@@ -79,7 +79,7 @@ enum Planner {
 
             if g > from {
                 fts = min(fts + 1, 5)
-                while moves.count < 2 {
+                while moves.count < 3 {
                     guard let best = bestTransfer(squad: squad, pool: pool, bank: bank,
                                                   from: g, to: end) else { break }
                     let isFree = fts > 0
