@@ -28,6 +28,24 @@ struct ProjectionEngine {
     let fixtures: [APIFixture]
     let gwFrom: Int
     let horizon: Int
+    private let teamGwFixtures: [Int: [Int: [FixtureInfo]]]
+
+    init(boot: Bootstrap, fixtures: [APIFixture], gwFrom: Int, horizon: Int) {
+        self.boot = boot
+        self.fixtures = fixtures
+        self.gwFrom = gwFrom
+        self.horizon = horizon
+        // precompute team → gw → fixtures once; projByGw spans the whole season
+        var map: [Int: [Int: [FixtureInfo]]] = [:]
+        for f in fixtures {
+            guard let gw = f.event else { continue }
+            map[f.team_h, default: [:]][gw, default: []]
+                .append(FixtureInfo(opp: f.team_a, home: true, diff: f.team_h_difficulty ?? 3))
+            map[f.team_a, default: [:]][gw, default: []]
+                .append(FixtureInfo(opp: f.team_h, home: false, diff: f.team_a_difficulty ?? 3))
+        }
+        self.teamGwFixtures = map
+    }
 
     private static let goalPts = [0, 10, 6, 5, 4]
     private static let csPts = [0.0, 4, 4, 1, 0]
@@ -36,12 +54,7 @@ struct ProjectionEngine {
     private static let histMult = [2: 1.14, 3: 1.0, 4: 0.9, 5: 0.79]
 
     func teamFixtures(_ teamId: Int, gw: Int) -> [FixtureInfo] {
-        fixtures.compactMap { f in
-            guard f.event == gw else { return nil }
-            if f.team_h == teamId { return FixtureInfo(opp: f.team_a, home: true, diff: f.team_h_difficulty ?? 3) }
-            if f.team_a == teamId { return FixtureInfo(opp: f.team_h, home: false, diff: f.team_a_difficulty ?? 3) }
-            return nil
-        }
+        teamGwFixtures[teamId]?[gw] ?? []
     }
 
     func horizonFixtures(_ teamId: Int) -> [FixtureInfo] {
@@ -110,10 +123,10 @@ struct ProjectionEngine {
                 return max(pts * avail, 0)
             }
 
-            // per-GW projections across the planning window (8 GWs) so the
-            // transfer planner can look ahead beyond the display horizon
+            // per-GW projections for every remaining gameweek of the season,
+            // so the planner can see all the way to GW 38
             var projByGw: [Int: Double] = [:]
-            for gw in gwFrom..<min(gwFrom + 8, 39) {
+            for gw in gwFrom...38 {
                 projByGw[gw] = teamFixtures(p.team, gw: gw).reduce(0) { $0 + perFixture($1) }
             }
             let fxs = horizonFixtures(p.team)

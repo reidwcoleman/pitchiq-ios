@@ -37,9 +37,18 @@ struct SeasonPlan {
 }
 
 enum Planner {
-    static let freeGainThreshold = 0.5   // free transfers are free — use one whenever it gains real points
     static let hitGainThreshold = 6.0    // pts to justify a -4 hit (4 + margin)
     static let decay = 0.88
+
+    /// The bar for spending a free transfer drops as they pile up — banking
+    /// past ~3 wastes them (they cap at 5), and replacing an injured player
+    /// is always worth any positive gain.
+    static func freeThreshold(ftsBanked: Int, outInjured: Bool) -> Double {
+        if outInjured { return 0.0 }
+        if ftsBanked >= 5 { return 0.1 }
+        if ftsBanked >= 3 { return 0.25 }
+        return 0.5
+    }
 
     static func weightedValue(_ p: Player, from gw: Int, to end: Int) -> Double {
         var v = 0.0, w = 1.0
@@ -89,11 +98,14 @@ enum Planner {
 
             if g > from { fts = min(fts + 1, 5) }
             if g > from || fromUserSquad {
-                while moves.count < 2 { // FPL habit + user rule: max 2 moves per GW
+                while moves.count < 2 { // max 2 moves per GW
                     guard let best = bestTransfer(squad: squad, pool: pool, bank: bank,
                                                   from: g, to: end) else { break }
                     let isFree = fts > 0
-                    let threshold = isFree ? freeGainThreshold : hitGainThreshold
+                    let outInjured = best.out.flagged || best.out.avail < 0.75
+                    let threshold = isFree
+                        ? freeThreshold(ftsBanked: fts, outInjured: outInjured)
+                        : (outInjured ? 4.5 : hitGainThreshold)
                     guard best.gain >= threshold else { break }
                     let idx = squad.firstIndex(of: best.out)!
                     squad[idx] = best.inn
@@ -130,16 +142,24 @@ enum Planner {
         let squadIds = Set(squad.map(\.id))
 
         var best: (out: Player, inn: Player, gain: Double)?
+        var bestInjured: (out: Player, inn: Player, gain: Double)?
         for out in squad {
             let outValue = weightedValue(out, from: g, to: end)
+            let outInjured = out.flagged || out.avail < 0.75
             for inn in pool where inn.pos == out.pos && !squadIds.contains(inn.id) {
                 guard inn.cost <= out.cost + bank else { continue }
                 let clubCount = clubs[inn.team, default: 0] - (inn.team == out.team ? 1 : 0)
                 guard clubCount < 3 else { continue }
                 let gain = weightedValue(inn, from: g, to: end) - outValue
                 if best == nil || gain > best!.gain { best = (out, inn, gain) }
+                if outInjured, bestInjured == nil || gain > bestInjured!.gain {
+                    bestInjured = (out, inn, gain)
+                }
             }
         }
+        // an injured/doubtful player is dead weight — replacing them takes
+        // priority over marginal upgrades elsewhere
+        if let inj = bestInjured, inj.gain > 0 { return inj }
         return best
     }
 }

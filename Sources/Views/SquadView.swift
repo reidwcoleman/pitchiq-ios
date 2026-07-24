@@ -25,7 +25,7 @@ struct SquadView: View {
                 if case .optimizing = state.phase {
                     VStack(spacing: 14) {
                         ProgressView().tint(Theme.lime)
-                        Text("Scoring 500+ players & planning \(state.planWindow) gameweeks…")
+                        Text("Scoring 500+ players & planning through GW 38…")
                             .font(.mono(12)).foregroundColor(Theme.inkDim)
                     }
                     .frame(maxWidth: .infinity, minHeight: 300)
@@ -180,6 +180,10 @@ struct TransfersCard: View {
             } else {
                 ForEach(gwPlan.transfers) { t in
                     HStack(spacing: 7) {
+                        if t.out.flagged {
+                            Image(systemName: "cross.case.fill")
+                                .font(.system(size: 10)).foregroundColor(Theme.red)
+                        }
                         Text(t.out.name)
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundColor(Theme.inkDim).strikethrough()
@@ -239,15 +243,19 @@ struct WhyCard: View {
         }
 
         for t in gwPlan.transfers {
-            out.append("\(t.out.name) → \(t.inn.name): +\(String(format: "%.1f", t.gain)) projected pts over the remaining weeks (\(t.paid ? "worth the -4 hit" : "free transfer")). \(t.inn.name)'s run: \(fixtureDesc(t.inn, gw: gwPlan.gw)).")
+            let injuredNote = t.out.flagged ? " \(t.out.name) is flagged (injured/doubtful/suspended), so moving them out takes priority." : ""
+            out.append("\(t.out.name) → \(t.inn.name): +\(String(format: "%.1f", t.gain)) projected pts over the remaining weeks (\(t.paid ? "worth the -4 hit" : "free transfer")).\(injuredNote) \(t.inn.name)'s run: \(fixtureDesc(t.inn, gw: gwPlan.gw)).")
         }
         if gwPlan.transfers.isEmpty && !isFirst {
-            out.append("No move gains enough to beat holding — the free transfer banks instead (\(gwPlan.ftsLeft) saved, max 5, max 2 moves a week).")
+            out.append("No move gains enough to beat holding this week, so the free transfer banks (\(gwPlan.ftsLeft) saved). The bar to spend one drops as they stack up — they never sit wasted at the cap of 5.")
         }
         if isFirst {
             out.append(fromUser
                 ? "This is your team — the plan works from it and only suggests changes that clearly add points."
-                : "This 15 was chosen to score now AND stay strong for all \(state.planWindow) weeks, so you barely need transfers.")
+                : "This 15 was chosen to score now AND stay strong for the whole season — near gameweeks count most, but every remaining fixture through GW 38 is weighed in.")
+        }
+        if gwPlan.xi.contains(where: { $0.flagged }) || gwPlan.bench.contains(where: { $0.flagged }) {
+            out.append("Flagged players in the squad are projected near zero, benched automatically, and prioritised for transfer as soon as a replacement is affordable.")
         }
 
         out.append(state.isPreseason

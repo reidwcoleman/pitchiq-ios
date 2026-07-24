@@ -20,7 +20,8 @@ final class AppState: ObservableObject {
     /// The user's own 15 (player ids) after editing the AI squad. Persisted.
     @Published var customSquadIds: [Int]?
 
-    let planWindow = 6
+    /// Plan every remaining gameweek of the season (through GW 38).
+    var planWindow: Int { max(38 - gwFrom + 1, 1) }
     private static let customKey = "customSquadIds"
 
     var teams: [Int: FPLTeam] = [:]
