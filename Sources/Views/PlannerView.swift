@@ -17,12 +17,16 @@ struct PlannerView: View {
                 } else if let plan = state.plan {
                     PlanSummary(plan: plan)
                         .padding(.horizontal, 14)
-                    Text("The opening squad is picked to stay strong across all \(plan.gws.count) gameweeks, so it needs few transfers. Free transfers roll over (max 5); a hit (-4) is only planned when the gain clearly beats it.")
+                    Text(plan.fromUserSquad
+                        ? "Planning from YOUR team. 1 free transfer per gameweek (bankable to 5), max 2 moves a week; a hit (-4) is only planned when the gain clearly beats it. Fixture difficulty of every opponent is baked into each projection."
+                        : "The opening squad is picked to stay strong across all \(plan.gws.count) gameweeks, so it needs few transfers. 1 free transfer per gameweek (bankable to 5), max 2 moves a week; a hit (-4) only when the gain clearly beats it.")
                         .font(.system(size: 12)).foregroundColor(Theme.inkDim)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.horizontal, 18)
                     ForEach(plan.gws) { gp in
-                        GWPlanCard(gwPlan: gp, isFirst: gp.gw == plan.gws.first?.gw)
+                        GWPlanCard(gwPlan: gp,
+                                   isFirst: gp.gw == plan.gws.first?.gw,
+                                   fromUser: plan.fromUserSquad)
                             .padding(.horizontal, 14)
                     }
                 } else {
@@ -63,6 +67,7 @@ struct GWPlanCard: View {
     @EnvironmentObject var state: AppState
     let gwPlan: GWPlan
     let isFirst: Bool
+    var fromUser = false
     @State private var expanded = false
 
     var body: some View {
@@ -88,8 +93,11 @@ struct GWPlanCard: View {
                     .font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
             }
 
-            if isFirst {
+            if isFirst && !fromUser {
                 Label("Opening squad — built for the whole run", systemImage: "flag.fill")
+                    .font(.system(size: 11.5, weight: .semibold)).foregroundColor(Theme.cyan)
+            } else if isFirst && fromUser && gwPlan.transfers.isEmpty {
+                Label("Your team — no transfer needed this week", systemImage: "person.fill.checkmark")
                     .font(.system(size: 11.5, weight: .semibold)).foregroundColor(Theme.cyan)
             } else if gwPlan.transfers.isEmpty {
                 Label("No transfers — roll the free transfer", systemImage: "arrow.uturn.right")

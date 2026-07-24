@@ -15,6 +15,7 @@ struct PitchIQApp: App {
 
 struct ContentView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
@@ -40,6 +41,11 @@ struct ContentView: View {
             }
         }
         .task { await state.load() }
+        // refetch live data when the app comes back to the foreground, so
+        // played gameweeks (form, points, injuries, next GW) flow in automatically
+        .onChange(of: scenePhase) { p in
+            if p == .active { state.refreshIfStale() }
+        }
     }
 
     func loadingView(_ msg: String) -> some View {
@@ -93,6 +99,10 @@ struct ControlsBar: View {
                     }
                     Text(state.isPreseason ? "2026/27 · PRE-SEASON" : "2026/27 · LIVE")
                         .font(.label(9)).tracking(2).foregroundColor(Theme.inkDim)
+                    if let updated = state.lastUpdated {
+                        Text("Updated \(updated.formatted(date: .omitted, time: .shortened)) · auto-refreshes after gameweeks")
+                            .font(.label(8)).foregroundColor(Theme.inkDim.opacity(0.8))
+                    }
                 }
                 Spacer()
                 Button {

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SquadView: View {
     @EnvironmentObject var state: AppState
+    @State private var swapTarget: Player?
 
     var body: some View {
         ScrollView {
@@ -15,9 +16,28 @@ struct SquadView: View {
                     }
                     .frame(maxWidth: .infinity, minHeight: 300)
                 } else if let r = state.squad {
-                    PitchGrid(result: r)
+                    HStack(spacing: 8) {
+                        Text(state.isEdited ? "YOUR TEAM · EDITED" : "AI PICK · TAP A PLAYER TO SWAP")
+                            .font(.label(9)).tracking(1.5)
+                            .foregroundColor(state.isEdited ? Theme.cyan : Theme.inkDim)
+                        Spacer()
+                        if state.isEdited {
+                            Button {
+                                state.resetToAI()
+                            } label: {
+                                Text("Reset to AI")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(Theme.lime)
+                                    .padding(.horizontal, 10).padding(.vertical, 5)
+                                    .background(Theme.lime.opacity(0.12))
+                                    .clipShape(Capsule())
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                    PitchGrid(result: r) { swapTarget = $0 }
                         .padding(.horizontal, 14)
-                    BenchRow(bench: r.bench)
+                    BenchRow(bench: r.bench) { swapTarget = $0 }
                         .padding(.horizontal, 14)
                     StatTiles(result: r, budget: state.budget)
                         .padding(.horizontal, 14)
@@ -32,11 +52,15 @@ struct SquadView: View {
             .padding(.bottom, 24)
         }
         .background(Theme.bg)
+        .sheet(item: $swapTarget) { out in
+            SwapSheet(out: out)
+        }
     }
 }
 
 struct PitchGrid: View {
     let result: SquadResult
+    var onTap: (Player) -> Void = { _ in }
 
     var rows: [[Player]] {
         (1...4).map { pos in result.xi.filter { $0.pos == pos } }
@@ -50,6 +74,7 @@ struct PitchGrid: View {
                         PlayerCard(player: p,
                                    isCaptain: p.id == result.captain.id,
                                    isVice: p.id == result.vice.id)
+                            .onTapGesture { onTap(p) }
                     }
                 }
             }
@@ -144,12 +169,16 @@ struct ShirtShape: Shape {
 
 struct BenchRow: View {
     let bench: [Player]
+    var onTap: (Player) -> Void = { _ in }
 
     var body: some View {
         VStack(spacing: 8) {
             Text("BENCH").font(.label(9)).tracking(3).foregroundColor(Theme.inkDim)
             HStack(spacing: 10) {
-                ForEach(bench) { p in PlayerCard(player: p, compact: true) }
+                ForEach(bench) { p in
+                    PlayerCard(player: p, compact: true)
+                        .onTapGesture { onTap(p) }
+                }
             }
         }
         .frame(maxWidth: .infinity)
@@ -186,6 +215,97 @@ struct StatTiles: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
         .panel()
+    }
+}
+
+struct SwapSheet: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    let out: Player
+    @State private var search = ""
+
+    var candidates: [Player] {
+        var list = state.swapCandidates(for: out)
+        if !search.isEmpty {
+            let q = search.lowercased()
+            list = list.filter { $0.name.lowercased().contains(q) || $0.teamShort.lowercased().contains(q) }
+        }
+        return Array(list.prefix(60))
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    Text("OUT").font(.mono(9, .bold)).foregroundColor(Theme.red)
+                    Text("\(out.name) · \(out.teamShort) · £\(out.price)")
+                        .font(.system(size: 14, weight: .heavy)).foregroundColor(Theme.ink)
+                    Spacer()
+                    Text(String(format: "%.1f pts", out.proj))
+                        .font(.mono(12, .bold)).foregroundColor(Theme.inkDim)
+                }
+                .padding(.horizontal, 16)
+
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundColor(Theme.inkDim)
+                    TextField("Search replacements", text: $search)
+                        .font(.system(size: 14)).foregroundColor(Theme.ink)
+                        .autocorrectionDisabled()
+                }
+                .padding(.horizontal, 12).padding(.vertical, 9)
+                .background(Theme.panel)
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
+                .padding(.horizontal, 16)
+
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(candidates) { p in
+                            Button {
+                                state.applySwap(out: out, inn: p)
+                                dismiss()
+                            } label: {
+                                HStack(spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack(spacing: 6) {
+                                            Text(p.name).font(.system(size: 14, weight: .heavy)).foregroundColor(Theme.ink)
+                                            if p.flagged {
+                                                Image(systemName: "exclamationmark.triangle.fill")
+                                                    .font(.system(size: 9)).foregroundColor(Theme.amber)
+                                            }
+                                        }
+                                        Text("\(p.teamShort) · £\(p.price) · PPG \(String(format: "%.1f", p.ppg))")
+                                            .font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
+                                    }
+                                    Spacer()
+                                    let d = p.proj - out.proj
+                                    Text(String(format: "%@%.1f", d >= 0 ? "+" : "", d))
+                                        .font(.mono(13, .bold))
+                                        .foregroundColor(d >= 0 ? Theme.green : Theme.red)
+                                    Text(String(format: "%.1f", p.proj))
+                                        .font(.mono(14, .bold)).foregroundColor(Theme.lime)
+                                        .frame(width: 44, alignment: .trailing)
+                                }
+                                .padding(.horizontal, 14).padding(.vertical, 10)
+                                .panel()
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+                }
+            }
+            .padding(.top, 14)
+            .background(Theme.bg)
+            .navigationTitle("Swap player")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }.tint(Theme.lime)
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }
 

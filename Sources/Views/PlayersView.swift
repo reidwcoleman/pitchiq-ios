@@ -5,6 +5,13 @@ struct PlayersView: View {
     @State private var search = ""
     @State private var posFilter = 0
     @State private var maxPrice = 15.5
+    @State private var sortMode: SortMode = .proj
+
+    enum SortMode: String, CaseIterable {
+        case proj = "Projected pts"
+        case ppg = "PPG last season"
+        case price = "Price (low → high)"
+    }
 
     var filtered: [Player] {
         var list = state.players.filter { Double($0.cost) / 10 <= maxPrice }
@@ -15,6 +22,11 @@ struct PlayersView: View {
                 $0.name.lowercased().contains(q) || $0.teamShort.lowercased().contains(q)
                     || $0.teamName.lowercased().contains(q)
             }
+        }
+        switch sortMode {
+        case .proj: list.sort { $0.proj > $1.proj }
+        case .ppg: list.sort { $0.ppg != $1.ppg ? $0.ppg > $1.ppg : $0.proj > $1.proj }
+        case .price: list.sort { $0.cost != $1.cost ? $0.cost < $1.cost : $0.proj > $1.proj }
         }
         return Array(list.prefix(100))
     }
@@ -45,6 +57,28 @@ struct PlayersView: View {
                 }
                 .pickerStyle(.menu)
                 .tint(Theme.lime)
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 6)
+
+            HStack {
+                Menu {
+                    ForEach(SortMode.allCases, id: \.self) { m in
+                        Button(m.rawValue) { sortMode = m }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.up.arrow.down").font(.system(size: 9, weight: .bold))
+                        Text("Sort: \(sortMode.rawValue)").font(.mono(11))
+                        Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
+                    }
+                    .foregroundColor(Theme.cyan)
+                    .padding(.horizontal, 11).padding(.vertical, 7)
+                    .background(Theme.panel)
+                    .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
+                    .clipShape(Capsule())
+                }
+                Spacer()
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 10)
@@ -96,7 +130,7 @@ struct PlayerRow: View {
                         .padding(.horizontal, 6).padding(.vertical, 2)
                         .background(posColor.opacity(0.13))
                         .clipShape(RoundedRectangle(cornerRadius: 5))
-                    Text("\(player.teamShort) · £\(player.price) · \(String(format: "%.1f", player.own))% owned")
+                    Text("\(player.teamShort) · £\(player.price) · PPG \(String(format: "%.1f", player.ppg)) · \(String(format: "%.1f", player.own))% owned")
                         .font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
                 }
                 FixtureChips(fixtures: Array(player.fixtures.prefix(4)))

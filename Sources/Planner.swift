@@ -33,6 +33,7 @@ struct SeasonPlan {
     let totalPts: Double
     let totalTransfers: Int
     let totalHits: Int
+    let fromUserSquad: Bool
 }
 
 enum Planner {
@@ -52,24 +53,33 @@ enum Planner {
     }
 
     static func plan(players: [Player], budgetM: Double, fitOnly: Bool,
-                     from: Int, window: Int) -> SeasonPlan? {
+                     from: Int, window: Int, userSquad: [Player]? = nil) -> SeasonPlan? {
         let end = min(from + window - 1, 38)
         guard end >= from else { return nil }
 
-        // opening squad: optimize on weighted whole-window value
-        let scored = players
-            .map { $0.reprojected(weightedValue($0, from: from, to: end)) }
-            .sorted { $0.proj > $1.proj }
-        guard let opening = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly)
-        else { return nil }
-
-        let byId = Dictionary(uniqueKeysWithValues: players.map { ($0.id, $0) })
-        var squad = opening.squad.compactMap { byId[$0.id] }
+        var squad: [Player]
+        var fts: Int
+        if let user = userSquad, user.count == 15 {
+            // plan starts from the user's own team: they hold 1 FT for the
+            // coming deadline, and transfers are considered from the first GW
+            squad = user
+            fts = 1
+        } else {
+            // opening squad: optimize on weighted whole-window value
+            let scored = players
+                .map { $0.reprojected(weightedValue($0, from: from, to: end)) }
+                .sorted { $0.proj > $1.proj }
+            guard let opening = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly)
+            else { return nil }
+            let byId = Dictionary(uniqueKeysWithValues: players.map { ($0.id, $0) })
+            squad = opening.squad.compactMap { byId[$0.id] }
+            fts = 0 // opening squad isn't a transfer; the first FT arrives next GW
+        }
         guard squad.count == 15 else { return nil }
+        let fromUserSquad = userSquad != nil
 
         let pool = Optimizer.candidatePool(players, fitOnly: fitOnly)
-        var bank = Int((budgetM * 10).rounded()) - squad.reduce(0) { $0 + $1.cost }
-        var fts = 0 // opening squad isn't a transfer; the first FT arrives next GW
+        var bank = max(Int((budgetM * 10).rounded()) - squad.reduce(0) { $0 + $1.cost }, 0)
         var plans: [GWPlan] = []
         var totalPts = 0.0, totalTransfers = 0, totalHits = 0
 
@@ -77,9 +87,9 @@ enum Planner {
             var moves: [TransferMove] = []
             var hitPts = 0
 
-            if g > from {
-                fts = min(fts + 1, 5)
-                while moves.count < 3 {
+            if g > from { fts = min(fts + 1, 5) }
+            if g > from || fromUserSquad {
+                while moves.count < 2 { // FPL habit + user rule: max 2 moves per GW
                     guard let best = bestTransfer(squad: squad, pool: pool, bank: bank,
                                                   from: g, to: end) else { break }
                     let isFree = fts > 0
@@ -108,7 +118,8 @@ enum Planner {
         }
 
         return SeasonPlan(gws: plans, totalPts: totalPts,
-                          totalTransfers: totalTransfers, totalHits: totalHits)
+                          totalTransfers: totalTransfers, totalHits: totalHits,
+                          fromUserSquad: fromUserSquad)
     }
 
     private static func bestTransfer(squad: [Player], pool: [Player], bank: Int,
