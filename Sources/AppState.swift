@@ -80,6 +80,7 @@ final class AppState: ObservableObject {
         let gwFrom = gwFrom
         let window = planWindow
         let customIds = customSquadIds
+        let dgws = doubleGws
         Task.detached(priority: .userInitiated) {
             let players = engine.buildPlayers()
             var squad: SquadResult?
@@ -102,7 +103,7 @@ final class AppState: ObservableObject {
             }
             let plan = Planner.plan(players: players, budgetM: budgetM, fitOnly: fit,
                                     from: gwFrom, window: window, userSquad: userSquad,
-                                    chipsMeta: chipsMeta, doubleGws: doubleGws)
+                                    chipsMeta: chipsMeta, doubleGws: dgws)
             await MainActor.run {
                 if staleCustom {
                     self.customSquadIds = nil
