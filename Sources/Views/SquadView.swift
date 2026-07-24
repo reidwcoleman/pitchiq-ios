@@ -1,8 +1,19 @@
 import SwiftUI
 
+enum SquadSheet: Identifiable {
+    case detail(Player)
+    case swap(Player)
+    var id: Int {
+        switch self {
+        case .detail(let p): return p.id
+        case .swap(let p): return -p.id
+        }
+    }
+}
+
 struct SquadView: View {
     @EnvironmentObject var state: AppState
-    @State private var swapTarget: Player?
+    @State private var sheet: SquadSheet?
 
     var body: some View {
         ScrollView {
@@ -17,7 +28,7 @@ struct SquadView: View {
                     .frame(maxWidth: .infinity, minHeight: 300)
                 } else if let r = state.squad {
                     HStack(spacing: 8) {
-                        Text(state.isEdited ? "YOUR TEAM · EDITED" : "AI PICK · TAP A PLAYER TO SWAP")
+                        Text(state.isEdited ? "YOUR TEAM · GW \(state.gwFrom) POINTS" : "AI PICK · GW \(state.gwFrom) POINTS · TAP A PLAYER")
                             .font(.label(9)).tracking(1.5)
                             .foregroundColor(state.isEdited ? Theme.cyan : Theme.inkDim)
                         Spacer()
@@ -35,11 +46,11 @@ struct SquadView: View {
                         }
                     }
                     .padding(.horizontal, 18)
-                    PitchGrid(result: r) { swapTarget = $0 }
+                    PitchGrid(result: r) { sheet = .detail($0) }
                         .padding(.horizontal, 14)
-                    BenchRow(bench: r.bench) { swapTarget = $0 }
+                    BenchRow(bench: r.bench) { sheet = .detail($0) }
                         .padding(.horizontal, 14)
-                    StatTiles(result: r, budget: state.budget)
+                    StatTiles(result: r, budget: state.budget, gw: state.gwFrom)
                         .padding(.horizontal, 14)
                     ModelNotes(result: r)
                         .padding(.horizontal, 14)
@@ -52,8 +63,16 @@ struct SquadView: View {
             .padding(.bottom, 24)
         }
         .background(Theme.bg)
-        .sheet(item: $swapTarget) { out in
-            SwapSheet(out: out)
+        .sheet(item: $sheet) { s in
+            switch s {
+            case .detail(let p):
+                PlayerDetailSheet(player: p, canSwap: true) { out in
+                    // detail sheet dismisses itself first; re-present as swap
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { sheet = .swap(out) }
+                }
+            case .swap(let p):
+                SwapSheet(out: p)
+            }
         }
     }
 }
@@ -195,12 +214,13 @@ struct BenchRow: View {
 struct StatTiles: View {
     let result: SquadResult
     let budget: Double
+    var gw = 0
 
     var body: some View {
         let xiPts = result.total + result.captain.proj
         let bank = budget * 10 - Double(result.cost)
         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-            tile(String(format: "%.1f", xiPts), "PROJ. XI PTS (C×2)", Theme.lime)
+            tile(String(format: "%.1f", xiPts), "GW \(gw) XI PTS (C×2)", Theme.lime)
             tile(result.formation, "FORMATION", Theme.cyan)
             tile("£\(String(format: "%.1f", Double(result.cost) / 10))m", "SQUAD COST", Theme.lime)
             tile("£\(String(format: "%.1f", bank / 10))m", "IN THE BANK", Theme.cyan)
@@ -241,7 +261,7 @@ struct SwapSheet: View {
                     Text("\(out.name) · \(out.teamShort) · £\(out.price)")
                         .font(.system(size: 14, weight: .heavy)).foregroundColor(Theme.ink)
                     Spacer()
-                    Text(String(format: "%.1f pts", out.proj))
+                    Text(String(format: "GW%d: %.1f pts", state.gwFrom, out.proj))
                         .font(.mono(12, .bold)).foregroundColor(Theme.inkDim)
                 }
                 .padding(.horizontal, 16)
@@ -274,15 +294,16 @@ struct SwapSheet: View {
                                                     .font(.system(size: 9)).foregroundColor(Theme.amber)
                                             }
                                         }
-                                        Text("\(p.teamShort) · £\(p.price) · PPG \(String(format: "%.1f", p.ppg))")
+                                        Text("\(p.teamShort) · £\(p.price) · PPG \(String(format: "%.1f", p.ppg)) · next \(state.horizon): \(String(format: "%.1f", p.proj))")
                                             .font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
                                     }
                                     Spacer()
-                                    let d = p.proj - out.proj
+                                    let gwV = p.projByGw[state.gwFrom] ?? 0
+                                    let d = gwV - out.proj
                                     Text(String(format: "%@%.1f", d >= 0 ? "+" : "", d))
                                         .font(.mono(13, .bold))
                                         .foregroundColor(d >= 0 ? Theme.green : Theme.red)
-                                    Text(String(format: "%.1f", p.proj))
+                                    Text(String(format: "%.1f", gwV))
                                         .font(.mono(14, .bold)).foregroundColor(Theme.lime)
                                         .frame(width: 44, alignment: .trailing)
                                 }
@@ -318,7 +339,8 @@ struct ModelNotes: View {
         let range = state.horizon > 1 ? "GW \(state.gwFrom)–\(gwEnd)" : "GW \(state.gwFrom)"
         let excluded = state.players.filter(\.flagged).count
         return [
-            "Projections cover \(range), summed per real fixture (doubles boost, blanks zero).",
+            "Points shown are for GW \(state.gwFrom) only — change the gameweek at the top to see any other week. Squad selection still looks across \(range).",
+            "Tap any player for full stats, every upcoming fixture, and the swap option.",
             "Captain: \(result.captain.name) — highest projection in the XI. Vice: \(result.vice.name).",
             state.isPreseason
                 ? "Pre-season mode: model leans on 2025/26 xG/xA, minutes and PPG; new signings & promoted clubs lean on FPL's expected-points feed."

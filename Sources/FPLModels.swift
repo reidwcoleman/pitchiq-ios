@@ -45,6 +45,8 @@ struct FPLElement: Decodable {
     let selected_by_percent: String?
     let status: String
     let chance_of_playing_next_round: Int?
+    let clean_sheets: Int?
+    let news: String?
 }
 
 struct APIFixture: Decodable {
@@ -87,6 +89,19 @@ struct Player: Identifiable, Hashable {
     let fixtures: [FixtureInfo]
     let projByGw: [Int: Double]   // per-GW projections across the planning window
 
+    // last-season detail stats (for the player card)
+    let totalPoints: Int
+    let goals: Int
+    let assists: Int
+    let cleanSheets: Int
+    let bonus: Int
+    let saves: Int
+    let starts: Int
+    let form: Double
+    let xg: Double
+    let xa: Double
+    let news: String
+
     var price: String { String(format: "%.1f", Double(cost) / 10) }
     var posShort: String { Position(rawValue: pos)?.short ?? "?" }
 
@@ -96,7 +111,10 @@ struct Player: Identifiable, Hashable {
         Player(id: id, name: name, pos: pos, team: team, teamShort: teamShort,
                teamName: teamName, cost: cost, proj: v, perGw: perGw, ppg: ppg,
                xgi90: xgi90, own: own, avail: avail, flagged: flagged, mins: mins,
-               fixtures: fixtures, projByGw: projByGw)
+               fixtures: fixtures, projByGw: projByGw,
+               totalPoints: totalPoints, goals: goals, assists: assists,
+               cleanSheets: cleanSheets, bonus: bonus, saves: saves, starts: starts,
+               form: form, xg: xg, xa: xa, news: news)
     }
 
     static func == (l: Player, r: Player) -> Bool { l.id == r.id }

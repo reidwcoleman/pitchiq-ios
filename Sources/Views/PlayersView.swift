@@ -6,6 +6,7 @@ struct PlayersView: View {
     @State private var posFilter = 0
     @State private var maxPrice = 15.5
     @State private var sortMode: SortMode = .proj
+    @State private var detail: Player?
 
     enum SortMode: String, CaseIterable {
         case proj = "Projected pts"
@@ -87,6 +88,7 @@ struct PlayersView: View {
                 LazyVStack(spacing: 8) {
                     ForEach(Array(filtered.enumerated()), id: \.element.id) { i, p in
                         PlayerRow(rank: i + 1, player: p)
+                            .onTapGesture { detail = p }
                     }
                 }
                 .padding(.horizontal, 14)
@@ -94,6 +96,9 @@ struct PlayersView: View {
             }
         }
         .background(Theme.bg)
+        .sheet(item: $detail) { p in
+            PlayerDetailSheet(player: p)
+        }
     }
 }
 

@@ -37,7 +37,7 @@ struct SeasonPlan {
 }
 
 enum Planner {
-    static let freeGainThreshold = 2.0   // pts over rest-of-window to spend a FT
+    static let freeGainThreshold = 0.5   // free transfers are free — use one whenever it gains real points
     static let hitGainThreshold = 6.0    // pts to justify a -4 hit (4 + margin)
     static let decay = 0.88
 

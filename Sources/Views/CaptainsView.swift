@@ -2,6 +2,7 @@ import SwiftUI
 
 struct CaptainsView: View {
     @EnvironmentObject var state: AppState
+    @State private var detail: Player?
 
     var picks: [Player] {
         Array(state.players.filter { state.fitOnly ? !$0.flagged : true }.prefix(10))
@@ -15,11 +16,15 @@ struct CaptainsView: View {
                 ForEach(Array(picks.enumerated()), id: \.element.id) { i, p in
                     CaptainRow(rank: i + 1, player: p, frac: p.proj / maxProj)
                         .padding(.horizontal, 14)
+                        .onTapGesture { detail = p }
                 }
             }
             .padding(.bottom, 24)
         }
         .background(Theme.bg)
+        .sheet(item: $detail) { p in
+            PlayerDetailSheet(player: p)
+        }
     }
 }
 

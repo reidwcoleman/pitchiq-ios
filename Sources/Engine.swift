@@ -127,7 +127,13 @@ struct ProjectionEngine {
                 ppg: ppg, xgi90: per90(p.expected_goal_involvements),
                 own: Double(p.selected_by_percent ?? "") ?? 0,
                 avail: avail, flagged: flagged, mins: p.minutes, fixtures: fxs,
-                projByGw: projByGw
+                projByGw: projByGw,
+                totalPoints: p.total_points, goals: p.goals_scored, assists: p.assists,
+                cleanSheets: p.clean_sheets ?? 0, bonus: p.bonus, saves: p.saves,
+                starts: p.starts ?? 0, form: form,
+                xg: Double(p.expected_goals ?? "") ?? 0,
+                xa: Double(p.expected_assists ?? "") ?? 0,
+                news: p.news ?? ""
             )
         }
         players.sort { $0.proj > $1.proj }

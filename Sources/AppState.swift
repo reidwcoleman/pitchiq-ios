@@ -72,10 +72,11 @@ final class AppState: ObservableObject {
             var squad: SquadResult?
             var userSquad: [Player]?
             if let ids = customIds, let custom = Self.buildSquad(ids: ids, players: players) {
-                squad = custom
                 userSquad = custom.squad
-            } else {
-                squad = Optimizer.optimize(players: players, budgetM: budgetM, fitOnly: fit)
+                // display XI/captain/points for the selected GW only
+                squad = Self.buildSquad(ids: ids, players: players, displayGw: gwFrom)
+            } else if let ai = Optimizer.optimize(players: players, budgetM: budgetM, fitOnly: fit) {
+                squad = Self.buildSquad(ids: ai.squad.map(\.id), players: players, displayGw: gwFrom)
             }
             let plan = Planner.plan(players: players, budgetM: budgetM, fitOnly: fit,
                                     from: gwFrom, window: window, userSquad: userSquad)
@@ -120,14 +121,31 @@ final class AppState: ObservableObject {
         }
     }
 
-    nonisolated static func buildSquad(ids: [Int], players: [Player]) -> SquadResult? {
+    /// Build a SquadResult from ids; with displayGw set, XI/captain/points are
+    /// computed for that single gameweek's projections.
+    nonisolated static func buildSquad(ids: [Int], players: [Player], displayGw: Int? = nil) -> SquadResult? {
         let byId = Dictionary(uniqueKeysWithValues: players.map { ($0.id, $0) })
-        let squad = ids.compactMap { byId[$0] }
+        var squad = ids.compactMap { byId[$0] }
+        if let gw = displayGw { squad = squad.map { $0.reprojected($0.projByGw[gw] ?? 0) } }
         guard squad.count == 15, let r = Optimizer.bestXI(squad) else { return nil }
         let sorted = r.xi.sorted { $0.proj > $1.proj }
         return SquadResult(squad: squad, xi: r.xi, bench: r.bench, formation: r.formation,
                            total: r.total, captain: sorted[0], vice: sorted[1],
                            cost: squad.reduce(0) { $0 + $1.cost })
+    }
+
+    /// All upcoming fixtures for a team from the selected GW (for player detail).
+    func upcomingFixtures(teamId: Int, limit: Int = 12) -> [(gw: Int, fx: FixtureInfo)] {
+        var out: [(Int, FixtureInfo)] = []
+        for f in fixtures {
+            guard let e = f.event, e >= gwFrom else { continue }
+            if f.team_h == teamId {
+                out.append((e, FixtureInfo(opp: f.team_a, home: true, diff: f.team_h_difficulty ?? 3)))
+            } else if f.team_a == teamId {
+                out.append((e, FixtureInfo(opp: f.team_h, home: false, diff: f.team_a_difficulty ?? 3)))
+            }
+        }
+        return Array(out.sorted { $0.0 < $1.0 }.prefix(limit))
     }
 
     // fixture grid helper
