@@ -25,6 +25,18 @@ final class AppState: ObservableObject {
     private static let customKey = "customSquadIds"
 
     var teams: [Int: FPLTeam] = [:]
+
+    /// Gameweeks where at least one team plays twice (announced mid-season).
+    var doubleGws: Set<Int> {
+        var counts: [Int: [Int: Int]] = [:]
+        for f in fixtures {
+            guard let gw = f.event else { continue }
+            counts[gw, default: [:]][f.team_h, default: 0] += 1
+            counts[gw, default: [:]][f.team_a, default: 0] += 1
+        }
+        return Set(counts.filter { $0.value.values.contains { $0 >= 2 } }.keys)
+    }
+
     var isPreseason: Bool { !(boot?.events.contains { $0.finished } ?? false) }
     var gwOptions: [GWEvent] { boot?.events ?? [] }
     var isEdited: Bool { customSquadIds != nil }
@@ -90,7 +102,7 @@ final class AppState: ObservableObject {
             }
             let plan = Planner.plan(players: players, budgetM: budgetM, fitOnly: fit,
                                     from: gwFrom, window: window, userSquad: userSquad,
-                                    chipsMeta: chipsMeta)
+                                    chipsMeta: chipsMeta, doubleGws: doubleGws)
             await MainActor.run {
                 if staleCustom {
                     self.customSquadIds = nil

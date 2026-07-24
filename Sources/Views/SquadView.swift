@@ -310,7 +310,13 @@ struct WhyCard: View {
                 : "This 15 was chosen to score now AND stay strong for the whole season — near gameweeks count most, but every remaining fixture through GW 38 is weighed in.")
             if let plan = state.plan, !plan.chips.isEmpty {
                 let list = plan.chips.map { "\(chipDisplayName($0.chip)) GW\($0.gw)" }.joined(separator: ", ")
-                out.append("All chips scheduled: \(list). You get two of each — the first set must be used by GW 19, the second from GW 20 — so none go unused. Each lands where it earns the most: Free Hit on the biggest one-week ceiling (double-fixture players when doubles exist), Bench Boost on the strongest bench week, Triple Captain on the best captain score, Wildcard on the best rebuild week.")
+                out.append("Chips scheduled: \(list). You get two of each — the first set must be used by GW 19, the second from GW 20. Each lands where it earns the most: Bench Boost on the strongest bench week, Triple Captain on the best captain score, Wildcard on the best rebuild week.")
+            }
+            if let plan = state.plan {
+                let heldFH = plan.heldChips.filter { $0 == "freehit" }.count
+                if heldFH > 0 {
+                    out.append("\(heldFH) Free Hit\(heldFH > 1 ? "s" : "") held for a double gameweek — no team plays twice in any gameweek yet (doubles get announced mid-season when postponed games are rescheduled). The moment one appears, the Free Hit is scheduled there to load up on players with two fixtures. If a half is about to end with no double, it's used on the best normal week instead of expiring.")
+                }
             }
         }
         if gwPlan.xi.contains(where: { $0.flagged }) || gwPlan.bench.contains(where: { $0.flagged }) {

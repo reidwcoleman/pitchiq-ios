@@ -217,12 +217,13 @@ enum Optimizer {
         return pool
     }
 
-    static func greedySeed(_ pool: [Player], budget: Int, jitter: Bool) -> [Player] {
+    static func greedySeed(_ pool: [Player], budget: Int, jitter: Bool,
+                           rng: inout SeededRandom) -> [Player] {
         var byPos: [[Player]] = [[], [], [], [], []]
         for p in pool { byPos[p.pos].append(p) }
         for i in 1...4 {
             byPos[i].sort { $0.proj > $1.proj }
-            if jitter { byPos[i] = byPos[i].filter { _ in Double.random(in: 0...1) > 0.25 } }
+            if jitter { byPos[i] = byPos[i].filter { _ in Double.random(in: 0...1, using: &rng) > 0.25 } }
         }
         var squad: [Player] = []
         var clubs: [Int: Int] = [:]
@@ -269,17 +270,21 @@ enum Optimizer {
     }
 
     static func optimize(players: [Player], budgetM: Double, fitOnly: Bool,
-                         iters: Int = 12000, restarts: Int = 4) -> SquadResult? {
+                         iters: Int = 12000, restarts: Int = 4,
+                         seed: UInt64 = 0xC0FFEE) -> SquadResult? {
         let budget = Int((budgetM * 10).rounded())
         let pool = candidatePool(players, fitOnly: fitOnly)
         var byPos: [[Player]] = [[], [], [], [], []]
         for p in pool { byPos[p.pos].append(p) }
 
+        // seeded RNG: same data in → same squad out, so the plan the user sees
+        // doesn't reshuffle on every rebuild
+        var rng = SeededRandom(seed: seed)
         var bestSquad: [Player]?
         var bestScore = -Double.infinity
 
         for restart in 0..<restarts {
-            var squad = greedySeed(pool, budget: budget, jitter: restart > 0)
+            var squad = greedySeed(pool, budget: budget, jitter: restart > 0, rng: &rng)
             guard squad.count == 15, feasible(squad, budget: budget) else { continue }
             var score = objective(squad)
             var localBest = squad
@@ -288,21 +293,21 @@ enum Optimizer {
             for it in 0..<iters {
                 let T = 1.4 * (1 - Double(it) / Double(iters)) + 0.02
                 var next = squad
-                let swaps = Double.random(in: 0...1) < 0.35 ? 2 : 1
+                let swaps = Double.random(in: 0...1, using: &rng) < 0.35 ? 2 : 1
                 var ok = true
                 var touched = Set<Int>()
                 for _ in 0..<swaps {
                     var i: Int
-                    repeat { i = Int.random(in: 0..<15) } while touched.contains(i)
+                    repeat { i = Int.random(in: 0..<15, using: &rng) } while touched.contains(i)
                     touched.insert(i)
                     let cands = byPos[next[i].pos]
-                    guard let inn = cands.randomElement(), !next.contains(inn) else { ok = false; break }
+                    guard let inn = cands.randomElement(using: &rng), !next.contains(inn) else { ok = false; break }
                     next[i] = inn
                 }
                 guard ok, feasible(next, budget: budget) else { continue }
                 let ns = objective(next)
                 let d = ns - score
-                if d > 0 || Double.random(in: 0...1) < exp(d / T) {
+                if d > 0 || Double.random(in: 0...1, using: &rng) < exp(d / T) {
                     squad = next; score = ns
                     if ns > localBestScore { localBest = squad; localBestScore = ns }
                 }

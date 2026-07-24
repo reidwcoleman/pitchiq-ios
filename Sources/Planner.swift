@@ -99,7 +99,7 @@ enum Planner {
 
     static func plan(players: [Player], budgetM: Double, fitOnly: Bool,
                      from: Int, window: Int, userSquad: [Player]? = nil,
-                     chipsMeta: [ChipMeta] = []) -> SeasonPlan? {
+                     chipsMeta: [ChipMeta] = [], doubleGws: Set<Int> = []) -> SeasonPlan? {
         let end = min(from + window - 1, 38)
         guard end >= from else { return nil }
         let budget = Int((budgetM * 10).rounded())
@@ -134,11 +134,15 @@ enum Planner {
         var actions: [Int: ChipAction] = [:]
         var plays: [ChipPlay] = []
         var heldChips: [String] = []
-        let order = ["wildcard", "freehit", "3xc", "bboost"]
+        // Free Hit gets first claim within each half so a double gameweek is
+        // never taken by another chip before it can land there
+        let order = ["freehit", "wildcard", "3xc", "bboost"]
         let sortedMeta = chipsMeta
             .filter { $0.stop >= from && $0.start <= end }
             .sorted {
-                $0.start != $1.start ? $0.start < $1.start
+                let h0 = $0.stop <= 19 ? 0 : 1
+                let h1 = $1.stop <= 19 ? 0 : 1
+                return h0 != h1 ? h0 < h1
                     : (order.firstIndex(of: $0.name) ?? 9) < (order.firstIndex(of: $1.name) ?? 9)
             }
 
@@ -176,11 +180,20 @@ enum Planner {
                 }
 
             case "freehit":
-                // candidates: biggest gap between the league's ceiling that week
-                // (top-11 projections anywhere — doubles push this way up) and
-                // what the base squad scores
+                // the Free Hit exists for double gameweeks: if any DGW is in
+                // this window, it MUST go on one. With no DGW announced yet,
+                // hold the chip — doubles appear mid-season, and the plan
+                // re-runs on every refresh. Only if the window is about to
+                // expire with no DGW does it fall back to the best normal week.
+                let dgwCands = free.filter { doubleGws.contains($0) }
+                let windowClosing = hi - max(lo, from) <= 3
+                if dgwCands.isEmpty && !windowClosing {
+                    heldChips.append("freehit")
+                    continue
+                }
+                let searchGws = dgwCands.isEmpty ? free : dgwCands
                 let basePts = Dictionary(uniqueKeysWithValues: base.gws.map { ($0.gw, $0.projPts) })
-                let cands = free
+                let cands = searchGws
                     .map { g -> (Int, Double) in
                         let ceiling = players.map { $0.projByGw[g] ?? 0 }.sorted(by: >).prefix(11).reduce(0, +)
                         return (g, ceiling - (basePts[g] ?? 0))
