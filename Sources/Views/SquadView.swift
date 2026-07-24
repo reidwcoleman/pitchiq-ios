@@ -205,8 +205,12 @@ struct TransfersCard: View {
                 .background(Theme.magenta.opacity(0.07))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
             }
-            if gwPlan.chip == "wildcard" || gwPlan.chip == "freehit" {
+            if gwPlan.chip == "freehit" {
                 EmptyView()
+            } else if gwPlan.chip == "wildcard" && gwPlan.transfers.isEmpty {
+                Label("Squad already optimal on this week — the wildcard confirms it with no changes needed.",
+                      systemImage: "checkmark.seal")
+                    .font(.system(size: 12.5, weight: .medium)).foregroundColor(Theme.ink)
             } else if isFirst && !fromUser {
                 Label("Starting squad — no transfers needed. Tap any player to make it yours.",
                       systemImage: "flag.checkered")
@@ -233,11 +237,12 @@ struct TransfersCard: View {
                         Spacer()
                         Text(String(format: "+%.1f", t.gain))
                             .font(.mono(11, .bold)).foregroundColor(Theme.green)
-                        Text(t.paid ? "-4" : "FREE")
+                        let badge = gwPlan.chip == "wildcard" ? "WC" : (t.paid ? "-4" : "FREE")
+                        Text(badge)
                             .font(.mono(9, .bold))
-                            .foregroundColor(t.paid ? .white : Theme.lime)
+                            .foregroundColor(t.paid ? .white : (gwPlan.chip == "wildcard" ? Theme.magenta : Theme.lime))
                             .padding(.horizontal, 7).padding(.vertical, 3)
-                            .background(t.paid ? Theme.red : Theme.lime.opacity(0.14))
+                            .background(t.paid ? Theme.red : (gwPlan.chip == "wildcard" ? Theme.magenta.opacity(0.12) : Theme.lime.opacity(0.14)))
                             .clipShape(Capsule())
                     }
                 }

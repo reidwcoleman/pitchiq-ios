@@ -2,8 +2,9 @@ import Foundation
 
 // MARK: - Multi-gameweek transfer + chip planner
 // Picks an opening squad weighted across the season, then simulates week by
-// week with real FPL rules: 1 free transfer per GW (bankable to 5, max 2
-// moves/week), -4 hits only when clearly worth it, injured players replaced
+// week with real FPL rules: 1 free transfer per GW (bankable to 5), every
+// banked FT spent whenever a move genuinely benefits the team (never when it
+// doesn't), -4 hits only when clearly worth it, injured players replaced
 // with priority. On top of the base plan it schedules every chip the game
 // gives you (Wildcard / Free Hit / Bench Boost / Triple Captain — one of
 // each per half-season) where each earns the most points:
@@ -227,7 +228,7 @@ enum Planner {
                 // there and re-simulate the rest of the season
                 let candSet = Set(stride(from: lo, through: hi, by: max((hi - lo) / 4, 1)))
                     .filter { free.contains($0) }
-                var best: (gw: Int, gain: Double, squad: [Player])?
+                var evals: [(gw: Int, gain: Double, squad: [Player], changes: Int)] = []
                 for g in candSet.sorted() {
                     let scored = players
                         .map { $0.reprojected(weightedValue($0, from: g, to: end)) }
@@ -241,9 +242,17 @@ enum Planner {
                                         initialFts: base.ftsAtStart[g] ?? 1,
                                         allowFirstMoves: false, chips: [:])
                     let baseRest = base.gws.filter { $0.gw >= g }.reduce(0) { $0 + $1.projPts }
-                    let gain = rest.totalPts - baseRest
-                    if best == nil || gain > best!.gain { best = (g, gain, newSquad) }
+                    let heldIds = Set((base.squadAtStart[g] ?? []).map(\.id))
+                    let changes = newSquad.filter { !heldIds.contains($0.id) }.count
+                    evals.append((g, rest.totalPts - baseRest, newSquad, changes))
                 }
+                // prefer a week where the rebuild actually changes the team,
+                // as long as it's within a point of the best candidate
+                let topGain = evals.map(\.gain).max() ?? 0
+                let best = evals
+                    .filter { $0.changes > 0 && $0.gain >= topGain - 1.0 }
+                    .max { $0.gain < $1.gain }
+                    ?? evals.max { $0.gain < $1.gain }
                 // always play it — each wildcard expires at its half's deadline,
                 // so it goes on the best rebuild week available
                 if let b = best {
@@ -290,9 +299,23 @@ enum Planner {
 
             var chipName: String?
             var suppressMoves = false
+            var moves: [TransferMove] = []
             if let action = chips[g] {
                 switch action {
                 case .wildcard(let newSquad):
+                    // unlimited free transfers: show exactly who comes in and
+                    // out; the rebuilt squad carries forward until changed
+                    let oldSquad = squad
+                    let newIds = Set(newSquad.map(\.id))
+                    let oldIds = Set(oldSquad.map(\.id))
+                    for pos in 1...4 {
+                        let outs = oldSquad.filter { $0.pos == pos && !newIds.contains($0.id) }
+                        let ins = newSquad.filter { $0.pos == pos && !oldIds.contains($0.id) }
+                        for k in 0..<min(outs.count, ins.count) {
+                            moves.append(TransferMove(out: outs[k], inn: ins[k], paid: false,
+                                                      gain: (ins[k].projByGw[g] ?? 0) - (outs[k].projByGw[g] ?? 0)))
+                        }
+                    }
                     squad = newSquad
                     bank = max(budget - squad.reduce(0) { $0 + $1.cost }, 0)
                     chipName = "wildcard"
@@ -307,10 +330,11 @@ enum Planner {
                 }
             }
 
-            var moves: [TransferMove] = []
             var hitPts = 0
             if !suppressMoves && (g > from || allowFirstMoves) {
-                while moves.count < 2 {
+                // no artificial cap: spend every banked free transfer that
+                // genuinely benefits the team; stop when no move clears the bar
+                while moves.count < 12 {
                     guard let best = bestTransfer(squad: squad, pool: pool, bank: bank,
                                                   from: g, to: end) else { break }
                     let isFree = fts > 0
@@ -346,7 +370,7 @@ enum Planner {
             if case .benchBoost? = chips[g] { pts += r.bench.reduce(0) { $0 + $1.proj } }
 
             res.totalPts += pts
-            res.totalTransfers += moves.count
+            if chipName != "wildcard" { res.totalTransfers += moves.count } // WC moves are unlimited/free
             res.totalHits += hitPts
             res.gws.append(GWPlan(gw: g, transfers: moves, xi: r.xi, bench: r.bench,
                                   captain: cap, formation: r.formation,
