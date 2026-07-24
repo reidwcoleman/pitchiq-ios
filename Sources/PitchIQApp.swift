@@ -79,15 +79,13 @@ struct MainTabs: View {
     var body: some View {
         TabView(selection: $tab) {
             SquadView()
-                .tabItem { Label("Optimal XV", systemImage: "sportscourt") }.tag(0)
-            PlannerView()
-                .tabItem { Label("Planner", systemImage: "point.topleft.down.curvedto.point.bottomright.up") }.tag(1)
+                .tabItem { Label("Team", systemImage: "sportscourt") }.tag(0)
             PlayersView()
-                .tabItem { Label("Players", systemImage: "list.number") }.tag(2)
+                .tabItem { Label("Players", systemImage: "list.number") }.tag(1)
             CaptainsView()
-                .tabItem { Label("Captaincy", systemImage: "crown") }.tag(3)
+                .tabItem { Label("Captaincy", systemImage: "crown") }.tag(2)
             FixturesView()
-                .tabItem { Label("Fixtures", systemImage: "calendar") }.tag(4)
+                .tabItem { Label("Fixtures", systemImage: "calendar") }.tag(3)
         }
         .tint(Theme.lime)
     }

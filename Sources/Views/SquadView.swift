@@ -1,19 +1,22 @@
 import SwiftUI
 
 enum SquadSheet: Identifiable {
-    case detail(Player)
+    case detail(Player, canSwap: Bool)
     case swap(Player)
     var id: Int {
         switch self {
-        case .detail(let p): return p.id
+        case .detail(let p, _): return p.id
         case .swap(let p): return -p.id
         }
     }
 }
 
+// The merged Team tab: pick any gameweek in the plan, see the exact squad you
+// should hold that week, the transfers that get you there, and why.
 struct SquadView: View {
     @EnvironmentObject var state: AppState
     @State private var sheet: SquadSheet?
+    @State private var selected = 0
 
     var body: some View {
         ScrollView {
@@ -22,37 +25,35 @@ struct SquadView: View {
                 if case .optimizing = state.phase {
                     VStack(spacing: 14) {
                         ProgressView().tint(Theme.lime)
-                        Text("Scoring 500+ players & optimizing…")
+                        Text("Scoring 500+ players & planning \(state.planWindow) gameweeks…")
                             .font(.mono(12)).foregroundColor(Theme.inkDim)
                     }
                     .frame(maxWidth: .infinity, minHeight: 300)
-                } else if let r = state.squad {
-                    HStack(spacing: 8) {
-                        Text(state.isEdited ? "YOUR TEAM · GW \(state.gwFrom) POINTS" : "AI PICK · GW \(state.gwFrom) POINTS · TAP A PLAYER")
-                            .font(.label(9)).tracking(1.5)
-                            .foregroundColor(state.isEdited ? Theme.cyan : Theme.inkDim)
-                        Spacer()
-                        if state.isEdited {
-                            Button {
-                                state.resetToAI()
-                            } label: {
-                                Text("Reset to AI")
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundColor(Theme.lime)
-                                    .padding(.horizontal, 10).padding(.vertical, 5)
-                                    .background(Theme.lime.opacity(0.12))
-                                    .clipShape(Capsule())
-                            }
-                        }
+                } else if let plan = state.plan, !plan.gws.isEmpty {
+                    let idx = min(selected, plan.gws.count - 1)
+                    let gp = plan.gws[idx]
+                    let isFirst = idx == 0
+
+                    planHeader(plan)
+                    gwPicker(plan, idx: idx)
+                    TransfersCard(gwPlan: gp, isFirst: isFirst, fromUser: plan.fromUserSquad)
+                        .padding(.horizontal, 14)
+
+                    let sortedXI = gp.xi.sorted { $0.proj > $1.proj }
+                    PitchGrid(xi: gp.xi,
+                              captainId: gp.captain.id,
+                              viceId: sortedXI.count > 1 ? sortedXI[1].id : -1) { p in
+                        sheet = .detail(p, canSwap: isFirst)
                     }
-                    .padding(.horizontal, 18)
-                    PitchGrid(result: r) { sheet = .detail($0) }
+                    .padding(.horizontal, 14)
+
+                    BenchRow(bench: gp.bench) { p in sheet = .detail(p, canSwap: isFirst) }
                         .padding(.horizontal, 14)
-                    BenchRow(bench: r.bench) { sheet = .detail($0) }
+
+                    gwTiles(gp, isFirst: isFirst)
                         .padding(.horizontal, 14)
-                    StatTiles(result: r, budget: state.budget, gw: state.gwFrom)
-                        .padding(.horizontal, 14)
-                    ModelNotes(result: r)
+
+                    WhyCard(gwPlan: gp, isFirst: isFirst, fromUser: plan.fromUserSquad)
                         .padding(.horizontal, 14)
                 } else {
                     Text("No feasible squad — raise the budget or allow flagged players.")
@@ -63,11 +64,11 @@ struct SquadView: View {
             .padding(.bottom, 24)
         }
         .background(Theme.bg)
+        .onChange(of: state.gwFrom) { _ in selected = 0 }
         .sheet(item: $sheet) { s in
             switch s {
-            case .detail(let p):
-                PlayerDetailSheet(player: p, canSwap: true) { out in
-                    // detail sheet dismisses itself first; re-present as swap
+            case .detail(let p, let canSwap):
+                PlayerDetailSheet(player: p, canSwap: canSwap) { out in
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { sheet = .swap(out) }
                 }
             case .swap(let p):
@@ -75,14 +76,216 @@ struct SquadView: View {
             }
         }
     }
+
+    func planHeader(_ plan: SeasonPlan) -> some View {
+        HStack(spacing: 8) {
+            Text(state.isEdited ? "YOUR TEAM · \(plan.gws.count)-WEEK PLAN" : "AI TEAM · \(plan.gws.count)-WEEK PLAN")
+                .font(.label(9)).tracking(1.5)
+                .foregroundColor(state.isEdited ? Theme.cyan : Theme.inkDim)
+            Spacer()
+            Text(String(format: "Σ %.0f pts · %d transfers%@", plan.totalPts, plan.totalTransfers,
+                        plan.totalHits > 0 ? " · -\(plan.totalHits) hits" : ""))
+                .font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
+            if state.isEdited {
+                Button { state.resetToAI() } label: {
+                    Text("Reset")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(Theme.lime)
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(Theme.lime.opacity(0.12))
+                        .clipShape(Capsule())
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+    }
+
+    func gwPicker(_ plan: SeasonPlan, idx: Int) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Array(plan.gws.enumerated()), id: \.element.gw) { i, gp in
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { selected = i }
+                    } label: {
+                        VStack(spacing: 3) {
+                            Text("GW \(gp.gw)").font(.mono(12, .bold))
+                            Text(String(format: "%.0f pts", gp.projPts)).font(.mono(9, .medium))
+                            if !gp.transfers.isEmpty {
+                                Text("\(gp.transfers.count) ⇄")
+                                    .font(.mono(8, .bold))
+                                    .foregroundColor(i == idx ? .white.opacity(0.9) : Theme.cyan)
+                            }
+                        }
+                        .foregroundColor(i == idx ? .white : Theme.ink)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(i == idx ? Theme.lime : Theme.panel)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .overlay(RoundedRectangle(cornerRadius: 12)
+                            .stroke(i == idx ? Theme.lime : Theme.line, lineWidth: 1))
+                        .shadow(color: Color.black.opacity(i == idx ? 0.1 : 0.03), radius: 5, x: 0, y: 2)
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 2)
+        }
+    }
+
+    func gwTiles(_ gp: GWPlan, isFirst: Bool) -> some View {
+        let cost = state.squad.map { Double($0.cost) / 10 }
+        return LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+            tile(String(format: "%.1f", gp.projPts), "GW \(gp.gw) XI PTS (C×2)", Theme.lime)
+            tile(gp.formation, "FORMATION", Theme.cyan)
+            tile("\(gp.ftsLeft)", "FREE TRANSFERS BANKED", Theme.cyan)
+            if isFirst, let cost {
+                tile("£\(String(format: "%.1f", cost))m", "SQUAD COST", Theme.lime)
+            } else {
+                tile(gp.hitPts > 0 ? "-\(gp.hitPts)" : "\(gp.transfers.count)",
+                     gp.hitPts > 0 ? "HIT COST THIS WEEK" : "TRANSFERS THIS WEEK",
+                     gp.hitPts > 0 ? Theme.red : Theme.lime)
+            }
+        }
+    }
+
+    func tile(_ v: String, _ k: String, _ c: Color) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(v).font(.mono(24, .bold)).foregroundColor(c)
+            Text(k).font(.label(9)).tracking(1.2).foregroundColor(Theme.inkDim)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .panel()
+    }
 }
 
+// MARK: - transfers card
+
+struct TransfersCard: View {
+    @EnvironmentObject var state: AppState
+    let gwPlan: GWPlan
+    let isFirst: Bool
+    let fromUser: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("TRANSFERS · GW \(gwPlan.gw)").font(.label(9)).tracking(1.5).foregroundColor(Theme.inkDim)
+            if isFirst && !fromUser {
+                Label("Starting squad — no transfers needed. Tap any player to make it yours.",
+                      systemImage: "flag.checkered")
+                    .font(.system(size: 12.5, weight: .medium)).foregroundColor(Theme.ink)
+            } else if gwPlan.transfers.isEmpty {
+                Label("None this week — bank the free transfer (\(gwPlan.ftsLeft) saved up).",
+                      systemImage: "tray.and.arrow.down")
+                    .font(.system(size: 12.5, weight: .medium)).foregroundColor(Theme.ink)
+            } else {
+                ForEach(gwPlan.transfers) { t in
+                    HStack(spacing: 7) {
+                        Text(t.out.name)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(Theme.inkDim).strikethrough()
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 10, weight: .bold)).foregroundColor(Theme.lime)
+                        Text(t.inn.name).font(.system(size: 13, weight: .bold)).foregroundColor(Theme.ink)
+                        Text("\(t.inn.teamShort) £\(t.inn.price)")
+                            .font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
+                        Spacer()
+                        Text(String(format: "+%.1f", t.gain))
+                            .font(.mono(11, .bold)).foregroundColor(Theme.green)
+                        Text(t.paid ? "-4" : "FREE")
+                            .font(.mono(9, .bold))
+                            .foregroundColor(t.paid ? .white : Theme.lime)
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(t.paid ? Theme.red : Theme.lime.opacity(0.14))
+                            .clipShape(Capsule())
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panel()
+    }
+}
+
+// MARK: - why this team
+
+struct WhyCard: View {
+    @EnvironmentObject var state: AppState
+    let gwPlan: GWPlan
+    let isFirst: Bool
+    let fromUser: Bool
+
+    func fixtureDesc(_ p: Player, gw: Int) -> String {
+        let fxs = state.gridFixtures(teamId: p.team, gws: [gw]).first ?? []
+        if fxs.isEmpty { return "blank gameweek" }
+        if fxs.count > 1 { return "double gameweek (" + fxs.map { state.teamShort($0.opp) }.joined(separator: " & ") + ")" }
+        let fx = fxs[0]
+        return "\(fx.home ? "home vs" : "away at") \(state.teamName(fx.opp)) (FDR \(fx.diff))"
+    }
+
+    var notes: [String] {
+        var out: [String] = []
+        let cap = gwPlan.captain
+        out.append("Captain \(cap.name) — highest projected scorer this week (\(String(format: "%.1f", cap.proj)) pts, doubled): \(fixtureDesc(cap, gw: gwPlan.gw)), xGI/90 \(String(format: "%.2f", cap.xgi90)), PPG \(String(format: "%.1f", cap.ppg)) last season.")
+
+        let favourable = gwPlan.xi.filter { p in
+            let fxs = state.gridFixtures(teamId: p.team, gws: [gwPlan.gw]).first ?? []
+            return !fxs.isEmpty && fxs.allSatisfy { $0.diff <= 3 }
+        }.count
+        out.append("\(favourable) of 11 starters have favourable fixtures (FDR ≤ 3) in GW \(gwPlan.gw) — every projection is weighted by exactly who each team plays, home or away.")
+
+        if let topDef = gwPlan.xi.filter({ $0.pos <= 2 }).max(by: { $0.proj < $1.proj }) {
+            out.append("Best defensive pick: \(topDef.name) (\(String(format: "%.1f", topDef.proj)) pts) — \(fixtureDesc(topDef, gw: gwPlan.gw)); clean-sheet odds come from how few goals that opponent is expected to score.")
+        }
+
+        for t in gwPlan.transfers {
+            out.append("\(t.out.name) → \(t.inn.name): +\(String(format: "%.1f", t.gain)) projected pts over the remaining weeks (\(t.paid ? "worth the -4 hit" : "free transfer")). \(t.inn.name)'s run: \(fixtureDesc(t.inn, gw: gwPlan.gw)).")
+        }
+        if gwPlan.transfers.isEmpty && !isFirst {
+            out.append("No move gains enough to beat holding — the free transfer banks instead (\(gwPlan.ftsLeft) saved, max 5, max 2 moves a week).")
+        }
+        if isFirst {
+            out.append(fromUser
+                ? "This is your team — the plan works from it and only suggests changes that clearly add points."
+                : "This 15 was chosen to score now AND stay strong for all \(state.planWindow) weeks, so you barely need transfers.")
+        }
+
+        out.append(state.isPreseason
+            ? "Model inputs: last season's xG/xA per-90, minutes security, points-per-game and bonus rates, adjusted for each opponent's difficulty. Player form joins the blend automatically once matches are played."
+            : "Model inputs: current form blended with xG/xA per-90 rates, minutes security, bonus rates and each opponent's difficulty (home/away adjusted).")
+        return out
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("WHY THIS TEAM").font(.label(10)).tracking(2).foregroundColor(Theme.inkDim)
+                .padding(.bottom, 8)
+            ForEach(Array(notes.enumerated()), id: \.offset) { i, n in
+                HStack(alignment: .top, spacing: 8) {
+                    Text("▸").foregroundColor(Theme.lime).font(.system(size: 12))
+                    Text(n).font(.system(size: 13)).foregroundColor(Theme.ink)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.vertical, 7)
+                if i < notes.count - 1 { Divider().background(Theme.line) }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panel()
+    }
+}
+
+// MARK: - pitch
+
 struct PitchGrid: View {
-    let result: SquadResult
+    let xi: [Player]
+    let captainId: Int
+    let viceId: Int
     var onTap: (Player) -> Void = { _ in }
 
     var rows: [[Player]] {
-        (1...4).map { pos in result.xi.filter { $0.pos == pos } }
+        (1...4).map { pos in xi.filter { $0.pos == pos } }
     }
 
     // size cards to the row so 4- and 5-player lines never clip the screen
@@ -97,8 +300,8 @@ struct PitchGrid: View {
                 HStack(spacing: 8) {
                     ForEach(row) { p in
                         PlayerCard(player: p,
-                                   isCaptain: p.id == result.captain.id,
-                                   isVice: p.id == result.vice.id,
+                                   isCaptain: p.id == captainId,
+                                   isVice: p.id == viceId,
                                    width: cardWidth(row.count))
                             .onTapGesture { onTap(p) }
                     }
@@ -221,32 +424,7 @@ struct BenchRow: View {
     }
 }
 
-struct StatTiles: View {
-    let result: SquadResult
-    let budget: Double
-    var gw = 0
-
-    var body: some View {
-        let xiPts = result.total + result.captain.proj
-        let bank = budget * 10 - Double(result.cost)
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-            tile(String(format: "%.1f", xiPts), "GW \(gw) XI PTS (C×2)", Theme.lime)
-            tile(result.formation, "FORMATION", Theme.cyan)
-            tile("£\(String(format: "%.1f", Double(result.cost) / 10))m", "SQUAD COST", Theme.lime)
-            tile("£\(String(format: "%.1f", bank / 10))m", "IN THE BANK", Theme.cyan)
-        }
-    }
-
-    func tile(_ v: String, _ k: String, _ c: Color) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(v).font(.mono(24, .bold)).foregroundColor(c)
-            Text(k).font(.label(9)).tracking(1.5).foregroundColor(Theme.inkDim)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .panel()
-    }
-}
+// MARK: - swap sheet
 
 struct SwapSheet: View {
     @EnvironmentObject var state: AppState
@@ -349,47 +527,5 @@ struct SwapSheet: View {
             }
         }
         .preferredColorScheme(.light)
-    }
-}
-
-struct ModelNotes: View {
-    @EnvironmentObject var state: AppState
-    let result: SquadResult
-
-    var notes: [String] {
-        let gwEnd = min(state.gwFrom + state.horizon - 1, 38)
-        let range = state.horizon > 1 ? "GW \(state.gwFrom)–\(gwEnd)" : "GW \(state.gwFrom)"
-        let excluded = state.players.filter(\.flagged).count
-        return [
-            "Points shown are for GW \(state.gwFrom) only — change the gameweek at the top to see any other week. Squad selection still looks across \(range).",
-            "Tap any player for full stats, every upcoming fixture, and the swap option.",
-            "Captain: \(result.captain.name) — highest projection in the XI. Vice: \(result.vice.name).",
-            state.isPreseason
-                ? "Pre-season mode: model leans on 2025/26 xG/xA, minutes and PPG; new signings & promoted clubs lean on FPL's expected-points feed."
-                : "In-season mode: recent form is blended into every projection.",
-            state.fitOnly
-                ? "\(excluded) flagged players (injured/doubtful/suspended) excluded — tap 'Fit only' to include them."
-                : "Flagged players included, weighted by % chance of playing.",
-            "Constraints: £\(Int(state.budget))m budget, 2 GK / 5 DEF / 5 MID / 3 FWD, max 3 per club.",
-        ]
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("MODEL NOTES").font(.label(10)).tracking(2).foregroundColor(Theme.inkDim)
-                .padding(.bottom, 8)
-            ForEach(Array(notes.enumerated()), id: \.offset) { i, n in
-                HStack(alignment: .top, spacing: 8) {
-                    Text("▸").foregroundColor(Theme.lime).font(.system(size: 12))
-                    Text(n).font(.system(size: 13)).foregroundColor(Theme.ink)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.vertical, 7)
-                if i < notes.count - 1 { Divider().background(Theme.line) }
-            }
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .panel()
     }
 }
