@@ -268,17 +268,17 @@ enum Optimizer {
         return squad
     }
 
-    static func optimize(players: [Player], budgetM: Double, fitOnly: Bool) -> SquadResult? {
+    static func optimize(players: [Player], budgetM: Double, fitOnly: Bool,
+                         iters: Int = 12000, restarts: Int = 4) -> SquadResult? {
         let budget = Int((budgetM * 10).rounded())
         let pool = candidatePool(players, fitOnly: fitOnly)
         var byPos: [[Player]] = [[], [], [], [], []]
         for p in pool { byPos[p.pos].append(p) }
 
-        let iters = 12000
         var bestSquad: [Player]?
         var bestScore = -Double.infinity
 
-        for restart in 0..<4 {
+        for restart in 0..<restarts {
             var squad = greedySeed(pool, budget: budget, jitter: restart > 0)
             guard squad.count == 15, feasible(squad, budget: budget) else { continue }
             var score = objective(squad)

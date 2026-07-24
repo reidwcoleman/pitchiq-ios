@@ -6,6 +6,33 @@ struct Bootstrap: Decodable {
     let events: [GWEvent]
     let teams: [FPLTeam]
     let elements: [FPLElement]
+    let chips: [FPLChip]?
+}
+
+struct FPLChip: Decodable {
+    let name: String          // "wildcard" | "freehit" | "bboost" | "3xc"
+    let start_event: Int
+    let stop_event: Int
+}
+
+func chipDisplayName(_ chip: String) -> String {
+    switch chip {
+    case "wildcard": return "Wildcard"
+    case "freehit": return "Free Hit"
+    case "bboost": return "Bench Boost"
+    case "3xc": return "Triple Captain"
+    default: return chip
+    }
+}
+
+func chipShortName(_ chip: String) -> String {
+    switch chip {
+    case "wildcard": return "WC"
+    case "freehit": return "FH"
+    case "bboost": return "BB"
+    case "3xc": return "TC"
+    default: return chip
+    }
 }
 
 struct GWEvent: Decodable {

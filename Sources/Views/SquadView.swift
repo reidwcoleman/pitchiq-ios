@@ -83,9 +83,10 @@ struct SquadView: View {
                 .font(.label(9)).tracking(1.5)
                 .foregroundColor(state.isEdited ? Theme.cyan : Theme.inkDim)
             Spacer()
-            Text(String(format: "Σ %.0f pts · %d transfers%@", plan.totalPts, plan.totalTransfers,
-                        plan.totalHits > 0 ? " · -\(plan.totalHits) hits" : ""))
+            Text(String(format: "Σ %.0f pts · %d transfers · %d chips%@", plan.totalPts, plan.totalTransfers,
+                        plan.chips.count, plan.totalHits > 0 ? " · -\(plan.totalHits) hits" : ""))
                 .font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
+                .lineLimit(1).minimumScaleFactor(0.8)
             if state.isEdited {
                 Button { state.resetToAI() } label: {
                     Text("Reset")
@@ -110,7 +111,14 @@ struct SquadView: View {
                         VStack(spacing: 3) {
                             Text("GW \(gp.gw)").font(.mono(12, .bold))
                             Text(String(format: "%.0f pts", gp.projPts)).font(.mono(9, .medium))
-                            if !gp.transfers.isEmpty {
+                            if let chip = gp.chip {
+                                Text(chipShortName(chip))
+                                    .font(.mono(8, .heavy))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 5).padding(.vertical, 1.5)
+                                    .background(Theme.magenta)
+                                    .clipShape(Capsule())
+                            } else if !gp.transfers.isEmpty {
                                 Text("\(gp.transfers.count) ⇄")
                                     .font(.mono(8, .bold))
                                     .foregroundColor(i == idx ? .white.opacity(0.9) : Theme.cyan)
@@ -137,7 +145,9 @@ struct SquadView: View {
             tile(String(format: "%.1f", gp.projPts), "GW \(gp.gw) XI PTS (C×2)", Theme.lime)
             tile(gp.formation, "FORMATION", Theme.cyan)
             tile("\(gp.ftsLeft)", "FREE TRANSFERS BANKED", Theme.cyan)
-            if isFirst, let cost {
+            if let chip = gp.chip {
+                tile(chipShortName(chip), "\(chipDisplayName(chip).uppercased()) PLAYED", Theme.magenta)
+            } else if isFirst, let cost {
                 tile("£\(String(format: "%.1f", cost))m", "SQUAD COST", Theme.lime)
             } else {
                 tile(gp.hitPts > 0 ? "-\(gp.hitPts)" : "\(gp.transfers.count)",
@@ -166,10 +176,38 @@ struct TransfersCard: View {
     let isFirst: Bool
     let fromUser: Bool
 
+    var chipBanner: (String, String)? {
+        guard let chip = gwPlan.chip else { return nil }
+        switch chip {
+        case "wildcard":
+            return ("wand.and.stars", "WILDCARD — unlimited free transfers this week; the rebuilt squad below carries forward.")
+        case "freehit":
+            return ("sparkles", "FREE HIT — one-week dream team below; your real squad returns next gameweek.")
+        case "bboost":
+            return ("person.3.fill", "BENCH BOOST — all four bench players' points count this week.")
+        case "3xc":
+            return ("crown.fill", "TRIPLE CAPTAIN — \(gwPlan.captain.name) scores ×3 instead of ×2.")
+        default: return nil
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             Text("TRANSFERS · GW \(gwPlan.gw)").font(.label(9)).tracking(1.5).foregroundColor(Theme.inkDim)
-            if isFirst && !fromUser {
+            if let (icon, text) = chipBanner {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: icon).font(.system(size: 12)).foregroundColor(Theme.magenta)
+                    Text(text).font(.system(size: 12.5, weight: .semibold)).foregroundColor(Theme.ink)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.magenta.opacity(0.07))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            if gwPlan.chip == "wildcard" || gwPlan.chip == "freehit" {
+                EmptyView()
+            } else if isFirst && !fromUser {
                 Label("Starting squad — no transfers needed. Tap any player to make it yours.",
                       systemImage: "flag.checkered")
                     .font(.system(size: 12.5, weight: .medium)).foregroundColor(Theme.ink)
@@ -230,6 +268,20 @@ struct WhyCard: View {
     var notes: [String] {
         var out: [String] = []
         let cap = gwPlan.captain
+        if let chip = gwPlan.chip {
+            let benchSum = gwPlan.bench.reduce(0) { $0 + $1.proj }
+            switch chip {
+            case "3xc":
+                out.append("Triple Captain played now: \(cap.name)'s \(String(format: "%.1f", cap.proj)) pts is the best captain week available in this half of the season — tripling instead of doubling adds +\(String(format: "%.1f", cap.proj)) extra.")
+            case "bboost":
+                out.append("Bench Boost played now: this bench projects \(String(format: "%.1f", benchSum)) pts, the strongest bench week in this half — those points only count because the chip is active.")
+            case "freehit":
+                out.append("Free Hit played now: this is the biggest gap between the best possible one-week team (doubles included) and what your real squad would score — the dream team below reverts automatically next week.")
+            case "wildcard":
+                out.append("Wildcard played now: rebuilding with unlimited free transfers here beats any sequence of weekly transfers for the rest of the season.")
+            default: break
+            }
+        }
         out.append("Captain \(cap.name) — highest projected scorer this week (\(String(format: "%.1f", cap.proj)) pts, doubled): \(fixtureDesc(cap, gw: gwPlan.gw)), xGI/90 \(String(format: "%.2f", cap.xgi90)), PPG \(String(format: "%.1f", cap.ppg)) last season.")
 
         let favourable = gwPlan.xi.filter { p in
@@ -253,6 +305,13 @@ struct WhyCard: View {
             out.append(fromUser
                 ? "This is your team — the plan works from it and only suggests changes that clearly add points."
                 : "This 15 was chosen to score now AND stay strong for the whole season — near gameweeks count most, but every remaining fixture through GW 38 is weighed in.")
+            if let plan = state.plan, !plan.chips.isEmpty {
+                let list = plan.chips.map { "\(chipDisplayName($0.chip)) GW\($0.gw)" }.joined(separator: ", ")
+                out.append("Chips scheduled across the season: \(list). Each is placed where it earns the most (Free Hit chases the biggest one-week ceiling — doubles included; Bench Boost the strongest bench week; Triple Captain the best captain score).")
+            }
+            if let plan = state.plan, !plan.heldChips.isEmpty {
+                out.append("\(plan.heldChips.count) wildcard(s) held in reserve — right now a full rebuild gains nothing over weekly transfers. The plan refreshes after every gameweek and will schedule them the moment injuries or form swings make a rebuild worthwhile.")
+            }
         }
         if gwPlan.xi.contains(where: { $0.flagged }) || gwPlan.bench.contains(where: { $0.flagged }) {
             out.append("Flagged players in the squad are projected near zero, benched automatically, and prioritised for transfer as soon as a replacement is affordable.")

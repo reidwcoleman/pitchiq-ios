@@ -85,8 +85,12 @@ final class AppState: ObservableObject {
             if squad == nil, let ai = Optimizer.optimize(players: players, budgetM: budgetM, fitOnly: fit) {
                 squad = Self.buildSquad(ids: ai.squad.map(\.id), players: players, displayGw: gwFrom)
             }
+            let chipsMeta = (boot.chips ?? []).map {
+                ChipMeta(name: $0.name, start: $0.start_event, stop: $0.stop_event)
+            }
             let plan = Planner.plan(players: players, budgetM: budgetM, fitOnly: fit,
-                                    from: gwFrom, window: window, userSquad: userSquad)
+                                    from: gwFrom, window: window, userSquad: userSquad,
+                                    chipsMeta: chipsMeta)
             await MainActor.run {
                 if staleCustom {
                     self.customSquadIds = nil
