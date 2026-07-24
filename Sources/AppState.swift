@@ -71,16 +71,26 @@ final class AppState: ObservableObject {
             let players = engine.buildPlayers()
             var squad: SquadResult?
             var userSquad: [Player]?
-            if let ids = customIds, let custom = Self.buildSquad(ids: ids, players: players) {
-                userSquad = custom.squad
-                // display XI/captain/points for the selected GW only
-                squad = Self.buildSquad(ids: ids, players: players, displayGw: gwFrom)
-            } else if let ai = Optimizer.optimize(players: players, budgetM: budgetM, fitOnly: fit) {
+            var staleCustom = false
+            if let ids = customIds {
+                if let custom = Self.buildSquad(ids: ids, players: players) {
+                    userSquad = custom.squad
+                    // display XI/captain/points for the selected GW only
+                    squad = Self.buildSquad(ids: ids, players: players, displayGw: gwFrom)
+                } else {
+                    staleCustom = true // a saved player no longer exists — fall back to AI
+                }
+            }
+            if squad == nil, let ai = Optimizer.optimize(players: players, budgetM: budgetM, fitOnly: fit) {
                 squad = Self.buildSquad(ids: ai.squad.map(\.id), players: players, displayGw: gwFrom)
             }
             let plan = Planner.plan(players: players, budgetM: budgetM, fitOnly: fit,
                                     from: gwFrom, window: window, userSquad: userSquad)
             await MainActor.run {
+                if staleCustom {
+                    self.customSquadIds = nil
+                    UserDefaults.standard.removeObject(forKey: Self.customKey)
+                }
                 self.players = players
                 self.squad = squad
                 self.plan = plan

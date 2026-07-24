@@ -25,8 +25,8 @@ struct PlayerDetailSheet: View {
                             onSwap(player)
                         } label: {
                             Label("Swap this player", systemImage: "arrow.left.arrow.right")
-                                .font(.system(size: 15, weight: .bold))
-                                .foregroundColor(.black)
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(.white)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 14)
                                 .background(Theme.lime)
@@ -45,7 +45,7 @@ struct PlayerDetailSheet: View {
                 }
             }
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
     }
 
     var header: some View {

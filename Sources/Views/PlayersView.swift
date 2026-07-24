@@ -4,7 +4,7 @@ struct PlayersView: View {
     @EnvironmentObject var state: AppState
     @State private var search = ""
     @State private var posFilter = 0
-    @State private var maxPrice = 15.5
+    @State private var maxPrice = 16.0
     @State private var sortMode: SortMode = .proj
     @State private var detail: Player?
 
@@ -30,6 +30,19 @@ struct PlayersView: View {
         case .price: list.sort { $0.cost != $1.cost ? $0.cost < $1.cost : $0.proj > $1.proj }
         }
         return Array(list.prefix(100))
+    }
+
+    func filterChip(icon: String, text: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon).font(.system(size: 9, weight: .semibold))
+            Text(text).font(.mono(11))
+            Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
+        }
+        .foregroundColor(Theme.cyan)
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(Theme.panel)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
     }
 
     var body: some View {
@@ -68,16 +81,16 @@ struct PlayersView: View {
                         Button(m.rawValue) { sortMode = m }
                     }
                 } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: "arrow.up.arrow.down").font(.system(size: 9, weight: .bold))
-                        Text("Sort: \(sortMode.rawValue)").font(.mono(11))
-                        Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
+                    filterChip(icon: "arrow.up.arrow.down", text: "Sort: \(sortMode.rawValue)")
+                }
+                Menu {
+                    Button("Any price") { maxPrice = 16 }
+                    ForEach([12.0, 10.0, 8.0, 6.5, 5.5, 4.5], id: \.self) { p in
+                        Button("≤ £\(String(format: "%.1f", p))m") { maxPrice = p }
                     }
-                    .foregroundColor(Theme.cyan)
-                    .padding(.horizontal, 11).padding(.vertical, 7)
-                    .background(Theme.panel)
-                    .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
-                    .clipShape(Capsule())
+                } label: {
+                    filterChip(icon: "sterlingsign.circle",
+                               text: maxPrice >= 16 ? "Any price" : "≤ £\(String(format: "%.1f", maxPrice))m")
                 }
                 Spacer()
             }

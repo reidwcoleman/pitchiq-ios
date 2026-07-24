@@ -1,21 +1,23 @@
 import SwiftUI
 
+// Light, calm palette: warm paper background, white cards, soft shadows,
+// a single confident green accent, muted supporting colors.
 enum Theme {
-    static let bg = Color(red: 0.039, green: 0.055, blue: 0.043)        // #0A0E0B
-    static let bg2 = Color(red: 0.063, green: 0.086, blue: 0.063)       // #101610
-    static let panel = Color(red: 0.075, green: 0.106, blue: 0.078)     // #131B14
-    static let line = Color(red: 0.141, green: 0.188, blue: 0.122)      // #24301F
-    static let ink = Color(red: 0.929, green: 0.953, blue: 0.894)       // #EDF3E4
-    static let inkDim = Color(red: 0.557, green: 0.627, blue: 0.541)    // #8EA08A
-    static let lime = Color(red: 0.831, green: 1.0, blue: 0.247)        // #D4FF3F
-    static let limeDim = Color(red: 0.616, green: 0.749, blue: 0.165)   // #9DBF2A
-    static let magenta = Color(red: 1.0, green: 0.239, blue: 0.541)     // #FF3D8A
-    static let cyan = Color(red: 0.310, green: 0.847, blue: 0.878)      // #4FD8E0
-    static let red = Color(red: 1.0, green: 0.365, blue: 0.365)         // #FF5D5D
-    static let amber = Color(red: 1.0, green: 0.722, blue: 0.310)       // #FFB84F
-    static let green = Color(red: 0.435, green: 0.890, blue: 0.533)     // #6FE388
-    static let pitchDark = Color(red: 0.075, green: 0.137, blue: 0.086)
-    static let pitchLight = Color(red: 0.086, green: 0.157, blue: 0.102)
+    static let bg = Color(hex: 0xF6F7F2)        // warm paper
+    static let bg2 = Color(hex: 0xEEF1E8)       // slightly deeper paper
+    static let panel = Color.white
+    static let line = Color(hex: 0xE5E8DE)      // hairline
+    static let ink = Color(hex: 0x25301F)       // deep green-gray text
+    static let inkDim = Color(hex: 0x8A9384)    // secondary text
+    static let lime = Color(hex: 0x2E9C5C)      // primary accent (fresh green)
+    static let limeDim = Color(hex: 0x8FCBA8)
+    static let magenta = Color(hex: 0xE2647F)   // captain rose
+    static let cyan = Color(hex: 0x5490BC)      // info blue
+    static let red = Color(hex: 0xD96057)
+    static let amber = Color(hex: 0xDD9A3E)
+    static let green = Color(hex: 0x2E9C5C)
+    static let pitchDark = Color(hex: 0xCFE7C6)  // soft pitch stripes
+    static let pitchLight = Color(hex: 0xD9EDD0)
 
     static let teamColors: [String: Color] = [
         "ARS": Color(hex: 0xEF0107), "AVL": Color(hex: 0x67122e), "BOU": Color(hex: 0xB50E12),
@@ -30,7 +32,7 @@ enum Theme {
     ]
 
     static func teamColor(_ short: String) -> Color {
-        teamColors[short] ?? Color(hex: 0x3a4a38)
+        teamColors[short] ?? Color(hex: 0x9AA694)
     }
 
     static func diffColor(_ d: Int) -> Color {
@@ -38,7 +40,7 @@ enum Theme {
         case 2: return green
         case 4: return amber
         case 5: return red
-        default: return inkDim
+        default: return Color(hex: 0x97A091)
         }
     }
 }
@@ -55,7 +57,7 @@ extension Color {
 
 extension Font {
     static func mono(_ size: CGFloat, _ weight: Font.Weight = .semibold) -> Font {
-        .system(size: size, weight: weight, design: .monospaced)
+        .system(size: size, weight: weight, design: .rounded)
     }
     static func label(_ size: CGFloat = 10) -> Font {
         .system(size: size, weight: .semibold)
@@ -66,8 +68,9 @@ struct PanelStyle: ViewModifier {
     func body(content: Content) -> some View {
         content
             .background(Theme.panel)
-            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.line, lineWidth: 1))
-            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.line, lineWidth: 1))
+            .shadow(color: Color.black.opacity(0.04), radius: 10, x: 0, y: 3)
     }
 }
 

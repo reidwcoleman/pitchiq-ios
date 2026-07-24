@@ -83,7 +83,7 @@ struct GWPlanCard: View {
             }
 
             HStack(spacing: 6) {
-                Text("C").font(.system(size: 10, weight: .black)).foregroundColor(.black)
+                Text("C").font(.system(size: 10, weight: .heavy)).foregroundColor(.white)
                     .frame(width: 17, height: 17).background(Theme.magenta).clipShape(Circle())
                 Text(gwPlan.captain.name).font(.system(size: 13, weight: .heavy)).foregroundColor(Theme.ink)
                 Text("(\(String(format: "%.1f", gwPlan.captain.proj))×2)")
@@ -144,7 +144,7 @@ struct GWPlanCard: View {
                                 .frame(width: 32, alignment: .leading)
                             Text(p.name).font(.system(size: 12.5, weight: .semibold)).foregroundColor(Theme.ink)
                             if p.id == gwPlan.captain.id {
-                                Text("C").font(.system(size: 8, weight: .black)).foregroundColor(.black)
+                                Text("C").font(.system(size: 8, weight: .heavy)).foregroundColor(.white)
                                     .frame(width: 13, height: 13).background(Theme.magenta).clipShape(Circle())
                             }
                             Spacer()

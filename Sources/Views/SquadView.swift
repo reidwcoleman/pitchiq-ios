@@ -85,14 +85,21 @@ struct PitchGrid: View {
         (1...4).map { pos in result.xi.filter { $0.pos == pos } }
     }
 
+    // size cards to the row so 4- and 5-player lines never clip the screen
+    func cardWidth(_ n: Int) -> CGFloat {
+        let available = UIScreen.main.bounds.width - 28 - 20 - CGFloat(max(n - 1, 0)) * 8
+        return min(84, available / CGFloat(max(n, 1)))
+    }
+
     var body: some View {
         VStack(spacing: 18) {
             ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     ForEach(row) { p in
                         PlayerCard(player: p,
                                    isCaptain: p.id == result.captain.id,
-                                   isVice: p.id == result.vice.id)
+                                   isVice: p.id == result.vice.id,
+                                   width: cardWidth(row.count))
                             .onTapGesture { onTap(p) }
                     }
                 }
@@ -107,16 +114,17 @@ struct PitchGrid: View {
                         (i % 2 == 0 ? Theme.pitchLight : Theme.pitchDark)
                     }
                 }
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(Theme.ink.opacity(0.12), lineWidth: 1.5)
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.white.opacity(0.75), lineWidth: 1.5)
                     .padding(10)
                 Circle()
-                    .stroke(Theme.ink.opacity(0.10), lineWidth: 1.5)
+                    .stroke(Color.white.opacity(0.65), lineWidth: 1.5)
                     .frame(width: 110, height: 110)
             }
         )
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color(hex: 0x27402a), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color(hex: 0xBFDCB4), lineWidth: 1))
+        .shadow(color: Color.black.opacity(0.05), radius: 12, x: 0, y: 4)
     }
 }
 
@@ -125,15 +133,16 @@ struct PlayerCard: View {
     var isCaptain = false
     var isVice = false
     var compact = false
+    var width: CGFloat = 82
 
     var body: some View {
         VStack(spacing: 4) {
             ShirtShape()
                 .fill(Theme.teamColor(player.teamShort))
-                .overlay(ShirtShape().stroke(Color.white.opacity(0.2), lineWidth: 1))
+                .overlay(ShirtShape().stroke(Color.black.opacity(0.08), lineWidth: 1))
                 .frame(width: 30, height: 26)
             Text(player.name)
-                .font(.system(size: 11, weight: .heavy))
+                .font(.system(size: 11, weight: .bold))
                 .foregroundColor(Theme.ink)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
@@ -149,18 +158,19 @@ struct PlayerCard: View {
                 .clipShape(RoundedRectangle(cornerRadius: 5))
         }
         .padding(6)
-        .frame(width: compact ? 76 : 82)
-        .background(Theme.bg.opacity(0.88))
-        .overlay(RoundedRectangle(cornerRadius: 11).stroke(Theme.line, lineWidth: 1))
-        .clipShape(RoundedRectangle(cornerRadius: 11))
+        .frame(width: compact ? 76 : width)
+        .background(Theme.panel)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .shadow(color: Color.black.opacity(0.08), radius: 5, x: 0, y: 2)
         .overlay(alignment: .topTrailing) {
             if isCaptain || isVice {
                 Text(isCaptain ? "C" : "V")
-                    .font(.system(size: 11, weight: .black))
-                    .foregroundColor(.black)
+                    .font(.system(size: 11, weight: .heavy))
+                    .foregroundColor(.white)
                     .frame(width: 20, height: 20)
                     .background(isCaptain ? Theme.magenta : Theme.cyan)
                     .clipShape(Circle())
+                    .shadow(color: Color.black.opacity(0.15), radius: 3, x: 0, y: 1)
                     .offset(x: 6, y: -6)
             }
         }
@@ -278,6 +288,18 @@ struct SwapSheet: View {
                 .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
                 .padding(.horizontal, 16)
 
+                if candidates.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass").font(.system(size: 24)).foregroundColor(Theme.inkDim)
+                        Text(search.isEmpty
+                             ? "No affordable replacements — free up budget by downgrading another player first."
+                             : "No matches for “\(search)”.")
+                            .font(.system(size: 13)).foregroundColor(Theme.inkDim)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 30)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 180)
+                }
                 ScrollView {
                     LazyVStack(spacing: 6) {
                         ForEach(candidates) { p in
@@ -326,7 +348,7 @@ struct SwapSheet: View {
                 }
             }
         }
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
     }
 }
 
