@@ -155,24 +155,24 @@ enum Planner {
 
             switch meta.name {
             case "3xc":
-                var bestGw: Int?; var bestGain = 0.0
+                var bestGw: Int?; var bestGain = -1.0
                 for gp in base.gws where free.contains(gp.gw) {
                     if gp.captain.proj > bestGain { bestGain = gp.captain.proj; bestGw = gp.gw }
                 }
-                if let g = bestGw, bestGain > 0 {
+                if let g = bestGw {
                     actions[g] = .tripleCaptain
-                    plays.append(ChipPlay(chip: "3xc", gw: g, gain: bestGain))
+                    plays.append(ChipPlay(chip: "3xc", gw: g, gain: max(bestGain, 0)))
                 }
 
             case "bboost":
-                var bestGw: Int?; var bestGain = 0.0
+                var bestGw: Int?; var bestGain = -1.0
                 for gp in base.gws where free.contains(gp.gw) {
                     let benchPts = gp.bench.reduce(0) { $0 + $1.proj }
                     if benchPts > bestGain { bestGain = benchPts; bestGw = gp.gw }
                 }
-                if let g = bestGw, bestGain > 0 {
+                if let g = bestGw {
                     actions[g] = .benchBoost
-                    plays.append(ChipPlay(chip: "bboost", gw: g, gain: bestGain))
+                    plays.append(ChipPlay(chip: "bboost", gw: g, gain: max(bestGain, 0)))
                 }
 
             case "freehit":
@@ -200,12 +200,13 @@ enum Planner {
                     }
                 }
                 if let b = best {
-                    let gain = b.pts - (basePts[b.gw] ?? 0)
-                    if gain > 1 {
-                        actions[b.gw] = .freeHit(xi: b.sq.xi, bench: b.sq.bench, captain: b.sq.captain,
-                                                 formation: b.sq.formation, pts: b.pts)
-                        plays.append(ChipPlay(chip: "freehit", gw: b.gw, gain: gain))
-                    }
+                    // always play it — the chip expires at the half; the pick
+                    // gravitates to double-gameweeks automatically because
+                    // two-fixture players carry doubled projections that week
+                    let gain = max(b.pts - (basePts[b.gw] ?? 0), 0)
+                    actions[b.gw] = .freeHit(xi: b.sq.xi, bench: b.sq.bench, captain: b.sq.captain,
+                                             formation: b.sq.formation, pts: b.pts)
+                    plays.append(ChipPlay(chip: "freehit", gw: b.gw, gain: gain))
                 }
 
             case "wildcard":
@@ -219,7 +220,7 @@ enum Planner {
                         .map { $0.reprojected(weightedValue($0, from: g, to: end)) }
                         .sorted { $0.proj > $1.proj }
                     guard let nsq = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly,
-                                                       iters: 4000, restarts: 2) else { continue }
+                                                       iters: 8000, restarts: 3) else { continue }
                     let newSquad = nsq.squad.compactMap { byId[$0.id] }
                     guard newSquad.count == 15 else { continue }
                     let rest = simulate(players: players, pool: pool, budget: budget,
@@ -230,9 +231,16 @@ enum Planner {
                     let gain = rest.totalPts - baseRest
                     if best == nil || gain > best!.gain { best = (g, gain, newSquad) }
                 }
-                if let b = best, b.gain > 0.5 {
-                    actions[b.gw] = .wildcard(b.squad)
-                    plays.append(ChipPlay(chip: "wildcard", gw: b.gw, gain: b.gain))
+                // always play it — each wildcard expires at its half's deadline,
+                // so it goes on the best rebuild week available
+                if let b = best {
+                    // only actually swap squads if the rebuild doesn't lose points
+                    if b.gain >= -0.5 {
+                        actions[b.gw] = .wildcard(b.squad)
+                    } else if let keep = base.squadAtStart[b.gw] {
+                        actions[b.gw] = .wildcard(keep) // "paper" wildcard: keep the squad
+                    }
+                    plays.append(ChipPlay(chip: "wildcard", gw: b.gw, gain: max(b.gain, 0)))
                 } else {
                     heldChips.append("wildcard")
                 }

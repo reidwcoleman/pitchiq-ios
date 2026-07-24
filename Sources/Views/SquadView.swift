@@ -276,9 +276,12 @@ struct WhyCard: View {
             case "bboost":
                 out.append("Bench Boost played now: this bench projects \(String(format: "%.1f", benchSum)) pts, the strongest bench week in this half — those points only count because the chip is active.")
             case "freehit":
-                out.append("Free Hit played now: this is the biggest gap between the best possible one-week team (doubles included) and what your real squad would score — the dream team below reverts automatically next week.")
+                let doubles = gwPlan.xi.filter {
+                    (state.gridFixtures(teamId: $0.team, gws: [gwPlan.gw]).first ?? []).count >= 2
+                }.count
+                out.append("Free Hit played now: the biggest gap in this half between the best possible one-week team and what your real squad would score.\(doubles > 0 ? " \(doubles) of the 11 have TWO fixtures this gameweek — double the chances to score." : " If double gameweeks get announced later, the plan re-runs and moves the Free Hit to the biggest one.") The dream team below reverts automatically next week.")
             case "wildcard":
-                out.append("Wildcard played now: rebuilding with unlimited free transfers here beats any sequence of weekly transfers for the rest of the season.")
+                out.append("Wildcard played now: unlimited free transfers to rebuild for the run ahead. Each wildcard expires at its half's deadline, so it's placed on the best rebuild week rather than wasted.")
             default: break
             }
         }
@@ -307,10 +310,7 @@ struct WhyCard: View {
                 : "This 15 was chosen to score now AND stay strong for the whole season — near gameweeks count most, but every remaining fixture through GW 38 is weighed in.")
             if let plan = state.plan, !plan.chips.isEmpty {
                 let list = plan.chips.map { "\(chipDisplayName($0.chip)) GW\($0.gw)" }.joined(separator: ", ")
-                out.append("Chips scheduled across the season: \(list). Each is placed where it earns the most (Free Hit chases the biggest one-week ceiling — doubles included; Bench Boost the strongest bench week; Triple Captain the best captain score).")
-            }
-            if let plan = state.plan, !plan.heldChips.isEmpty {
-                out.append("\(plan.heldChips.count) wildcard(s) held in reserve — right now a full rebuild gains nothing over weekly transfers. The plan refreshes after every gameweek and will schedule them the moment injuries or form swings make a rebuild worthwhile.")
+                out.append("All chips scheduled: \(list). You get two of each — the first set must be used by GW 19, the second from GW 20 — so none go unused. Each lands where it earns the most: Free Hit on the biggest one-week ceiling (double-fixture players when doubles exist), Bench Boost on the strongest bench week, Triple Captain on the best captain score, Wildcard on the best rebuild week.")
             }
         }
         if gwPlan.xi.contains(where: { $0.flagged }) || gwPlan.bench.contains(where: { $0.flagged }) {
