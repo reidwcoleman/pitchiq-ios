@@ -86,6 +86,26 @@ enum Optimizer {
         return r.total + r.capProj + 0.12 * r.benchSum
     }
 
+    /// What a bench place is worth relative to a starting place when judging a
+    /// transfer. Not zero — a substitute covers a starter who doesn't play, and
+    /// counts in full under Bench Boost — but close to it. A fourth-choice
+    /// forward scores you nothing on a normal weekend.
+    static let benchValue = 0.10
+
+    /// The points a fifteen actually contributes in one gameweek: the best legal
+    /// XI, the captain counted twice, and a small allowance for the bench.
+    ///
+    /// This is the number a transfer has to move. Ranking transfers by the
+    /// change in a *player's* projection instead — which is what this app used
+    /// to do — rates an upgrade to the player sitting fourth on your bench
+    /// exactly as highly as the same upgrade to a starter, even though the first
+    /// one cannot score you a single point.
+    @inline(__always)
+    static func scoringValue(_ squad: [Pick]) -> Double {
+        guard let r = evaluate(squad) else { return -1e9 }
+        return r.total + r.capProj + benchValue * r.benchSum
+    }
+
     /// Budget and the max-three-per-club rule. Allocation-free.
     static func feasible(_ squad: [Pick], budget: Int) -> Bool {
         var cost = 0

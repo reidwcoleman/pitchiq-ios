@@ -193,6 +193,48 @@ enough for fixtures to genuinely diverge, and when form and injuries have pulled
 players apart. At GW1 it mostly confirms that the near-term and season-long
 answers agree.
 
+### What a transfer is worth
+
+A transfer's gain is the change in **what the squad actually scores** — best XI,
+captain doubled, plus a tenth of the bench — summed over the next twelve
+gameweeks with the usual discount.
+
+It is not the change in the incoming player's own projection, which is what this
+measured until recently. By that standard, replacing the fourth-choice forward
+who never leaves your bench with a slightly better fourth-choice forward scored
+exactly as well as the same upgrade to a starter, and the planner duly spent free
+transfers on players who could not earn it a single point. Bench points only
+count through auto-substitutions and Bench Boost, hence the tenth rather than
+zero.
+
+Two guards sit on top:
+
+**A floor.** A move must add at least 0.10 points to the eleven to be worth
+making, however many free transfers are spare. "Free" is not "costless" — the
+transfer you spend is the one you wanted next week. Swept against a full season:
+
+```
+floor  transfers  →XI  →bench   season pts   pts per transfer
+0.00          28   18      10       2164.5           +0.21
+0.05          20   16       4       2163.9           +0.27
+0.10           9    8       1       2161.7           +0.36
+0.20           4    4       0       2159.4           +0.23
+0.30           1    1       0       2158.6           +0.05
+```
+
+With no floor the planner makes 28 transfers a season, ten of them on players who
+never leave the bench, for 0.21 points each. At 0.10 it makes nine, eight of which
+walk straight into the eleven, and earns nearly twice as much per move — giving up
+2.8 points that were being chased through model noise, since no projection is
+accurate to a twentieth of a point.
+
+**A holding period.** Selling a player bought within six gameweeks, or buying back
+one sold that recently, costs a full point of gain. Without it the planner sold a
+man it had bought two gameweeks earlier and bought him back the week after,
+because a small fixture swing flipped the ordering — advice no manager would
+follow, and a real loss in practice, since you buy at the risen price and sell
+after the fall that follows.
+
 ### Season plan (`Planner.swift`)
 
 Simulates every remaining gameweek under the real rules: one free transfer a week
@@ -220,8 +262,8 @@ read + decode JSON (1.3 MB)      28.2 ms
 build projection engine           0.3 ms
 project 558 players × 38 GW       2.1 ms
 solve optimal XV                  3.1 ms
-plan 38 gameweeks + chips        40.4 ms
-all decision tools                8.8 ms
+plan 38 gameweeks + chips       117.5 ms
+all decision tools                2.4 ms
 ```
 
 The launch itself is faster than any of that suggests: the app renders from its

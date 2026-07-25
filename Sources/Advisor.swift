@@ -50,6 +50,10 @@ enum Advisor {
         let gainWindow: Double      // over the chosen horizon
         let gainWeighted: Double    // decay-weighted to the end of the season
         let spend: Int              // tenths of £m taken out of the bank
+        /// Whether the outgoing player is in the current starting eleven.
+        /// A move on a substitute cannot add points on a normal weekend, and
+        /// saying so is more useful than hiding the row.
+        let outStarts: Bool
         var reasons: [String]
     }
 
@@ -69,13 +73,31 @@ enum Advisor {
         var bestSingle: TransferOption? { options.first }
     }
 
-    /// Rank every legal single transfer out of `squad`.
+    /// How many gameweeks ahead a transfer is judged over.
+    static let lookahead = 12
+
+    /// The points a fifteen actually scores in one gameweek.
+    @inline(__always)
+    private static func scoring(_ picks: [Pick]) -> Double { Optimizer.scoringValue(picks) }
+
+    /// Rank every legal single transfer out of `squad` by what it does to the
+    /// points the squad actually scores.
+    ///
+    /// The gain of a move is the change in best XI + captain + a tenth of the
+    /// bench, summed across the coming gameweeks. Measuring the change in the
+    /// incoming player's own projection instead — which is what this did before
+    /// — treats an upgrade to the man sitting fourth on your bench as worth the
+    /// same as an upgrade to a starter. Bench points don't count unless you play
+    /// Bench Boost, so those moves are worth close to nothing and now score that
+    /// way.
     static func transferBoard(squad: [Player], players: [Player], from gw: Int,
                               horizon: Int, bank: Int, fitOnly: Bool,
                               limit: Int = 40) -> TransferBoard {
         guard squad.count == 15 else { return TransferBoard() }
         let end = 38
         let hi = min(gw + horizon - 1, 38)
+        let last = min(gw + lookahead - 1, 38)
+        let weeks = Array(gw...last)
         let ids = Set(squad.map(\.id))
         var clubs: [Int: Int] = [:]
         for p in squad { clubs[p.team, default: 0] += 1 }
@@ -83,54 +105,77 @@ enum Advisor {
             !ids.contains($0.id) && (fitOnly ? !$0.flagged : $0.avail > 0.4) && $0.proj > 0
         }
 
+        // the squad as it stands, one Pick array per gameweek in the window
+        var base: [[Pick]] = weeks.map { h in squad.map { $0.pick($0.projByGw.at(h)) } }
+        let baseValue = base.map { scoring($0) }
+        let startingXI = Set(
+            Optimizer.bestXI(squad.map { $0.reprojected($0.projByGw.at(gw)) })?.xi.map(\.id) ?? [])
+
+        /// Gains for putting `cand` into `slot`, measured on the real objective.
+        func measure(slot: Int, cand: Player) -> (next: Double, window: Double, weighted: Double) {
+            var next = 0.0, win = 0.0, wtd = 0.0
+            var w = 1.0
+            for (k, h) in weeks.enumerated() {
+                let keep = base[k][slot]
+                base[k][slot] = cand.pick(cand.projByGw.at(h))
+                let d = scoring(base[k]) - baseValue[k]
+                base[k][slot] = keep
+                if k == 0 { next = d }
+                if h <= hi { win += d }
+                wtd += d * w
+                w *= decay
+            }
+            return (next, win, wtd)
+        }
+
         var out: [TransferOption] = []
-        out.reserveCapacity(limit * 4)
-        for old in squad {
+        out.reserveCapacity(limit * 2)
+        for (slot, old) in squad.enumerated() {
             let maxCost = old.cost + bank
             let oldW = weighted(old, from: gw, to: end)
-            let oldWin = window(old, from: gw, count: max(hi - gw + 1, 1))
+            // Shortlist on the raw projection delta, which bounds the true gain,
+            // then score the survivors on the real objective.
+            var cands: [(Player, Double)] = []
             for cand in pool where cand.pos == old.pos && cand.cost <= maxCost {
                 let clubCount = clubs[cand.team, default: 0] - (cand.team == old.team ? 1 : 0)
                 guard clubCount < 3 else { continue }
-                // Negative-gain moves stay on the board. A squad that is
-                // already optimal produced an empty screen before, which reads
-                // as broken rather than as "you have nothing to do" — and the
-                // near misses are exactly what a manager wants to see before
-                // deciding to hold.
-                let gw2 = weighted(cand, from: gw, to: end) - oldW
-                out.append(TransferOption(
-                    out: old, inn: cand,
-                    gainNext: cand.projByGw.at(gw) - old.projByGw.at(gw),
-                    gainWindow: window(cand, from: gw, count: max(hi - gw + 1, 1)) - oldWin,
-                    gainWeighted: gw2,
-                    spend: cand.cost - old.cost,
-                    reasons: explain(out: old, inn: cand, gw: gw, horizon: horizon)))
+                cands.append((cand, weighted(cand, from: gw, to: end) - oldW))
             }
+            cands.sort { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0.id < $1.0.id }
+            var bestForSlot: TransferOption?
+            for (cand, _) in cands.prefix(14) {
+                let m = measure(slot: slot, cand: cand)
+                let option = TransferOption(
+                    out: old, inn: cand,
+                    gainNext: m.next, gainWindow: m.window, gainWeighted: m.weighted,
+                    spend: cand.cost - old.cost,
+                    outStarts: startingXI.contains(old.id),
+                    reasons: explain(out: old, inn: cand, gw: gw, horizon: horizon))
+                if bestForSlot == nil || m.weighted > bestForSlot!.gainWeighted {
+                    bestForSlot = option
+                }
+            }
+            // One row per player you could sell, showing their best replacement.
+            if let o = bestForSlot { out.append(o) }
         }
         out.sort {
             $0.gainWeighted != $1.gainWeighted ? $0.gainWeighted > $1.gainWeighted
                 : $0.inn.id < $1.inn.id
         }
-
-        // One row per player you could sell, showing their best replacement.
-        // Listing every pairing filled the screen with ten ways to sell the same
-        // fourth-choice forward.
-        var seenOut = Set<Int>()
-        var ranked: [TransferOption] = []
-        for o in out where ranked.count < limit {
-            guard seenOut.insert(o.out.id).inserted else { continue }
-            ranked.append(o)
-        }
-        // pairs only make sense from moves that actually gain
-        let positive = ranked.filter { $0.gainWeighted > 0 }
+        // A near-zero move on a substitute is not a suggestion — it swaps one
+        // player who scores you nothing for another. Rows on bench players stay
+        // when they genuinely gain (a good enough replacement forces its way
+        // into the eleven), and are dropped when they don't.
+        let ranked = Array(out.filter { $0.outStarts || $0.gainWeighted >= 0.1 }.prefix(limit))
 
         var board = TransferBoard(options: ranked)
-        board.pairs = pairs(positive, bank: bank, squad: squad)
+        board.pairs = pairs(ranked.filter { $0.gainWeighted > 0 }, bank: bank,
+                            squad: squad, weeks: Array(gw...hi), base: base, baseValue: baseValue)
         if let best = ranked.first {
             board.holdReason = best.gainWeighted < 0.8
                 ? (best.gainWeighted <= 0
-                   ? "No transfer improves this squad — every legal move projects to lose points. Bank the free transfer and reassess after team news."
-                   : String(format: "The best move on the board gains %.1f pts. A saved free transfer is worth about that much on its own, so banking it and waiting for team news is the stronger play.", best.gainWeighted))
+                   ? "No transfer improves this squad — every legal move projects to lose points off the eleven that actually score. Bank the free transfer and reassess after team news."
+                   : String(format: "The best move on the board adds %.1f pts to your starting eleven. A saved free transfer is worth about that much on its own, so banking it and waiting for team news is the stronger play.", best.gainWeighted))
                 : ""
         } else {
             board.holdReason = "No legal transfer improves this squad. Bank the free transfer."
@@ -138,15 +183,22 @@ enum Advisor {
         return board
     }
 
-    /// Two moves that only work together — most often selling two mid-price
-    /// players to fund one premium, which a one-at-a-time search never sees.
-    private static func pairs(_ options: [TransferOption], bank: Int,
-                              squad: [Player]) -> [SecondMove] {
+    /// Two moves scored *together*, on the same objective. Summing two
+    /// individual gains double-counts whenever both incoming players compete for
+    /// the same starting place — two new midfielders can't both displace the
+    /// same man.
+    private static func pairs(_ options: [TransferOption], bank: Int, squad: [Player],
+                              weeks: [Int], base: [[Pick]], baseValue: [Double]) -> [SecondMove] {
+        guard !weeks.isEmpty else { return [] }
+        var slotOf: [Int: Int] = [:]
+        for (i, p) in squad.enumerated() { slotOf[p.id] = i }
+        var scratch = base
         var out: [SecondMove] = []
-        for (i, a) in options.prefix(14).enumerated() {
-            for b in options.prefix(14).dropFirst(i + 1) {
-                guard a.out.id != b.out.id, a.inn.id != b.inn.id else { continue }
-                guard a.spend + b.spend <= bank else { continue }
+        for (i, a) in options.prefix(12).enumerated() {
+            for b in options.prefix(12).dropFirst(i + 1) {
+                guard a.out.id != b.out.id, a.inn.id != b.inn.id,
+                      let sa = slotOf[a.out.id], let sb = slotOf[b.out.id],
+                      a.spend + b.spend <= bank else { continue }
                 // the max-three rule has to hold for the pair, not just each move
                 var clubs: [Int: Int] = [:]
                 for p in squad where p.id != a.out.id && p.id != b.out.id {
@@ -155,7 +207,16 @@ enum Advisor {
                 clubs[a.inn.team, default: 0] += 1
                 clubs[b.inn.team, default: 0] += 1
                 guard clubs.values.allSatisfy({ $0 <= 3 }) else { continue }
-                let total = a.gainWindow + b.gainWindow
+
+                var total = 0.0
+                for (k, h) in weeks.enumerated() where k < scratch.count {
+                    let ka = scratch[k][sa], kb = scratch[k][sb]
+                    scratch[k][sa] = a.inn.pick(a.inn.projByGw.at(h))
+                    scratch[k][sb] = b.inn.pick(b.inn.projByGw.at(h))
+                    total += Optimizer.scoringValue(scratch[k]) - baseValue[k]
+                    scratch[k][sa] = ka
+                    scratch[k][sb] = kb
+                }
                 out.append(SecondMove(first: a, second: b, totalWindowGain: total,
                                       netAfterHit: total - 4))
             }
@@ -187,6 +248,9 @@ enum Advisor {
         }
         if inn.penTaker && !old.penTaker { r.append("\(inn.name) is on penalties.") }
         if inn.setPieces && !old.setPieces { r.append("\(inn.name) takes set pieces.") }
+        if !old.flagged, inn.proj > old.proj + 0.5 {
+            r.append("Walks straight into the eleven ahead of \(old.name).")
+        }
         if inn.own < 8 && inn.proj > old.proj {
             r.append(String(format: "Differential: %.1f%% owned.", inn.own))
         }

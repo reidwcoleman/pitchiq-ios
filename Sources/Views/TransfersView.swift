@@ -77,7 +77,7 @@ struct TransfersView: View {
 
             VStack(alignment: .leading, spacing: 10) {
                 SectionLabel(text: "Every move, ranked")
-                Text("Sorted by points gained across the remaining season, with later weeks discounted. Tap a row for the reasoning.")
+                Text("Sorted by what each move adds to your **starting eleven** across the coming gameweeks — not by the incoming player's own projection. Bench points don't count unless you play Bench Boost. Tap a row for the reasoning.")
                     .font(.system(size: 11.5)).foregroundColor(Theme.inkDim)
                 ForEach(board.options.prefix(20)) { o in
                     TransferOptionRow(option: o, horizon: state.horizon)
@@ -297,7 +297,8 @@ struct TransferOptionRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
-                Tag(text: option.out.posShort, color: option.out.posColor)
+                Tag(text: option.outStarts ? option.out.posShort : "BENCH",
+                    color: option.outStarts ? option.out.posColor : Theme.inkDim)
                 Text(option.out.name)
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(Theme.inkDim).strikethrough().lineLimit(1)
