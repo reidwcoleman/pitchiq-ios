@@ -253,6 +253,16 @@ struct ReasonCard: View {
 struct ChipStrip: View {
     let plan: SeasonPlan
 
+    /// You get two of each chip a season, so held ones come in pairs — listing
+    /// "Free Hit, Free Hit" reads like a bug.
+    var heldSummary: String {
+        var counts: [String: Int] = [:]
+        for c in plan.heldChips { counts[c, default: 0] += 1 }
+        return counts.keys.sorted()
+            .map { counts[$0]! > 1 ? "\(chipDisplayName($0)) ×\(counts[$0]!)" : chipDisplayName($0) }
+            .joined(separator: ", ")
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionLabel(text: "Chip plan")
@@ -278,8 +288,7 @@ struct ChipStrip: View {
             }
             if !plan.heldChips.isEmpty {
                 Divider().background(Theme.line)
-                let names = plan.heldChips.map { chipDisplayName($0) }.joined(separator: ", ")
-                Text("Held back: \(names). Nothing in their windows clears the bar yet — double gameweeks in particular only get announced once postponed matches are rescheduled.")
+                Text("Held back: \(heldSummary). Nothing in their windows clears the bar yet — double gameweeks in particular only get announced once postponed matches are rescheduled.")
                     .font(.system(size: 12)).foregroundColor(Theme.inkDim)
                     .fixedSize(horizontal: false, vertical: true)
             }
