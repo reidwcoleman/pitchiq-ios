@@ -313,6 +313,8 @@ struct Player: Identifiable, Hashable {
     var penTaker = false
     var setPieces = false
     var startRate = 0.0     // P(starts) — the minutes-security number
+    var startSecurity = 0.0 // how safe the starting place looks over months, 0…1
+    var formMult = 1.0      // recent form as a multiplier on attacking output
 
     // distribution of next gameweek's score, not just its mean
     var ceiling = 0.0       // 90th-percentile return

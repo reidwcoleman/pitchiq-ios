@@ -202,6 +202,69 @@ enum Planner {
         return s[s.count / 2]
     }
 
+    // MARK: - what a player is worth for the rest of the season
+
+    /// How the remaining gameweeks are weighted when valuing a player to hold.
+    struct ValueProfile {
+        let name: String
+        let blurb: String
+        /// Weight the furthest gameweek still carries. Never zero: a squad that
+        /// is strong in August and thin in March wastes the season.
+        let tail: Double
+        /// How fast the near-term premium falls away.
+        let decay: Double
+    }
+
+    /// Three honest ways to answer "what is this player worth to me now", from
+    /// short-sighted to long-sighted. The planner builds a squad under each and
+    /// keeps whichever actually scores most over a simulated season.
+    static let profiles: [ValueProfile] = [
+        ValueProfile(name: "Next six",
+                     blurb: "weighted almost entirely on the coming fixture run",
+                     tail: 0.06, decay: 0.80),
+        ValueProfile(name: "Balanced",
+                     blurb: "the next few gameweeks count most, but every week to GW38 counts",
+                     tail: 0.38, decay: 0.82),
+        ValueProfile(name: "Whole season",
+                     blurb: "close to flat across all 38 — built for the long haul",
+                     tail: 0.75, decay: 0.85),
+    ]
+
+    /// Value of holding a player from `gw` to the end of the season.
+    ///
+    /// Three things are traded off:
+    ///
+    ///  • **Points now.** The nearest gameweeks are the ones you are certain to
+    ///    play him for, so they carry a premium.
+    ///  • **Points later.** The weight decays toward `tail`, not toward zero.
+    ///    The previous version used a flat 0.88 geometric decay, which put GW25
+    ///    at 4% of GW1 — so "best squad" quietly meant "best squad for about
+    ///    eight gameweeks", and the plan drifted every time the horizon moved.
+    ///  • **Whether he will still be playing.** A projection for April is worth
+    ///    what it says only if the player still starts in April. Far gameweeks
+    ///    are discounted by how secure the starting place looks, which is what
+    ///    separates a nailed-on starter from an equally-projected rotation risk
+    ///    over a full season.
+    static func seasonValue(_ p: Player, from gw: Int, to end: Int,
+                            profile: ValueProfile) -> Double {
+        var v = 0.0
+        var near = 1.0
+        let security = max(min(p.startSecurity, 1), 0)
+        var g = gw
+        var k = 0
+        while g <= end {
+            let horizonWeight = profile.tail + (1 - profile.tail) * near
+            let persistence = 1 - (1 - security) * min(Double(k) / 12, 1) * 0.45
+            v += p.projByGw.at(g) * horizonWeight * persistence
+            near *= profile.decay
+            g += 1
+            k += 1
+        }
+        return v
+    }
+
+    /// Kept for callers that want the plain geometric weighting (transfer
+    /// comparisons inside a single week, where persistence is not in question).
     static func weightedValue(_ p: Player, from gw: Int, to end: Int) -> Double {
         var v = 0.0, w = 1.0
         var g = gw
@@ -211,6 +274,65 @@ enum Planner {
             g += 1
         }
         return v
+    }
+
+    // MARK: - choosing the opening squad by simulation
+
+    struct OpeningSquad {
+        let ids: [Int]
+        let profile: String
+        /// Simulated points to GW38 for every profile tried, best first.
+        let trials: [(profile: String, blurb: String, points: Double, ids: [Int])]
+    }
+
+    /// Build a candidate squad under each value profile, then **simulate the
+    /// rest of the season** from each and keep the one that actually scores
+    /// most. The profiles are proxies; the simulation is the real objective, so
+    /// rather than trusting a hand-picked discount rate the planner tries
+    /// several and measures the result — transfers, chips, injuries, blanks and
+    /// all — the same way the plan the user reads is scored.
+    static func bestOpeningSquad(players: [Player], budgetM: Double, fitOnly: Bool,
+                                 from: Int, end: Int, incumbent: [Int]?,
+                                 incumbentMargin: Double) -> OpeningSquad? {
+        let poolPlayers = Optimizer.candidatePool(players, fitOnly: fitOnly)
+        let ctx = PlanContext(players: players, pool: poolPlayers, from: from, end: end)
+        let budget = Int((budgetM * 10).rounded())
+
+        func simulateSeason(_ ids: [Int]) -> Double? {
+            let compact = ids.compactMap { ctx.index[$0] }
+            guard compact.count == 15 else { return nil }
+            return simulate(ctx: ctx, budget: budget, from: from, end: end,
+                            initial: compact, initialFts: 0, allowFirstMoves: false,
+                            chips: [:], scoreOnly: true).totalPts
+        }
+
+        var trials: [(profile: String, blurb: String, points: Double, ids: [Int])] = []
+        for profile in profiles {
+            let scored = players.map {
+                $0.reprojected(seasonValue($0, from: from, to: end, profile: profile))
+            }
+            guard let sq = Optimizer.optimize(players: scored, budgetM: budgetM,
+                                              fitOnly: fitOnly) else { continue }
+            let ids = sq.squad.map(\.id)
+            guard let pts = simulateSeason(ids) else { continue }
+            trials.append((profile.name, profile.blurb, pts, ids))
+        }
+        guard !trials.isEmpty else { return nil }
+        trials.sort { $0.points != $1.points ? $0.points > $1.points : $0.profile < $1.profile }
+
+        // The squad already on screen is judged on exactly the same scale, and
+        // keeps its place unless it is beaten by a real margin. It is added to
+        // the list either way, so the comparison the decision rests on is the
+        // one the user actually sees.
+        var chosen = trials[0]
+        if let inc = incumbent, let incPts = simulateSeason(inc) {
+            let held = (profile: "Your current XV",
+                        blurb: "the fifteen already on screen, scored on the same scale",
+                        points: incPts, ids: inc)
+            if incPts + incumbentMargin >= chosen.points { chosen = held }
+            trials.insert(held, at: 0)
+        }
+        return OpeningSquad(ids: chosen.ids, profile: chosen.profile, trials: trials)
     }
 
     enum ChipAction {
@@ -249,12 +371,13 @@ enum Planner {
             fts0 = max(start.freeTransfers, 0)
             fromUser = start.isUserTeam
         } else {
-            // No imported team: build the squad that scores best across the
-            // whole remaining season, not just the next gameweek.
-            let scored = players.map { $0.reprojected(weightedValue($0, from: from, to: end)) }
-            guard let opening = Optimizer.optimize(players: scored, budgetM: budgetM,
-                                                   fitOnly: fitOnly) else { return nil }
-            squad0 = opening.squad.compactMap { ctx.index[$0.id] }
+            // No imported team: pick the opening squad by simulating the rest of
+            // the season under several value profiles and keeping the winner.
+            guard let opening = bestOpeningSquad(players: players, budgetM: budgetM,
+                                                 fitOnly: fitOnly, from: from, end: end,
+                                                 incumbent: nil, incumbentMargin: 0)
+            else { return nil }
+            squad0 = opening.ids.compactMap { ctx.index[$0] }
             fts0 = 0
             fromUser = false
         }

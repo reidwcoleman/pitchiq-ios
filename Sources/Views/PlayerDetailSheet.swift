@@ -19,6 +19,7 @@ struct PlayerDetailSheet: View {
                     if !full.news.isEmpty { newsBox }
                     outlookSection
                     projSection
+                    signalSection
                     statSection
                     fixtureSection
                     if canSwap { swapButton }
@@ -92,8 +93,15 @@ struct PlayerDetailSheet: View {
                          caption: "Haul 10+", color: Theme.magenta)
             }
             VStack(alignment: .leading, spacing: 7) {
-                meterRow("Minutes security", full.startRate, Theme.lime,
-                         String(format: "starts %.0f%% of matches", full.startRate * 100))
+                meterRow("Starting place", full.startSecurity, Theme.lime,
+                         security(full.startSecurity))
+                if abs(full.formMult - 1) > 0.02 {
+                    meterRow(full.formMult > 1 ? "In form" : "Out of form",
+                             min(abs(full.formMult - 1) / 0.45, 1),
+                             full.formMult > 1 ? Theme.green : Theme.red,
+                             String(format: "%+.0f%% on goals, assists and bonus",
+                                    (full.formMult - 1) * 100))
+                }
                 meterRow("Chance of a blank", full.blankProb, Theme.amber,
                          String(format: "%.0f%% chance of two points or fewer", full.blankProb * 100))
                 meterRow("Ownership", min(full.own / 60, 1), Theme.cyan,
@@ -107,6 +115,17 @@ struct PlayerDetailSheet: View {
         }
     }
 
+    /// Plain-language reading of the squad-status number, which is a blend of
+    /// start rate, starts per 90 played and minutes per appearance.
+    func security(_ v: Double) -> String {
+        switch v {
+        case 0.85...: return "nailed on — starts and finishes matches"
+        case 0.65..<0.85: return "regular starter, occasionally hooked early"
+        case 0.45..<0.65: return "in and out of the side"
+        default: return "squad player — the minutes aren't there"
+        }
+    }
+
     func meterRow(_ title: String, _ frac: Double, _ color: Color, _ note: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
@@ -115,6 +134,42 @@ struct PlayerDetailSheet: View {
                 Text(note).font(.system(size: 10.5)).foregroundColor(Theme.inkDim)
             }
             Meter(fraction: frac, color: color, height: 5)
+        }
+    }
+
+    /// What the model is actually reading on this player. Without it the
+    /// projection is a number with no argument behind it.
+    var signalSection: some View {
+        var rows: [(String, String)] = []
+        rows.append(("Expected goals / 90", String(format: "%.2f", full.mins > 0 ? full.xg / Double(full.mins) * 90 : 0)))
+        rows.append(("Expected assists / 90", String(format: "%.2f", full.mins > 0 ? full.xa / Double(full.mins) * 90 : 0)))
+        rows.append(("Threat index", String(format: "%.0f", full.threat)))
+        rows.append(("Creativity index", String(format: "%.0f", full.creativity)))
+        rows.append(("Minutes per appearance", String(format: "%.0f'", full.expMins)))
+        if full.penTaker { rows.append(("Penalties", "first choice")) }
+        if full.setPieces { rows.append(("Set pieces", "on duty")) }
+        if full.costChangeStart != 0 {
+            rows.append(("Price since season start",
+                         String(format: "%+.1fm", Double(full.costChangeStart) / 10)))
+        }
+        return VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(text: "What the model reads")
+            VStack(spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { i, r in
+                    HStack {
+                        Text(r.0).font(.system(size: 12.5)).foregroundColor(Theme.inkDim)
+                        Spacer()
+                        Text(r.1).font(.mono(12, .bold)).foregroundColor(Theme.ink)
+                    }
+                    .padding(.vertical, 7)
+                    if i < rows.count - 1 { Divider().background(Theme.line) }
+                }
+            }
+            .padding(.horizontal, 13)
+            .panel()
+            Text("Each of these feeds the per-gameweek projection above, scaled by the opponent that week and whether the match is home or away.")
+                .font(.system(size: 11)).foregroundColor(Theme.inkDim)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

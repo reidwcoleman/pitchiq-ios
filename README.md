@@ -64,10 +64,49 @@ points totals:
 | Conceded | exact E⌊goals/2⌋ |
 | Saves | exact E⌊saves/3⌋ — FPL pays in whole blocks of three |
 | Defensive contribution | Poisson tail above the CBIT/CBIRT threshold |
-| Bonus, cards | realised rates shrunk to positional priors |
+| Bonus | realised rate, blended with a BPS estimate, shrunk to a positional prior |
+| Cards | realised yellow/red rates |
+| Form | the 30-day average against the season level, applied to goals, assists and bonus |
 
 That model is blended with the player's own scoring history and with FPL's
 `ep_next`, weighted by a smooth credibility term in minutes played.
+
+**Independent measurement channels.** FPL publishes threat, creativity and BPS
+indices built from different inputs than the expected-goals feed — shot location
+and volume, chances created, the full bonus rubric — so they carry information xG
+does not. Coefficients are fitted by least squares through the origin against
+every player with 900+ minutes in the source data, which means folding them in
+re-ranks players without moving the population mean:
+
+| Channel | | r (DEF / MID / FWD) |
+|---|---|---|
+| threat / 90 | → xG / 90 | 0.77 · 0.83 · 0.78 |
+| creativity / 90 | → xA / 90 | 0.86 · 0.88 · 0.73 |
+| bps / 90 | → bonus / 90 | 0.65 · 0.72 · 0.88 |
+
+Keepers are excluded from the BPS channel: their BPS barely predicts their bonus
+(r = 0.19).
+
+**Form** is points per match over the last 30 days; points per game is the
+season-long level. Their ratio is the trend, applied to the parts of a projection
+that genuinely move with a player's run of touch — goals, assists, bonus — and not
+to appearance points or his team's clean-sheet odds. The weight (0.4, clamped to
+0.72–1.45) is deliberately well under 1: four matches is a small sample and
+chasing it is the standard way to lose a season, but ignoring a player who has
+changed role or started taking the penalties throws away the freshest information
+available. Measured effect: doubling every player's form lifts projections by a
+median 17%. Form reads 0.0 for everyone until matches are played, so it is inert
+in pre-season by design.
+
+**Squad status** blends start rate, starts per 90 minutes played and minutes per
+appearance into one number. Two players can share a start rate and not share a
+role — one plays 90 every week, the other is hooked on the hour.
+
+**A defender's own record.** Team ratings come from the keeper's expected goals
+conceded, but a defender's own xGC/90 measures what the team conceded *while he
+was on the pitch*, which tracks goals actually conceded at r = 0.71. It is applied
+as a multiplier on the fixture's concession rate — for a Poisson clean sheet
+P(0) = e^-λ, so scaling λ by s is exactly P(0)^s.
 
 Fixture strength comes from per-club attack and defence ratings in expected goals
 per match, credibility-shrunk toward the league mean, with FPL's difficulty
@@ -101,9 +140,9 @@ Verified on live data:
 
 ```
 pool: 512 → 81 after dominance pruning
-full pool 353.4619 vs reduced pool 353.4619        pruning costs nothing
-cost £100.0m | quota 1:2 2:5 3:5 4:3 | max/club 2  all constraints hold
-3622 random legal squads: best 336.77 vs 353.46    never beaten
+full pool 348.8713 vs reduced pool 348.8713        pruning costs nothing
+cost £100.0m | quota 1:2 2:5 3:5 4:3 | max/club 3  all constraints hold
+3598 random legal squads: best 333.42 vs 348.87    never beaten
 same squad regardless of pool order                fully deterministic
 ```
 
@@ -113,7 +152,46 @@ whenever a single price ticked. Measured against live data, one day of ordinary
 price movement rewrote four or five of the fifteen — which is why the app used to
 show a different team on every visit. The solver is now a pure function of its
 input, is seeded from the squad already on screen, and only replaces it when a
-new squad wins by a real margin. Same data in, same team out.
+new squad wins by a real margin:
+
+```
+day of price moves    unanchored    anchored
+1                     15/15 kept    15/15 kept
+2                     13/15 kept    15/15 kept
+3                     15/15 kept    15/15 kept
+4                     13/15 kept    15/15 kept
+```
+
+### Valuing a player for the rest of the season
+
+Squad selection needs one number per player: what he is worth to hold. Three
+things trade off.
+
+* **Points now** — the nearest gameweeks are the ones you are certain to play him
+  for, so they carry a premium.
+* **Points later** — the weight decays toward a floor, not toward zero. The
+  previous version used a flat 0.88 geometric decay, which put GW25 at 4% of GW1,
+  so "best squad" quietly meant "best squad for about eight gameweeks".
+* **Whether he will still be playing** — a projection for April is worth what it
+  says only if the player still starts in April, so far gameweeks are discounted
+  by squad status. That term alone changes 3 of 15 picks.
+
+Rather than trust one hand-picked discount rate, the planner builds a squad under
+each of three profiles — *Next six*, *Balanced*, *Whole season* — and **plays each
+one through every remaining gameweek**, transfers, chips, injuries and blanks
+included, keeping whichever actually scores most. The proxies are guesses; the
+simulation is the real objective. The squad already on screen is scored on the
+same scale and keeps its place unless beaten by 12 season points.
+
+**An honest caveat.** On a full 38-gameweek horizon the three profiles land within
+0.2% of each other and rank players at Spearman 0.998+. That is a real property of
+the competition, not a bug: over a whole season every club plays everyone home and
+away, so fixture advantage averages out — the gameweek-to-gameweek spread of a
+regular starter's projection is ~9% over six gameweeks and ~9% over thirty-eight.
+The machinery earns its keep later in the season, when the remaining run is short
+enough for fixtures to genuinely diverge, and when form and injuries have pulled
+players apart. At GW1 it mostly confirms that the near-term and season-long
+answers agree.
 
 ### Season plan (`Planner.swift`)
 

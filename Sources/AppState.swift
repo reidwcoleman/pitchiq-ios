@@ -16,6 +16,17 @@ struct Insights {
     var template: [Player] = []
     var risers: [Advisor.PriceMove] = []
     var fallers: [Advisor.PriceMove] = []
+
+    /// How the recommended squad was arrived at: each value profile that was
+    /// tried and what it actually scored over a simulated season.
+    struct Trial: Identifiable {
+        var id: String { profile }
+        let profile: String
+        let blurb: String
+        let points: Double
+    }
+    var openingTrials: [Trial] = []
+    var chosenProfile = ""
 }
 
 @MainActor
@@ -287,11 +298,10 @@ final class AppState: ObservableObject {
     /// is already showing. Projections wobble by tenths of a point every time
     /// prices move; without this the recommended fifteen churned on every
     /// refresh and the app looked like it had no conviction.
-    static let switchMargin = 2.5
-
-    /// The season-long objective sums ~8 gameweeks of discounted points, so the
-    /// same conviction expressed against it needs a proportionally bigger gap.
-    static let seasonScale = 3.0
+    /// Measured in simulated points across the whole remaining season, so it is
+    /// directly interpretable: a new squad has to be worth at least this many
+    /// points between now and GW38 before it is worth the churn.
+    static let switchMargin = 12.0
 
     private struct ComputeResult {
         var insights: Insights
@@ -334,19 +344,22 @@ final class AppState: ObservableObject {
         }
 
         if squadIds == nil {
-            // Nothing connected or edited: recommend the squad that scores best
-            // across the whole remaining season rather than just the next few
-            // gameweeks, anchored to whatever the app showed last so the answer
-            // doesn't churn between visits.
-            let scored = players.map {
-                $0.reprojected(Planner.weightedValue($0, from: gwFrom, to: 38))
-            }
-            let ai = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly,
-                                        incumbent: incumbent,
-                                        incumbentMargin: switchMargin * seasonScale)
-            squadIds = ai?.squad.map(\.id)
+            // Nothing connected or edited: build a candidate squad under each
+            // value profile, simulate the rest of the season from each, and keep
+            // whichever actually scores most — anchored to whatever the app
+            // showed last so the answer doesn't churn between visits.
+            let opening = Planner.bestOpeningSquad(
+                players: players, budgetM: budgetM, fitOnly: fitOnly,
+                from: gwFrom, end: 38, incumbent: incumbent,
+                incumbentMargin: switchMargin)
+            squadIds = opening?.ids
+            out.openingTrials = opening?.trials.map {
+                Insights.Trial(profile: $0.profile, blurb: $0.blurb, points: $0.points)
+            } ?? []
+            out.chosenProfile = opening?.profile ?? ""
             let budgetTenths = Int(budgetM * 10)
-            let spent = ai?.squad.reduce(0) { $0 + $1.cost } ?? budgetTenths
+            let spent = squadIds?.compactMap { id in players.first { $0.id == id }?.cost }
+                .reduce(0, +) ?? budgetTenths
             start = PlanStart(squadIds: squadIds, bank: max(budgetTenths - spent, 0),
                               budget: budgetTenths, freeTransfers: 0, isUserTeam: false)
         }

@@ -228,6 +228,9 @@ struct PlayerRates {
     var avail = 1.0
     var cred = 0.0        // trust in this player's own rate estimates
     var epWeight = 0.0    // reliance on FPL's cold-start estimate
+    var formMult = 1.0    // recent form as a multiplier on attacking output
+    var startSecurity = 0.0   // how safe the starting place looks, 0…1
+    var defScale = 1.0    // this player's own concession rate vs his team's
 
     struct Components {
         var appearance = 0.0
@@ -252,8 +255,9 @@ struct PlayerRates {
         c.appearance = pPlay + p60
         c.goals = goalPts90 * minShare * fx.atkScale
         c.assists = assistPts90 * minShare * fx.atkScale
-        c.cleanSheet = ProjectionEngine.csPts[pos] * fx.csProb * p60
-        c.conceded = pos <= 2 ? -fx.concedePen * minShare : 0
+        c.cleanSheet = ProjectionEngine.csPts[pos]
+            * (defScale == 1 ? fx.csProb : pow(fx.csProb, defScale)) * p60
+        c.conceded = pos <= 2 ? -fx.concedePen * defScale * minShare : 0
         c.saves = pos == 1
             ? Poisson.expectedFloorDiv(saves90 * minShare * fx.savesScale, 3) : 0
         c.defcon = defconPts
@@ -265,7 +269,9 @@ struct PlayerRates {
         // *appearance*, so scaling by P(play) converts it to points per
         // gameweek — the unit everything else in this model uses.
         let hist = ppg * fx.histMult * max(pPlay, 0.3)
-        c.anchor = form > 0 ? 0.62 * hist + 0.38 * form * fx.histMult : hist
+        // form also scales the rate model above, so its share here is smaller
+        // than it was when the anchor was the only place it appeared
+        c.anchor = form > 0 ? 0.72 * hist + 0.28 * form * fx.histMult : hist
         c.ep = epNext * fx.histMult
 
         let blended = 0.62 * c.model + 0.38 * c.anchor
@@ -291,6 +297,7 @@ struct ProjectionEngine {
     let gwFrom: Int
     let horizon: Int
     let statGames: Int
+    let seasonUnderway: Bool
     private let ratings: TeamRatings
     private let ctx: [[[FixtureContext]]]        // team → gw → fixtures
 
@@ -322,6 +329,23 @@ struct ProjectionEngine {
     private static let xaToAssist: [Double] = [1, 1.2, 1.32, 1.18, 1.35]
     private static let xgToGoal: [Double] = [1, 1.0, 0.92, 1.02, 1.0]
 
+    // Independent measurement channels, fitted by least squares through the
+    // origin against every player with 900+ minutes in the source data. FPL's
+    // threat, creativity and BPS indices are built from different inputs than
+    // the xG model — shot location and volume, chances created, and the full
+    // bonus rubric — so they carry information the expected-goals feed does not,
+    // and they correlate strongly enough to be worth blending in:
+    //
+    //   threat/90     → xG/90     r = 0.77 (DEF)  0.83 (MID)  0.78 (FWD)
+    //   creativity/90 → xA/90     r = 0.86        0.88        0.73
+    //   bps/90        → bonus/90  r = 0.65        0.72        0.88
+    //
+    // Each coefficient reproduces the observed mean by construction, so folding
+    // them in shifts individual players without moving the population.
+    private static let threatToXg: [Double] = [0, 0, 0.00818, 0.01016, 0.01363]
+    private static let creativityToXa: [Double] = [0, 0, 0.00632, 0.00643, 0.00551]
+    private static let bpsToBonus: [Double] = [0, 0, 0.01735, 0.01880, 0.03542]
+
     init(boot: Bootstrap, fixtures: [APIFixture], gwFrom: Int, horizon: Int) {
         self.boot = boot
         self.fixtures = fixtures
@@ -330,6 +354,10 @@ struct ProjectionEngine {
         let played = boot.events.filter(\.finished).count
         // Pre-season: the API still carries last season's totals over 38 games.
         self.statGames = played > 0 ? played : 38
+        // Form is a 30-day rolling average, so it reads 0.0 for every player
+        // until matches are played. Applying it in pre-season would zero the
+        // whole league.
+        self.seasonUnderway = played > 0
         let r = TeamRatings(boot: boot, statGames: statGames)
         self.ratings = r
 
@@ -425,9 +453,25 @@ struct ProjectionEngine {
             r.pPlay = 0.55; r.p60 = 0.42; r.minShare = 0.48
         }
 
+        // How safe does the starting place look? `starts_per_90` is starts per
+        // 90 minutes played, so it separates a man who plays 90 every week from
+        // one who is hooked on the hour — two players can share a start rate and
+        // not share a role. Combined with minutes per appearance it gives a
+        // single number for squad status, which is what decides whether a
+        // projection made for April is worth anything.
+        let per90Starts = p.starts_per_90 ?? (mins > 0 ? starts / mins * 90 : 0)
+        let minsPerApp = r.pPlay > 0.05 ? mpg / r.pPlay : 0
+        r.startSecurity = min(startRate, 1) * 0.55
+            + min(per90Starts, 1) * 0.2
+            + min(minsPerApp / 90, 1) * 0.25
+        if p.minutes == 0 { r.startSecurity = 0.42 }
+
         // ---- availability
         var avail = 1.0
+        // Take the lower of the two published chances. FPL updates the
+        // this-round figure first when news breaks on a matchday.
         if let c = p.chance_of_playing_next_round { avail = Double(c) / 100 }
+        if let c = p.chance_of_playing_this_round { avail = min(avail, Double(c) / 100) }
         switch p.status {
         case "u", "n": avail = min(avail, 0.02)
         case "i", "s": avail = min(avail, 0.08)
@@ -451,10 +495,24 @@ struct ProjectionEngine {
         // defenders and 18% for midfielders, so xA is converted into
         // FPL-assist units before it is scored. Goals need only a small
         // defender correction (headers from set pieces underperform their xG).
-        var xg90 = cred * (0.75 * rawXg90 * Self.xgToGoal[pos] + 0.25 * g90)
-            + (1 - cred) * Self.xgPrior[pos]
-        var xa90 = cred * (0.6 * rawXa90 * Self.xaToAssist[pos] + 0.4 * a90)
-            + (1 - cred) * Self.xaPrior[pos] * Self.xaToAssist[pos]
+        // Third channel: FPL's own threat and creativity indices, converted to
+        // xG/xA units by the fitted coefficients above. They see things the xG
+        // feed doesn't — shot volume and chance creation — and for outfielders
+        // they are the single best predictor available after xG itself.
+        let threat90 = mins > 0 ? (Double(p.threat ?? "") ?? 0) / mins * 90 : 0
+        let creat90 = mins > 0 ? (Double(p.creativity ?? "") ?? 0) / mins * 90 : 0
+        let threatXg = Self.threatToXg[pos] * threat90
+        let creatXa = Self.creativityToXa[pos] * creat90
+        let hasIndices = pos >= 2 && (threat90 > 0 || creat90 > 0)
+
+        let ownXg = hasIndices
+            ? 0.58 * rawXg90 * Self.xgToGoal[pos] + 0.20 * g90 + 0.22 * threatXg
+            : 0.75 * rawXg90 * Self.xgToGoal[pos] + 0.25 * g90
+        let ownXa = hasIndices
+            ? 0.44 * rawXa90 * Self.xaToAssist[pos] + 0.30 * a90 + 0.26 * creatXa * Self.xaToAssist[pos]
+            : 0.6 * rawXa90 * Self.xaToAssist[pos] + 0.4 * a90
+        var xg90 = cred * ownXg + (1 - cred) * Self.xgPrior[pos]
+        var xa90 = cred * ownXa + (1 - cred) * Self.xaPrior[pos] * Self.xaToAssist[pos]
 
         // ---- set-piece and penalty duty
         // xG already contains penalties the player has taken, so an established
@@ -488,13 +546,24 @@ struct ProjectionEngine {
             r.defconPts = Self.dcBasePts[pos] * min(r.minShare / 0.75, 1.3)
         }
 
-        // ---- bonus: the player's own realised bonus rate, shrunk toward a
-        // positional prior. An earlier version blended in a BPS-derived
-        // estimate, but that estimate sat well below observed bonus rates and
-        // dragged every projection down by roughly a quarter of a bonus point
-        // a game; BPS totals are kept for the player card, not the projection.
+        // ---- bonus: realised bonus rate, blended with a BPS-derived estimate
+        // and shrunk toward a positional prior. An earlier build dropped BPS
+        // because the estimate it used sat well below observed bonus rates and
+        // taxed every projection; the coefficient here is fitted to reproduce
+        // the observed mean, so it re-ranks players without moving the total.
+        // Bonus is lumpy — a player can out-earn his BPS for half a season by
+        // being narrowly first rather than narrowly third — which is exactly why
+        // the smoother BPS signal is worth carrying alongside the realised rate.
         let bonus90 = mins > 0 ? Double(p.bonus) / mins * 90 : 0
-        r.bonusRate = cred * bonus90 + (1 - cred) * Self.bonusPrior[pos]
+        let bps90 = mins > 0 ? Double(p.bps ?? 0) / mins * 90 : 0
+        let bpsBonus = Self.bpsToBonus[pos] * bps90
+        // keepers excluded: their BPS barely predicts their bonus (r = 0.19)
+        if pos >= 2, bps90 > 0 {
+            r.bonusRate = cred * (0.55 * bonus90 + 0.45 * bpsBonus)
+                + (1 - cred) * (0.5 * bpsBonus + 0.5 * Self.bonusPrior[pos])
+        } else {
+            r.bonusRate = cred * bonus90 + (1 - cred) * Self.bonusPrior[pos]
+        }
 
         // ---- cards
         let y90 = mins > 0 ? Double(p.yellow_cards ?? 0) / mins * 90 : 0.10
@@ -508,6 +577,44 @@ struct ProjectionEngine {
         r.ppg = Double(p.points_per_game ?? "") ?? 0
         r.form = Double(p.form ?? "") ?? 0
         r.epNext = Double(p.ep_next ?? "") ?? 0
+
+        // ---- form
+        // Form is points per match over the last 30 days; points per game is the
+        // season-long level. Their ratio is the trend, and it is applied to the
+        // parts of the projection that genuinely move with a player's run of
+        // touch — goals, assists, bonus — and not to the parts that don't, like
+        // appearance points or his team's clean-sheet odds.
+        //
+        // The weight is deliberately well under 1. Four good matches is a small
+        // sample, and chasing it is the standard way to lose a season; but
+        // ignoring a player who has changed role, moved up the pecking order or
+        // started taking the penalties throws away the freshest information
+        // there is. 0.4 splits that difference, and the clamp stops one hat-trick
+        // from doubling anyone.
+        if seasonUnderway, r.ppg > 0.5, r.form > 0 {
+            let trend = r.form / r.ppg
+            r.formMult = min(max(1 + 0.4 * (trend - 1), 0.72), 1.45)
+            r.goalPts90 *= r.formMult
+            r.assistPts90 *= r.formMult
+            r.bonusRate *= r.formMult
+        }
+
+        // ---- the player's own defensive record
+        // Team-level ratings come from the keeper's expected goals conceded, but
+        // a defender's own xGC/90 measures what the team conceded *while he was
+        // on the pitch* — which separates a first-choice centre-back from a
+        // full-back who only plays the comfortable games, and tracks the real
+        // thing at r = 0.71 against goals actually conceded. Applied as a
+        // multiplier on the fixture's concession rate: for a Poisson clean sheet
+        // P(0) = e^-λ, so scaling λ by s is exactly P(0)^s.
+        if pos <= 2, mins >= 450 {
+            let ownXgc = p.expected_goals_conceded_per_90
+                ?? (mins > 0 ? (Double(p.expected_goals_conceded ?? "") ?? 0) / mins * 90 : 0)
+            let teamXgc = ratings.defence[min(p.team, ratings.defence.count - 1)]
+            if ownXgc > 0.05, teamXgc > 0.05 {
+                r.defScale = min(max(ownXgc / teamXgc, 0.78), 1.28)
+            }
+        }
         return r
     }
 
@@ -661,6 +768,8 @@ struct ProjectionEngine {
             pl.setPieces = (p.corners_and_indirect_freekicks_order ?? 99) == 1
                 || (p.direct_freekicks_order ?? 99) == 1
             pl.startRate = min(Double(p.starts ?? 0) / games, 1)
+            pl.startSecurity = r.startSecurity
+            pl.formMult = r.formMult
             pl.ceiling = dist.ceiling; pl.haulProb = dist.haul; pl.blankProb = dist.blank
             pl.netTransfers = net
             pl.priceMomentum = max(min(Double(net) / priceUnit, 1.5), -1.5)

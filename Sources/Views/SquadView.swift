@@ -40,6 +40,7 @@ struct SquadView: View {
                     .padding(.horizontal, 14)
                     gwTiles(gp).padding(.horizontal, 14)
                     ReasonCard(title: "Why", notes: gp.reasons).padding(.horizontal, 14)
+                    SelectionCard().padding(.horizontal, 14)
                     ChipStrip(plan: plan).padding(.horizontal, 14)
                     SeasonSummary(plan: plan).padding(.horizontal, 14)
                 } else if case .loading = state.phase {
@@ -245,6 +246,63 @@ struct ReasonCard: View {
         .padding(15)
         .frame(maxWidth: .infinity, alignment: .leading)
         .panel()
+    }
+}
+
+// MARK: - how the squad was chosen
+
+/// The selection is measured, not asserted: several ways of valuing a player
+/// are tried and each resulting squad is played through the rest of the season
+/// before one is picked. Showing the alternatives and what they scored is the
+/// only honest way to present that.
+struct SelectionCard: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        let trials = state.insights.openingTrials
+        if state.isConnected || trials.isEmpty {
+            EmptyView()
+        } else {
+            VStack(alignment: .leading, spacing: 11) {
+                SectionLabel(text: "How this XV was chosen")
+                Text("Three ways of weighing the season were tried. Each built a squad, and each squad was played through every remaining gameweek — transfers, chips, injuries and blanks included. The highest score wins.")
+                    .font(.system(size: 12)).foregroundColor(Theme.inkDim)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(trials) { t in
+                    HStack(spacing: 9) {
+                        Image(systemName: t.profile == state.insights.chosenProfile
+                              ? "largecircle.fill.circle" : "circle")
+                            .font(.system(size: 12))
+                            .foregroundColor(t.profile == state.insights.chosenProfile
+                                             ? Theme.lime : Theme.line)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(t.profile).font(.system(size: 13, weight: .bold))
+                                .foregroundColor(Theme.ink)
+                            Text(t.blurb).font(.system(size: 10.5)).foregroundColor(Theme.inkDim)
+                                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 6)
+                        Text(String(format: "%.0f", t.points))
+                            .font(.mono(14, .bold))
+                            .foregroundColor(t.profile == state.insights.chosenProfile
+                                             ? Theme.lime : Theme.inkDim)
+                    }
+                }
+                if state.insights.chosenProfile == "Your current XV" {
+                    Divider().background(Theme.line)
+                    Text("Your fifteen is within \(Int(AppState.switchMargin)) points of the best alternative across the whole run, so it keeps its place. A squad that rebuilds itself every time a price ticks loses more to transfers than it gains.")
+                        .font(.system(size: 12)).foregroundColor(Theme.ink)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Divider().background(Theme.line)
+                Text("Every projection behind those numbers is built per gameweek from that player's own fixtures — home or away, against that specific opponent's attack and defence — blended with his minutes security, expected goals and assists per 90, FPL's threat, creativity and BPS indices, set-piece and penalty duty, bonus rate, cards, and recent form.")
+                    .font(.system(size: 11.5)).foregroundColor(Theme.inkDim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(15)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .panel()
+        }
     }
 }
 
