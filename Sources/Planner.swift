@@ -77,6 +77,13 @@ struct SeasonPlan {
     let heldChips: [String]    // no week in the window is worth playing them yet
 
     var perGw: Double { gws.isEmpty ? 0 : totalPts / Double(gws.count) }
+
+    /// The next gameweek the plan actually changes something. A run of "hold"
+    /// weeks reads like the app has nothing to say unless you can see where the
+    /// next move lands.
+    var firstMoveGw: Int? {
+        gws.first { !$0.transfers.isEmpty || $0.chip != nil }?.gw
+    }
 }
 
 /// Everything the planner needs to know about the starting position.
@@ -162,7 +169,8 @@ final class PlanContext {
 }
 
 enum Planner {
-    static let decay = 0.88
+    /// Discount on each further gameweek when valuing a transfer.
+    static let decay = 0.80
 
     /// Extra gain a move must show before it is worth taking a −4. Four points
     /// is the cost; the margin on top covers the fact that a projection made
@@ -188,6 +196,9 @@ enum Planner {
     ///     0.20           4     4       0        2159.4           +0.23
     ///     0.30           1     1       0        2158.6           +0.05
     ///
+    /// (Measured at the old twelve-gameweek lookahead; the ranking of floors is
+    /// unchanged at four, where the same floor now permits 29 moves.)
+    ///
     /// With no floor the planner makes 28 transfers a season, ten of them on
     /// players who never leave the bench, and earns 0.21 points each for the
     /// trouble. At 0.10 it makes nine, eight of which walk straight into the
@@ -196,14 +207,16 @@ enum Planner {
     /// projection is accurate to a twentieth of a point.
     static let minimumWorthwhileGain = 0.10
 
-    /// How long a player is expected to stay bought, and what it costs to break
-    /// that. Without this the planner sells a man it bought two gameweeks
-    /// earlier and buys him back the week after, because a small fixture swing
-    /// flips the ordering — advice no manager would follow, and a real loss in
-    /// practice, since you buy at the risen price and sell after the fall that
-    /// follows. Set high enough that a genuine improvement still goes through.
-    static let holdingPeriod = 6
-    static let churnCost = 1.0
+    /// Guard against flip-flopping: selling a player bought a week ago and
+    /// buying him back the next, because a small swing flipped the ordering.
+    ///
+    /// Deliberately short. Selling a player whose next four fixtures are ugly
+    /// and buying him back when they turn is a real strategy, not churn, so the
+    /// penalty only covers immediate reversals — beyond two gameweeks a buy-back
+    /// costs nothing. A six-gameweek holding period blocked exactly the rotation
+    /// that makes the plan worth following, and cost points doing it.
+    static let holdingPeriod = 2
+    static let churnCost = 0.4
 
     /// What a banked free transfer is worth, and therefore the bar a move has
     /// to clear to be worth spending one.
@@ -615,12 +628,17 @@ enum Planner {
                     if !scoreOnly {
                         let newIds = Set(newSquad), oldIds = Set(squad)
                         for pos in 1...4 {
+                            // rank both sides so the list reads like-for-like;
+                            // a wildcard is judged as one rebuild, so no
+                            // per-move gain is quoted
                             let outs = squad.filter { ctx.picks[$0].pos == Int8(pos) && !newIds.contains($0) }
+                                .sorted { ctx.proj($0, g) > ctx.proj($1, g) }
                             let ins = newSquad.filter { ctx.picks[$0].pos == Int8(pos) && !oldIds.contains($0) }
+                                .sorted { ctx.proj($0, g) > ctx.proj($1, g) }
                             for k in 0..<min(outs.count, ins.count) {
                                 moves.append(TransferMove(
                                     out: ctx.players[outs[k]], inn: ctx.players[ins[k]], paid: false,
-                                    gain: ctx.proj(ins[k], g) - ctx.proj(outs[k], g)))
+                                    gain: 0))
                             }
                         }
                     }
@@ -713,7 +731,8 @@ enum Planner {
                 formation: disp.formation, projPts: pts, ftsLeft: fts, hitPts: hitPts,
                 bank: bank, chip: chipName,
                 action: actionLine(moves: moves, chip: chipName, fts: fts, hits: hitPts,
-                                   captain: cap, isFirst: g == from),
+                                   captain: cap, isFirst: g == from,
+                                   fromUserTeam: allowFirstMoves),
                 reasons: weekReasons(moves: moves, chip: chipName, fts: fts,
                                      captain: cap, bench: disp.bench, heldFor: heldFor,
                                      bank: bank, isFirst: g == from, fromUser: allowFirstMoves)))
@@ -724,7 +743,8 @@ enum Planner {
     // MARK: - narration
 
     private static func actionLine(moves: [TransferMove], chip: String?, fts: Int,
-                                   hits: Int, captain: Player, isFirst: Bool) -> String {
+                                   hits: Int, captain: Player, isFirst: Bool,
+                                   fromUserTeam: Bool) -> String {
         if let chip {
             switch chip {
             case "wildcard": return "Wildcard — rebuild the squad"
@@ -734,7 +754,10 @@ enum Planner {
             }
         }
         if moves.isEmpty {
-            return isFirst ? "Hold — captain \(captain.name)" : "Roll the transfer (\(fts) banked)"
+            return isFirst
+                ? (fromUserTeam ? "No change needed — captain \(captain.name)"
+                                : "This XV is already the strongest available")
+                : "Roll the transfer (\(fts) banked)"
         }
         let names = moves.map { "\($0.out.name) → \($0.inn.name)" }.joined(separator: ", ")
         return hits > 0 ? "\(names)  (−\(hits))" : names
@@ -762,8 +785,8 @@ enum Planner {
             default: break
             }
         }
-        for m in moves {
-            var line = String(format: "%@ → %@: +%.1f points added to the starting eleven over the coming gameweeks",
+        for m in moves where chip != "wildcard" {
+            var line = String(format: "%@ → %@: %+.1f points added to the starting eleven over the coming gameweeks",
                               m.out.name, m.inn.name, m.gain)
             line += m.paid ? ", enough to clear the −4." : ", using a free transfer."
             if m.out.flagged {
@@ -779,7 +802,7 @@ enum Planner {
         if isFirst && chip == nil {
             out.append(fromUser
                 ? "This is your squad as it stands. Only moves that clearly add points are suggested."
-                : "This fifteen is picked to score now and still be strong in April — every remaining fixture through GW 38 is weighed, with the nearest weeks counting most.")
+                : "This fifteen was just picked as the best available, so there is nothing to transfer yet — every change would make it worse. It starts rotating as fixture runs turn.")
         }
         out.append(String(format: "Captain %@ — the highest projected scorer in the eleven at %.1f pts, doubled.",
                           captain.name, captain.proj))
@@ -791,10 +814,28 @@ enum Planner {
 
     // MARK: - transfer search
 
-    /// How many gameweeks ahead a transfer is judged over. With a 0.88 discount
-    /// the twelfth week already carries under a quarter of the first's weight,
-    /// so looking further changes nothing and costs a great deal.
-    static let transferLookahead = 12
+    /// How many gameweeks ahead a transfer is judged over.
+    ///
+    /// The right horizon is not "the rest of the season" — it is "until you
+    /// would transfer again". Scoring a move over twelve gameweeks silently
+    /// assumes you hold the player for twelve gameweeks, which is wrong for
+    /// anyone who uses their free transfer most weeks: it averages a good run
+    /// and a bad run together and concludes that nothing is worth doing. Over a
+    /// six-gameweek window the fixture swing for a regular starter is only about
+    /// 11%, because runs even out; over four it is sharp enough to act on.
+    ///
+    /// Swept against a full simulated season, holding everything else fixed:
+    ///
+    ///     lookahead  decay  transfers  ->XI  ->bench   season pts
+    ///            12   0.88         10    10       0        2160.6
+    ///             8   0.86         13    12       1        2161.5
+    ///             6   0.85         32    25       7        2166.7
+    ///             4   0.80         29    27       2        2169.1
+    ///
+    /// Four is both the most active and the highest scoring — the shorter window
+    /// is not a trade-off against accuracy, it is a better model of how the team
+    /// is actually managed.
+    static let transferLookahead = 4
 
     /// The best transfer available, measured by what the squad actually scores.
     ///

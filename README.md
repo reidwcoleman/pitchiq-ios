@@ -196,8 +196,8 @@ answers agree.
 ### What a transfer is worth
 
 A transfer's gain is the change in **what the squad actually scores** — best XI,
-captain doubled, plus a tenth of the bench — summed over the next twelve
-gameweeks with the usual discount.
+captain doubled, plus a tenth of the bench — summed over the next **four**
+gameweeks with a 0.80 discount.
 
 It is not the change in the incoming player's own projection, which is what this
 measured until recently. By that standard, replacing the fourth-choice forward
@@ -228,12 +228,41 @@ walk straight into the eleven, and earns nearly twice as much per move — givin
 2.8 points that were being chased through model noise, since no projection is
 accurate to a twentieth of a point.
 
-**A holding period.** Selling a player bought within six gameweeks, or buying back
-one sold that recently, costs a full point of gain. Without it the planner sold a
-man it had bought two gameweeks earlier and bought him back the week after,
-because a small fixture swing flipped the ordering — advice no manager would
-follow, and a real loss in practice, since you buy at the risen price and sell
-after the fall that follows.
+**A short holding period.** Selling a player bought within *two* gameweeks, or
+buying one back that recently, costs 0.4 points. It only covers immediate
+reversals: selling a player whose next four fixtures are ugly and buying him back
+when they turn is a real strategy, not churn. A six-gameweek holding period
+blocked exactly that rotation and cost points doing it.
+
+### Why the window is four gameweeks
+
+The right horizon for a transfer is not "the rest of the season" — it is *until
+you would transfer again*. Scoring a move over twelve gameweeks silently assumes
+you hold the player for twelve, which is wrong for anyone who uses their free
+transfer most weeks: it averages a good run and a bad run together and concludes
+nothing is worth doing.
+
+The numbers behind that: a single fixture moves a regular starter's projection by
+about 55% (Haaland at home to a promoted side against Haaland away at Arsenal).
+But over a *six-gameweek run* the best-to-worst gap collapses to 11%, because runs
+even out. Judge a transfer over twelve weeks and there is nothing left to see.
+
+```
+lookahead  decay  transfers  →XI  →bench   season pts
+       12   0.88         10   10       0       2160.6
+        8   0.86         13   12       1       2161.5
+        6   0.85         32   25       7       2166.7
+        4   0.80         29   27       2       2169.1
+```
+
+Four is both the most active *and* the highest scoring. The shorter window is not
+a trade-off against accuracy — it is a better model of how the team is actually
+managed. The season plan now makes ~28 transfers, nearly all of them straight
+into the starting eleven, rotating players out when their run turns and back in
+when it improves.
+
+Verified against a squad whose starters lose their form mid-season: all three go,
+worst first, at +2.44, +1.11 and +1.38 points to the eleven.
 
 ### Season plan (`Planner.swift`)
 

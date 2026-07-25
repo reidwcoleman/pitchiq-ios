@@ -67,7 +67,7 @@ struct TransfersView: View {
             } else if let best = board.bestSingle {
                 verdictCard(
                     "\(best.out.name) → \(best.inn.name) is the strongest single move available: "
-                    + String(format: "+%.1f points over the rest of the season, +%.1f over the next %d gameweeks.",
+                    + String(format: "+%.1f points on your starting eleven over the next four gameweeks, +%.1f across the next %d.",
                              best.gainWeighted, best.gainWindow, state.horizon),
                     color: Theme.lime, icon: "arrow.left.arrow.right",
                     title: "Recommendation: make one transfer")
@@ -77,7 +77,7 @@ struct TransfersView: View {
 
             VStack(alignment: .leading, spacing: 10) {
                 SectionLabel(text: "Every move, ranked")
-                Text("Sorted by what each move adds to your **starting eleven** across the coming gameweeks — not by the incoming player's own projection. Bench points don't count unless you play Bench Boost. Tap a row for the reasoning.")
+                Text("Sorted by what each move adds to your **starting eleven** over the next four gameweeks — not by the incoming player's own projection, since bench points don't count. Four, because that's roughly how long you hold a player before the next move. Tap a row for the reasoning.")
                     .font(.system(size: 11.5)).foregroundColor(Theme.inkDim)
                 ForEach(board.options.prefix(20)) { o in
                     TransferOptionRow(option: o, horizon: state.horizon)
@@ -312,7 +312,7 @@ struct TransferOptionRow: View {
                         .font(.mono(13, .bold))
                         .foregroundColor(option.gainWeighted > 0.05 ? Theme.green
                                          : (option.gainWeighted < -0.05 ? Theme.red : Theme.inkDim))
-                    Text("season").font(.label(7.5)).foregroundColor(Theme.inkDim)
+                    Text("gain").font(.label(7.5)).foregroundColor(Theme.inkDim)
                 }
             }
             HStack(spacing: 12) {

@@ -178,6 +178,13 @@ struct ActionCard: View {
                     ForEach(gwPlan.transfers) { t in TransferRow(move: t, chip: gwPlan.chip) }
                 }
             }
+            if gwPlan.transfers.isEmpty && gwPlan.chip == nil,
+               let next = plan.firstMoveGw, next > gwPlan.gw {
+                let weeks = next - gwPlan.gw
+                Text("Next change: GW \(next), \(weeks) gameweek\(weeks == 1 ? "" : "s") away. Until then the free transfers bank — the plan spends \(plan.totalTransfers) of them across the season as fixture runs turn.")
+                    .font(.system(size: 12)).foregroundColor(Theme.inkDim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if isFirst && !state.isConnected {
                 Text("Connect your FPL team in Settings and this becomes advice on your own fifteen instead of a suggested squad.")
                     .font(.system(size: 11.5)).foregroundColor(Theme.inkDim)
@@ -212,8 +219,11 @@ struct TransferRow: View {
                 .foregroundColor(Theme.ink).lineLimit(1)
             Text("£\(move.inn.price)").font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
             Spacer(minLength: 4)
-            Text(String(format: "+%.1f", move.gain))
-                .font(.mono(11, .bold)).foregroundColor(Theme.green)
+            if chip != "wildcard" {
+                Text(String(format: "%+.1f", move.gain))
+                    .font(.mono(11, .bold))
+                    .foregroundColor(move.gain >= 0 ? Theme.green : Theme.red)
+            }
             if chip == "wildcard" {
                 Tag(text: "WC", color: Theme.magenta)
             } else {

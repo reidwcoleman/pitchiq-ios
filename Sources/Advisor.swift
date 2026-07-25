@@ -17,11 +17,11 @@ import Foundation
 // gameweek projections the engine already produced.
 
 enum Advisor {
-    /// Weight on each future gameweek when comparing two players. A transfer
-    /// made now is held for a while, so later weeks count — but not equally,
-    /// because plans change. 0.88 puts about two thirds of the weight on the
-    /// next six gameweeks.
-    static let decay = 0.88
+    /// Transfers are judged on the same window and discount the season planner
+    /// uses, so the board's top move and the plan's instruction agree. See
+    /// `Planner.transferLookahead` for why the window is short.
+    static var decay: Double { Planner.decay }
+    static var lookahead: Int { Planner.transferLookahead }
 
     static func weighted(_ p: Player, from gw: Int, to end: Int) -> Double {
         var v = 0.0, w = 1.0
@@ -48,7 +48,7 @@ enum Advisor {
         let inn: Player
         let gainNext: Double        // next gameweek only
         let gainWindow: Double      // over the chosen horizon
-        let gainWeighted: Double    // decay-weighted to the end of the season
+        let gainWeighted: Double    // discounted across the lookahead window
         let spend: Int              // tenths of £m taken out of the bank
         /// Whether the outgoing player is in the current starting eleven.
         /// A move on a substitute cannot add points on a normal weekend, and
@@ -72,9 +72,6 @@ enum Advisor {
         var holdReason: String = ""
         var bestSingle: TransferOption? { options.first }
     }
-
-    /// How many gameweeks ahead a transfer is judged over.
-    static let lookahead = 12
 
     /// The points a fifteen actually scores in one gameweek.
     @inline(__always)
@@ -228,29 +225,45 @@ enum Advisor {
             .map { $0 }
     }
 
+    /// Average fixture difficulty over the next `n` gameweeks.
+    private static func runDifficulty(_ p: Player, from gw: Int, _ n: Int) -> Double? {
+        let fx = p.fixtures.prefix(n)
+        guard !fx.isEmpty else { return nil }
+        return Double(fx.reduce(0) { $0 + $1.diff }) / Double(fx.count)
+    }
+
     private static func explain(out old: Player, inn: Player, gw: Int, horizon: Int) -> [String] {
         var r: [String] = []
+
+        // why the outgoing player is the one to lose
         if old.flagged && !old.news.isEmpty { r.append("\(old.name): \(old.news)") }
         else if old.flagged { r.append("\(old.name) is flagged and projected near zero.") }
+        if old.formMult < 0.92 {
+            r.append(String(format: "%@ is out of form — scoring %.0f%% below his own season level, which the model applies to his goals, assists and bonus.",
+                            old.name, (1 - old.formMult) * 100))
+        }
         if old.startRate < 0.55 && old.mins > 0 {
             r.append(String(format: "%@ started only %.0f%% of matches — the minutes aren't secure.",
                             old.name, old.startRate * 100))
         }
-        let inFix = inn.fixtures.prefix(horizon)
-        let outFix = old.fixtures.prefix(horizon)
-        if !inFix.isEmpty && !outFix.isEmpty {
-            let a = Double(inFix.reduce(0) { $0 + $1.diff }) / Double(inFix.count)
-            let b = Double(outFix.reduce(0) { $0 + $1.diff }) / Double(outFix.count)
+
+        // the fixture argument, which is usually the real one
+        let n = Planner.transferLookahead
+        if let a = runDifficulty(inn, from: gw, n), let b = runDifficulty(old, from: gw, n) {
             if a + 0.4 < b {
-                r.append(String(format: "Fixtures swing your way: %.1f average difficulty over the next %d against %.1f.",
-                                a, horizon, b))
+                r.append(String(format: "Fixtures: %@ averages %.1f difficulty over the next %d, against %.1f for %@.",
+                                inn.name, a, n, b, old.name))
+            } else if b + 0.4 < a {
+                r.append(String(format: "%@ has the harder run on paper (%.1f against %.1f) — this move is on form and underlying numbers, not fixtures.",
+                                inn.name, a, b))
             }
+        }
+        if inn.formMult > 1.08 {
+            r.append(String(format: "%@ is in form: %.0f%% above his season level.",
+                            inn.name, (inn.formMult - 1) * 100))
         }
         if inn.penTaker && !old.penTaker { r.append("\(inn.name) is on penalties.") }
         if inn.setPieces && !old.setPieces { r.append("\(inn.name) takes set pieces.") }
-        if !old.flagged, inn.proj > old.proj + 0.5 {
-            r.append("Walks straight into the eleven ahead of \(old.name).")
-        }
         if inn.own < 8 && inn.proj > old.proj {
             r.append(String(format: "Differential: %.1f%% owned.", inn.own))
         }
@@ -258,9 +271,10 @@ enum Advisor {
             r.append(String(format: "Frees £%.1fm for elsewhere.", Double(old.cost - inn.cost) / 10))
         }
         if r.isEmpty {
-            r.append(String(format: "%@ simply projects higher over the run: %.1f against %.1f.",
+            r.append(String(format: "%@ simply projects higher over the coming run: %.1f against %.1f.",
                             inn.name, inn.proj, old.proj))
         }
+        r.append("You can move back the other way when the runs swing — a buy-back costs nothing after two gameweeks.")
         return r
     }
 
