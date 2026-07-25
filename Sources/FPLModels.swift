@@ -7,6 +7,7 @@ struct Bootstrap: Decodable {
     let teams: [FPLTeam]
     let elements: [FPLElement]
     let chips: [FPLChip]?
+    let total_players: Int?
 }
 
 struct FPLChip: Decodable {
@@ -110,6 +111,85 @@ struct FPLElement: Decodable {
     let direct_freekicks_order: Int?
     let corners_and_indirect_freekicks_order: Int?
     let news: String?
+
+    // Market signals. FPL moves a price when net transfers cross a threshold
+    // proportional to the total number of managers, so these three fields are
+    // what the price-change watch is built from.
+    let transfers_in_event: Int?
+    let transfers_out_event: Int?
+    let cost_change_event: Int?
+    let cost_change_start: Int?
+
+    // Underlying-performance indices, used on the player card and to separate
+    // players whose projections are close.
+    let ict_index: String?
+    let threat: String?
+    let creativity: String?
+    let influence: String?
+    let expected_goal_involvements_per_90: Double?
+    let starts_per_90: Double?
+    let clean_sheets_per_90: Double?
+    let chance_of_playing_this_round: Int?
+    let dreamteam_count: Int?
+}
+
+// MARK: - A manager's own team (public entry endpoints)
+
+struct EntrySummary: Decodable {
+    let id: Int
+    let name: String
+    let player_first_name: String?
+    let player_last_name: String?
+    let summary_overall_points: Int?
+    let summary_overall_rank: Int?
+    let last_deadline_bank: Int?
+    let last_deadline_value: Int?
+    let current_event: Int?
+}
+
+struct EntryPicks: Decodable {
+    struct Pick: Decodable {
+        let element: Int
+        let position: Int
+        let multiplier: Int
+        let is_captain: Bool
+        let is_vice_captain: Bool
+    }
+    struct History: Decodable {
+        let event: Int
+        let bank: Int
+        let value: Int
+        let event_transfers: Int
+        let event_transfers_cost: Int
+        let points: Int?
+    }
+    let picks: [Pick]
+    let entry_history: History?
+    let active_chip: String?
+}
+
+struct EntryHistory: Decodable {
+    struct ChipUse: Decodable { let name: String; let event: Int }
+    let chips: [ChipUse]
+}
+
+/// Everything the planner needs to know about the squad the user actually owns.
+struct TeamState: Codable, Equatable {
+    var entryId: Int
+    var teamName: String
+    var managerName: String
+    var squadIds: [Int]
+    var captainId: Int
+    var bank: Int              // tenths of £m
+    var squadValue: Int        // tenths of £m, excluding the bank
+    var freeTransfers: Int
+    var chipsUsed: [String]    // chip names already played this season
+    var overallPoints: Int
+    var overallRank: Int
+    var gw: Int                // the gameweek these picks are from
+    var fetched: Date
+
+    var budget: Int { squadValue + bank }
 }
 
 struct APIFixture: Decodable {
@@ -191,57 +271,73 @@ struct Pick {
     }
 }
 
+/// A player as the app uses them: identity, price, the projection for whatever
+/// window is selected, per-gameweek projections, and the season stats behind
+/// the number. Stored with `var` properties and copied by value — `reprojected`
+/// used to be a 20-argument re-construction that had to be edited every time a
+/// field was added, and silently dropped anything forgotten.
 struct Player: Identifiable, Hashable {
-    let id: Int
-    let name: String
-    let pos: Int
-    let team: Int
-    let teamShort: String
-    let teamName: String
-    let cost: Int          // tenths of £m
-    let proj: Double       // projected points over horizon
-    let perGw: Double
-    let ppg: Double
-    let xgi90: Double
-    let own: Double
-    let avail: Double
-    let flagged: Bool
-    let mins: Int
-    let fixtures: [FixtureInfo]
-    let projByGw: GWProjection   // per-GW projections across the planning window
+    var id = 0
+    var name = ""
+    var pos = 0
+    var team = 0
+    var teamShort = ""
+    var teamName = ""
+    var cost = 0            // tenths of £m
+    var proj = 0.0          // projected points over the selected window
+    var perGw = 0.0
+    var ppg = 0.0
+    var xgi90 = 0.0
+    var own = 0.0           // % of managers who own them
+    var avail = 1.0
+    var flagged = false
+    var mins = 0
+    var fixtures: [FixtureInfo] = []
+    var projByGw = GWProjection()
 
-    // detail stats (for the player card)
-    let totalPoints: Int
-    let goals: Int
-    let assists: Int
-    let cleanSheets: Int
-    let bonus: Int
-    let saves: Int
-    let starts: Int
-    let form: Double
-    let xg: Double
-    let xa: Double
-    let news: String
+    // detail stats (player card)
+    var totalPoints = 0
+    var goals = 0
+    var assists = 0
+    var cleanSheets = 0
+    var bonus = 0
+    var saves = 0
+    var starts = 0
+    var form = 0.0
+    var xg = 0.0
+    var xa = 0.0
+    var news = ""
 
-    // model diagnostics surfaced on the player card
-    let expMins: Double     // expected minutes per match
-    let penTaker: Bool
-    let setPieces: Bool
+    // model diagnostics
+    var expMins = 0.0       // expected minutes per match
+    var penTaker = false
+    var setPieces = false
+    var startRate = 0.0     // P(starts) — the minutes-security number
+
+    // distribution of next gameweek's score, not just its mean
+    var ceiling = 0.0       // 90th-percentile return
+    var haulProb = 0.0      // P(10+ points)
+    var blankProb = 0.0     // P(2 or fewer)
+
+    // market
+    var netTransfers = 0    // this gameweek's transfers in minus out
+    var priceMomentum = 0.0 // -1 … +1, progress toward a fall or a rise
+    var costChangeStart = 0 // price movement since the season opened
+    var ictIndex = 0.0
+    var threat = 0.0
+    var creativity = 0.0
 
     var price: String { String(format: "%.1f", Double(cost) / 10) }
     var posShort: String { Position(rawValue: pos)?.short ?? "?" }
+    /// Points per £m over the selected window — the value metric.
+    var valueScore: Double { cost > 0 ? proj / (Double(cost) / 10) : 0 }
 
-    /// Copy with a different headline projection — lets the optimizer and
-    /// best-XI picker run against GW-specific or transfer-weighted values.
+    /// Copy with a different headline projection — lets the solver and the
+    /// best-XI picker run against gameweek-specific or transfer-weighted values.
     func reprojected(_ v: Double) -> Player {
-        Player(id: id, name: name, pos: pos, team: team, teamShort: teamShort,
-               teamName: teamName, cost: cost, proj: v, perGw: perGw, ppg: ppg,
-               xgi90: xgi90, own: own, avail: avail, flagged: flagged, mins: mins,
-               fixtures: fixtures, projByGw: projByGw,
-               totalPoints: totalPoints, goals: goals, assists: assists,
-               cleanSheets: cleanSheets, bonus: bonus, saves: saves, starts: starts,
-               form: form, xg: xg, xa: xa, news: news,
-               expMins: expMins, penTaker: penTaker, setPieces: setPieces)
+        var c = self
+        c.proj = v
+        return c
     }
 
     @inline(__always)

@@ -1,15 +1,12 @@
 import Foundation
 
-// MARK: - Squad optimizer
-// Greedy seed + simulated annealing with single- and double-swap moves so the
-// search can fund a premium upgrade by downgrading elsewhere in one move.
-//
-// The annealer evaluates ~50k candidate squads per rebuild. Every evaluation
-// used to sort four arrays, build four prefix-sum arrays, allocate a bench
-// array and a club-count dictionary — roughly ten heap allocations per
-// iteration. `evaluate` and `feasible` below do the same work entirely in
-// stack scratch space, and operate on `Pick` (16 bytes, no references) rather
-// than `Player` (four strings + two buffers, six retain/release pairs a copy).
+// MARK: - Squad evaluation
+// The scoring side of squad selection: best legal XI from a 15, the max-3-per-
+// club and budget checks, and the entry point that hands the search off to
+// `SquadSolver`. `evaluate` runs in the solver's innermost loop, so it does all
+// its work in stack scratch space and operates on `Pick` (16 bytes, no
+// references) rather than `Player` (four strings and two buffers, six
+// retain/release pairs per copy).
 
 enum Optimizer {
     static let quota = [0, 2, 5, 5, 3]
@@ -139,189 +136,49 @@ enum Optimizer {
 
     // MARK: - candidate pool
 
+    /// Everyone who could plausibly be picked. The old pool was the 48
+    /// best-projected plus the 10 cheapest per position — a hard cap the
+    /// annealer needed to keep its search space small, and one that quietly
+    /// excluded most mid-price players. The exact solver prunes by dominance
+    /// instead (see `SquadSolver.reduce`), which removes strictly-worse players
+    /// only, so nothing selectable is thrown away.
     static func candidatePool(_ players: [Player], fitOnly: Bool) -> [Player] {
-        var pool: [Player] = []
-        pool.reserveCapacity(240)
-        for pos in 1...4 {
-            let byPos = players.filter { $0.pos == pos && (fitOnly ? !$0.flagged : $0.avail > 0.5) }
-            let top = byPos.prefix(48)
-            let cheap = byPos
-                .sorted { $0.cost != $1.cost ? $0.cost < $1.cost : $0.proj > $1.proj }
-                .prefix(10)
-            var seen = Set<Int>()
-            for p in Array(top) + Array(cheap) where seen.insert(p.id).inserted { pool.append(p) }
-        }
-        return pool
+        players.filter { $0.pos >= 1 && $0.pos <= 4 && (fitOnly ? !$0.flagged : $0.avail > 0.4) }
     }
 
-    // MARK: - greedy seed
+    // MARK: - entry points
 
-    /// Cheapest-completion bound used to prune the greedy seed. Precomputed
-    /// cost-sorted lists replace the filter+sort that previously ran inside
-    /// the seed's innermost loop.
-    private struct SeedContext {
-        let byPos: [[Pick]]          // sorted by projection, descending
-        let cheap: [[Pick]]          // sorted by cost, ascending
-
-        init(_ pool: [Pick]) {
-            var p: [[Pick]] = [[], [], [], [], []]
-            for x in pool where x.pos >= 1 && x.pos <= 4 { p[Int(x.pos)].append(x) }
-            for i in 1...4 {
-                p[i].sort { $0.proj != $1.proj ? $0.proj > $1.proj : $0.id < $1.id }
-            }
-            byPos = p
-            cheap = p.map { $0.sorted { $0.cost != $1.cost ? $0.cost < $1.cost : $0.proj > $1.proj } }
-        }
-
-        func cheapestRest(needs: [Int], taken: Set<Int32>, excluding: Int32) -> Int {
-            var sum = 0
-            for pos in 1...4 where needs[pos] > 0 {
-                var need = needs[pos]
-                for p in cheap[pos] {
-                    if p.id == excluding || taken.contains(p.id) { continue }
-                    sum += Int(p.cost)
-                    need -= 1
-                    if need == 0 { break }
-                }
-                sum += need * 999
-            }
-            return sum
-        }
-    }
-
-    private static func greedySeed(_ ctx: SeedContext, budget: Int, jitter: Bool,
-                                   rng: inout SeededRandom) -> [Pick] {
-        var byPos = ctx.byPos
-        if jitter {
-            for i in 1...4 {
-                byPos[i] = byPos[i].filter { _ in Double.random(in: 0...1, using: &rng) > 0.25 }
-                if byPos[i].isEmpty { byPos[i] = ctx.byPos[i] }
-            }
-        }
-        var squad: [Pick] = []
-        squad.reserveCapacity(15)
-        var taken = Set<Int32>()
-        var clubs = [Int](repeating: 0, count: 32)
-        var needs = quota
-        var spent = 0
-
-        for pos in 1...4 {
-            for _ in 0..<quota[pos] {
-                for p in byPos[pos] {
-                    guard !taken.contains(p.id), clubs[Int(p.team)] < 3 else { continue }
-                    needs[pos] -= 1
-                    let restMin = ctx.cheapestRest(needs: needs, taken: taken, excluding: p.id)
-                    if spent + Int(p.cost) + restMin <= budget {
-                        squad.append(p)
-                        taken.insert(p.id)
-                        clubs[Int(p.team)] += 1
-                        spent += Int(p.cost)
-                        break
-                    }
-                    needs[pos] += 1
-                }
-            }
-        }
-        // pad if incomplete
-        for pos in 1...4 {
-            while squad.reduce(0, { $1.pos == pos ? $0 + 1 : $0 }) < quota[pos] {
-                guard let cand = ctx.cheap[pos].first(where: {
-                    !taken.contains($0.id) && clubs[Int($0.team)] < 3
-                }) else { break }
-                squad.append(cand)
-                taken.insert(cand.id)
-                clubs[Int(cand.team)] += 1
-            }
-        }
-        return squad
-    }
-
-    // MARK: - annealer
-
-    /// Optimize over `Pick`s. Returns the chosen 15 ids.
-    static func optimizeIds(pool: [Pick], budget: Int,
-                            iters: Int = 12000, restarts: Int = 4,
-                            seed: UInt64 = 0xC0FFEE) -> [Int32]? {
-        let ctx = SeedContext(pool)
-        guard (1...4).allSatisfy({ ctx.byPos[$0].count >= quota[$0] }) else { return nil }
-
-        // seeded RNG: same data in → same squad out, so the plan the user sees
-        // doesn't reshuffle on every rebuild
-        var rng = SeededRandom(seed: seed)
-        var bestSquad: [Pick]?
-        var bestScore = -Double.infinity
-
-        for restart in 0..<restarts {
-            var squad = greedySeed(ctx, budget: budget, jitter: restart > 0, rng: &rng)
-            guard squad.count == 15, feasible(squad, budget: budget) else { continue }
-            var score = objective(squad)
-            var localBest = squad
-            var localBestScore = score
-
-            var ids = Set(squad.map(\.id))
-            for it in 0..<iters {
-                let T = 1.4 * (1 - Double(it) / Double(iters)) + 0.02
-                let swaps = Double.random(in: 0...1, using: &rng) < 0.35 ? 2 : 1
-
-                // mutate in place and revert on reject — copying the array per
-                // iteration was one heap allocation per candidate evaluated
-                var i0 = Int.random(in: 0..<15, using: &rng)
-                var i1 = -1
-                let old0 = squad[i0]
-                var old1 = old0
-                var ok = true
-
-                guard let n0 = ctx.byPos[Int(old0.pos)].randomElement(using: &rng),
-                      !ids.contains(n0.id) else { continue }
-                squad[i0] = n0
-
-                if swaps == 2 {
-                    var j = Int.random(in: 0..<15, using: &rng)
-                    if j == i0 { j = (j + 1) % 15 }
-                    i1 = j
-                    old1 = squad[i1]
-                    if let n1 = ctx.byPos[Int(old1.pos)].randomElement(using: &rng),
-                       !ids.contains(n1.id), n1.id != n0.id {
-                        squad[i1] = n1
-                    } else {
-                        ok = false
-                    }
-                }
-
-                var accepted = false
-                if ok, feasible(squad, budget: budget) {
-                    let ns = objective(squad)
-                    let d = ns - score
-                    if d > 0 || Double.random(in: 0...1, using: &rng) < exp(d / T) {
-                        ids.remove(old0.id); ids.insert(squad[i0].id)
-                        if i1 >= 0 { ids.remove(old1.id); ids.insert(squad[i1].id) }
-                        score = ns
-                        accepted = true
-                        if ns > localBestScore { localBest = squad; localBestScore = ns }
-                    }
-                }
-                if !accepted {
-                    squad[i0] = old0
-                    if i1 >= 0 { squad[i1] = old1 }
-                }
-            }
-            if localBestScore > bestScore { bestScore = localBestScore; bestSquad = localBest }
-        }
-        return bestSquad.map { $0.map(\.id) }
-    }
-
-    /// Player-facing entry point: pool → annealed 15 → display-ready result.
+    /// Player-facing entry point: pool → exact-DP squad → display-ready result.
+    /// `seeds` are squads the search should also start from; passing the squad
+    /// already on screen is what stops the app rewriting the team on refresh.
     static func optimize(players: [Player], budgetM: Double, fitOnly: Bool,
-                         iters: Int = 12000, restarts: Int = 4,
-                         seed: UInt64 = 0xC0FFEE) -> SquadResult? {
+                         seeds: [[Int]] = [], incumbent: [Int]? = nil,
+                         incumbentMargin: Double = 0, benchWeight: Double = 0.12,
+                         exactCaptain: Bool = true) -> SquadResult? {
         let budget = Int((budgetM * 10).rounded())
         let pool = candidatePool(players, fitOnly: fitOnly)
-        let picks = pool.map { $0.pick($0.proj) }
-        guard let ids = optimizeIds(pool: picks, budget: budget,
-                                    iters: iters, restarts: restarts, seed: seed) else { return nil }
+        // The incumbent must survive pool reduction even if it has gone stale,
+        // or "keep the team you already have" degrades into "rebuild".
+        var picks = SquadSolver.reduce(pool.map { $0.pick($0.proj) })
+        if let inc = incumbent {
+            let have = Set(picks.map(\.id))
+            let wanted = Set(inc.map(Int32.init))
+            for p in pool where wanted.contains(Int32(p.id)) && !have.contains(Int32(p.id)) {
+                picks.append(p.pick(p.proj))
+            }
+        }
+        var weights = SquadSolver.Weights()
+        weights.bench = benchWeight
+        guard let chosen = SquadSolver.solve(
+            pool: picks, budget: budget, weights: weights,
+            seeds: seeds.map { $0.map(Int32.init) },
+            incumbent: incumbent.map { $0.map(Int32.init) },
+            incumbentMargin: incumbentMargin, exactCaptain: exactCaptain)
+        else { return nil }
+
         var byId = [Int32: Player](minimumCapacity: pool.count)
         for p in pool { byId[Int32(p.id)] = p }
-        let squad = ids.compactMap { byId[$0] }
+        let squad = chosen.compactMap { byId[$0.id] }
         guard squad.count == 15, let r = bestXI(squad) else { return nil }
         let sorted = r.xi.sorted { $0.proj != $1.proj ? $0.proj > $1.proj : $0.id < $1.id }
         return SquadResult(

@@ -1,36 +1,82 @@
 import SwiftUI
 
+/// Everything the app derives from one set of projections, computed once on a
+/// background task and handed to the views ready to draw. Views used to do this
+/// work inside `body` — the fixture grid rebuilt a whole projection engine per
+/// team row — which is why scrolling stuttered.
+struct Insights {
+    var players: [Player] = []
+    var squad: SquadResult?
+    var plan: SeasonPlan?
+    var board = Advisor.TransferBoard()
+    var audit: [Advisor.SquadCheck] = []
+    var captains: [Advisor.CaptainPick] = []
+    var differentials: [Advisor.Differential] = []
+    var valuePicks: [Player] = []
+    var template: [Player] = []
+    var risers: [Advisor.PriceMove] = []
+    var fallers: [Advisor.PriceMove] = []
+}
+
 @MainActor
 final class AppState: ObservableObject {
-    enum Phase { case loading, optimizing, ready, error(String) }
+    enum Phase { case loading, ready, error(String) }
 
     @Published var phase: Phase = .loading
     @Published var boot: Bootstrap?
     @Published var fixtures: [APIFixture] = []
-    @Published var players: [Player] = []
-    @Published var squad: SquadResult?
-    @Published var plan: SeasonPlan?
+    @Published var insights = Insights()
     @Published var lastUpdated: Date?
     @Published var refreshing = false
+    /// A rebuild is in flight but the previous answer is still on screen. The
+    /// old build swapped the whole team view for a spinner on every settings
+    /// change, which made a 40 ms recomputation feel like a page load.
+    @Published var working = false
 
     @Published var gwFrom = 1
-    @Published var horizon = 3 { didSet { if horizon != oldValue { rebuild() } } }
+    @Published var horizon = 6 { didSet { if horizon != oldValue { rebuild() } } }
     @Published var budget = 100.0
     @Published var fitOnly = true { didSet { if fitOnly != oldValue { rebuild() } } }
 
-    /// The user's own 15 (player ids) after editing the AI squad. Persisted.
+    /// The user's connected FPL team, if they've linked one.
+    @Published var team: TeamState?
+    @Published var importing = false
+    @Published var importError: String?
+
+    /// Manual edits to the recommended squad, when no team is connected.
     @Published var customSquadIds: [Int]?
 
-    /// Plan every remaining gameweek of the season (through GW 38).
-    var planWindow: Int { max(38 - gwFrom + 1, 1) }
-    private static let customKey = "customSquadIds"
-
+    var players: [Player] { insights.players }
+    var squad: SquadResult? { insights.squad }
+    var plan: SeasonPlan? { insights.plan }
     var teams: [Int: FPLTeam] = [:]
 
+    var planWindow: Int { max(38 - gwFrom + 1, 1) }
+    var isPreseason: Bool { !(boot?.events.contains { $0.finished } ?? false) }
+    var gwOptions: [GWEvent] { boot?.events ?? [] }
+    var isEdited: Bool { customSquadIds != nil }
+    var isConnected: Bool { team != nil }
+
+    /// Where the fifteen on screen comes from, for labelling.
+    var squadSource: String {
+        if let t = team { return t.teamName.uppercased() }
+        if customSquadIds != nil { return "YOUR TEAM" }
+        return "OPTIMAL XV"
+    }
+
+    // MARK: - persistence
+
+    private enum Key {
+        static let custom = "customSquadIds"
+        static let committed = "committedSquadIds"
+        static let team = "connectedTeam"
+    }
+
+    /// The fifteen the app last showed. Fed back into the solver as the
+    /// incumbent so an unchanged week produces an unchanged team.
+    private var committedSquadIds: [Int]?
+
     // MARK: - caches
-    // Every one of these used to be rebuilt from scratch on each `rebuild()`,
-    // and `gridFixtures` rebuilt an entire ProjectionEngine per call — from
-    // inside view bodies, once per team row.
 
     private var engine: ProjectionEngine?
     private var engineGw: Int?
@@ -38,11 +84,6 @@ final class AppState: ObservableObject {
     private var cachedDoubleGws: Set<Int>?
     private var cachedPlan: SeasonPlan?
     private var cachedPlanKey: PlanKey?
-
-    /// Bumped on every rebuild request. A background result whose token no
-    /// longer matches is discarded — previously two quick control changes
-    /// raced and whichever finished last won, so the screen could end up
-    /// showing a squad that didn't match the visible settings.
     private var generation = 0
 
     private struct PlanKey: Equatable {
@@ -50,10 +91,11 @@ final class AppState: ObservableObject {
         let budget: Int
         let fitOnly: Bool
         let custom: [Int]?
+        let team: [Int]?
         let dataStamp: Int
     }
 
-    /// Gameweeks where at least one team plays twice (announced mid-season).
+    /// Gameweeks where at least one club plays twice.
     var doubleGws: Set<Int> {
         if let c = cachedDoubleGws { return c }
         var counts: [Int: [Int: Int]] = [:]
@@ -67,12 +109,13 @@ final class AppState: ObservableObject {
         return s
     }
 
-    var isPreseason: Bool { !(boot?.events.contains { $0.finished } ?? false) }
-    var gwOptions: [GWEvent] { boot?.events ?? [] }
-    var isEdited: Bool { customSquadIds != nil }
-
     init() {
-        customSquadIds = UserDefaults.standard.array(forKey: Self.customKey) as? [Int]
+        let d = UserDefaults.standard
+        customSquadIds = d.array(forKey: Key.custom) as? [Int]
+        committedSquadIds = d.array(forKey: Key.committed) as? [Int]
+        if let data = d.data(forKey: Key.team) {
+            team = try? JSONDecoder().decode(TeamState.self, from: data)
+        }
     }
 
     func teamShort(_ id: Int) -> String { teams[id]?.short_name ?? "?" }
@@ -80,8 +123,9 @@ final class AppState: ObservableObject {
 
     // MARK: - loading
 
-    /// Render from the on-disk cache first, then refresh over the network.
-    /// A cold launch no longer blocks on two HTTP round trips before drawing.
+    /// Draw from disk first, and only go to the network when the cache is
+    /// actually stale. A cold launch used to download 1.3 MB and re-decode it
+    /// before showing anything, every single time.
     func load() async {
         if boot == nil {
             let cached = await Task.detached(priority: .userInitiated) { DataCache.read() }.value
@@ -89,11 +133,13 @@ final class AppState: ObservableObject {
                 apply(boot: cached.boot, fixtures: cached.fixtures, stamp: cached.fetched)
             }
         }
-        await refresh()
+        let age = lastUpdated.map { Date().timeIntervalSince($0) } ?? .infinity
+        // FPL prices move once a day and injury news a few times a day; a
+        // fifteen-minute cache costs nothing and removes the wait entirely.
+        if age > 15 * 60 { await refresh() }
     }
 
-    /// Fetch live data. Keeps whatever is already on screen if the network
-    /// fails, and never drops the UI back to the loading spinner.
+    /// Fetch live data. Keeps whatever is on screen if the network fails.
     func refresh() async {
         guard !refreshing else { return }
         refreshing = true
@@ -101,6 +147,9 @@ final class AppState: ObservableObject {
         do {
             let (boot, fixtures) = try await FPLService.fetch()
             apply(boot: boot, fixtures: fixtures, stamp: Date())
+            if let t = team, Date().timeIntervalSince(t.fetched) > 30 * 60 {
+                await connect(entryId: t.entryId, silent: true)
+            }
         } catch {
             if self.boot == nil {
                 phase = .error("Couldn't reach the FPL API — check your connection.\n(\(error.localizedDescription))")
@@ -112,7 +161,6 @@ final class AppState: ObservableObject {
         self.boot = boot
         self.fixtures = fixtures
         self.teams = Dictionary(uniqueKeysWithValues: boot.teams.map { ($0.id, $0) })
-        // auto-advance to the next gameweek once one finishes
         self.gwFrom = boot.events.first { $0.is_next }?.id
             ?? boot.events.first { !$0.finished }?.id ?? 1
         self.lastUpdated = stamp
@@ -124,10 +172,35 @@ final class AppState: ObservableObject {
         rebuild()
     }
 
-    /// Refetch live data if it's stale (call when app returns to foreground).
     func refreshIfStale() {
-        guard let last = lastUpdated, Date().timeIntervalSince(last) > 30 * 60 else { return }
+        guard let last = lastUpdated, Date().timeIntervalSince(last) > 15 * 60 else { return }
         Task { await refresh() }
+    }
+
+    // MARK: - connecting an FPL team
+
+    func connect(entryId: Int, silent: Bool = false) async {
+        guard let boot else { return }
+        if !silent { importing = true; importError = nil }
+        defer { importing = false }
+        do {
+            let state = try await FPLService.fetchTeam(entryId: entryId, currentGw: gwFrom, boot: boot)
+            team = state
+            customSquadIds = nil
+            UserDefaults.standard.removeObject(forKey: Key.custom)
+            if let data = try? JSONEncoder().encode(state) {
+                UserDefaults.standard.set(data, forKey: Key.team)
+            }
+            rebuild()
+        } catch {
+            if !silent { importError = error.localizedDescription }
+        }
+    }
+
+    func disconnect() {
+        team = nil
+        UserDefaults.standard.removeObject(forKey: Key.team)
+        rebuild()
     }
 
     // MARK: - rebuild
@@ -137,9 +210,6 @@ final class AppState: ObservableObject {
         generation += 1
         let gen = generation
 
-        // The engine is expensive to construct (it precomputes every fixture's
-        // clean-sheet and concession maths) but only depends on the data and
-        // the starting gameweek.
         let eng: ProjectionEngine
         if let e = engine, engineGw == gwFrom {
             eng = e
@@ -150,7 +220,7 @@ final class AppState: ObservableObject {
             modelPlayers = []
         }
 
-        if players.isEmpty { phase = .loading } else { phase = .optimizing }
+        if insights.players.isEmpty { phase = .loading } else { working = true }
 
         let budgetM = budget
         let fit = fitOnly
@@ -158,78 +228,171 @@ final class AppState: ObservableObject {
         let horizon = horizon
         let window = planWindow
         let customIds = customSquadIds
+        let connected = team
+        let incumbent = committedSquadIds
         let dgws = doubleGws
         let cachedModel = modelPlayers
+        let managers = boot.total_players ?? 11_000_000
         let chipsMeta = (boot.chips ?? []).map {
             ChipMeta(name: $0.name, start: $0.start_event, stop: $0.stop_event)
         }
         // Changing the horizon changes only the headline number shown against
-        // each player — per-gameweek projections, and therefore the whole
-        // season plan, are unaffected. Reuse the plan instead of re-running the
-        // most expensive computation in the app for a display-only change.
+        // each player — per-gameweek projections, and therefore the season plan,
+        // are unaffected. Reuse the plan rather than re-running the single most
+        // expensive computation in the app for a display-only change.
         let key = PlanKey(gwFrom: gwFrom, budget: Int(budget * 10), fitOnly: fit,
-                          custom: customIds, dataStamp: boot.elements.count)
+                          custom: customIds, team: connected?.squadIds,
+                          dataStamp: boot.elements.count)
         let reusablePlan = (cachedPlanKey == key) ? cachedPlan : nil
 
         Task.detached(priority: .userInitiated) {
-            // reuse the per-gameweek model when only the horizon changed
             let players: [Player] = cachedModel.isEmpty
-                ? eng.buildPlayers()
+                ? eng.buildPlayers(totalManagers: managers)
                 : ProjectionEngine.reHorizon(cachedModel, gwFrom: gwFrom,
                                              horizon: horizon, engine: eng)
             let baseModel = cachedModel.isEmpty ? players : cachedModel
 
-            var squad: SquadResult?
-            var userSquad: [Player]?
-            var staleCustom = false
-            if let ids = customIds {
-                if let custom = Self.buildSquad(ids: ids, players: players) {
-                    userSquad = custom.squad
-                    // display XI/captain/points for the selected GW only
-                    squad = Self.buildSquad(ids: ids, players: players, displayGw: gwFrom)
-                } else {
-                    staleCustom = true // a saved player no longer exists — fall back to AI
-                }
-            }
-            if squad == nil, let ai = Optimizer.optimize(players: players, budgetM: budgetM, fitOnly: fit) {
-                squad = Self.buildSquad(ids: ai.squad.map(\.id), players: players, displayGw: gwFrom)
-            }
-
-            let plan = reusablePlan ?? Planner.plan(
-                players: players, budgetM: budgetM, fitOnly: fit,
-                from: gwFrom, window: window, userSquad: userSquad,
-                chipsMeta: chipsMeta, doubleGws: dgws)
+            let result = Self.compute(
+                players: players, gwFrom: gwFrom, horizon: horizon, window: window,
+                budgetM: budgetM, fitOnly: fit, customIds: customIds, team: connected,
+                incumbent: incumbent, chipsMeta: chipsMeta, doubleGws: dgws,
+                reusablePlan: reusablePlan)
 
             await MainActor.run {
                 guard gen == self.generation else { return }   // a newer rebuild won
-                if staleCustom {
+                if result.staleCustom {
                     self.customSquadIds = nil
-                    UserDefaults.standard.removeObject(forKey: Self.customKey)
+                    UserDefaults.standard.removeObject(forKey: Key.custom)
                 }
                 self.modelPlayers = baseModel
-                self.players = players
-                self.squad = squad
-                self.plan = plan
-                if let plan { self.cachedPlan = plan; self.cachedPlanKey = key }
+                self.insights = result.insights
+                if let plan = result.insights.plan {
+                    self.cachedPlan = plan
+                    self.cachedPlanKey = key
+                }
+                // Remember the fifteen so the next rebuild keeps it unless a
+                // materially better squad exists.
+                if self.team == nil, self.customSquadIds == nil,
+                   let ids = result.insights.squad?.squad.map(\.id) {
+                    self.committedSquadIds = ids
+                    UserDefaults.standard.set(ids, forKey: Key.committed)
+                }
+                self.working = false
                 self.phase = .ready
             }
         }
     }
 
-    // MARK: - team editing
+    /// How much better a new squad has to be before the app swaps the team it
+    /// is already showing. Projections wobble by tenths of a point every time
+    /// prices move; without this the recommended fifteen churned on every
+    /// refresh and the app looked like it had no conviction.
+    static let switchMargin = 2.5
 
-    /// Swap `out` for `inn` in the displayed squad and make it the user's team.
+    /// The season-long objective sums ~8 gameweeks of discounted points, so the
+    /// same conviction expressed against it needs a proportionally bigger gap.
+    static let seasonScale = 3.0
+
+    private struct ComputeResult {
+        var insights: Insights
+        var staleCustom: Bool
+    }
+
+    nonisolated private static func compute(
+        players: [Player], gwFrom: Int, horizon: Int, window: Int,
+        budgetM: Double, fitOnly: Bool, customIds: [Int]?, team: TeamState?,
+        incumbent: [Int]?, chipsMeta: [ChipMeta], doubleGws: Set<Int>,
+        reusablePlan: SeasonPlan?
+    ) -> ComputeResult {
+        var out = Insights()
+        out.players = players
+
+        // --- which fifteen are we advising on
+        //
+        // Exactly one squad drives every screen. An earlier build optimised one
+        // squad for the ranking horizon on the Team tab and let the planner
+        // build a different, season-weighted one, so the transfer board audited
+        // a team the pitch never showed.
+        var squadIds: [Int]?
+        var staleCustom = false
+        var start = PlanStart()
+        if let t = team {
+            squadIds = t.squadIds
+            start = PlanStart(squadIds: t.squadIds, bank: t.bank, budget: t.budget,
+                              freeTransfers: t.freeTransfers, chipsUsed: Set(t.chipsUsed),
+                              isUserTeam: true)
+        } else if let ids = customIds {
+            if buildSquad(ids: ids, players: players) != nil {
+                let budgetTenths = Int(budgetM * 10)
+                let spent = ids.compactMap { id in players.first { $0.id == id }?.cost }.reduce(0, +)
+                squadIds = ids
+                start = PlanStart(squadIds: ids, bank: max(budgetTenths - spent, 0),
+                                  budget: budgetTenths, freeTransfers: 1, isUserTeam: true)
+            } else {
+                staleCustom = true      // a saved player no longer exists
+            }
+        }
+
+        if squadIds == nil {
+            // Nothing connected or edited: recommend the squad that scores best
+            // across the whole remaining season rather than just the next few
+            // gameweeks, anchored to whatever the app showed last so the answer
+            // doesn't churn between visits.
+            let scored = players.map {
+                $0.reprojected(Planner.weightedValue($0, from: gwFrom, to: 38))
+            }
+            let ai = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly,
+                                        incumbent: incumbent,
+                                        incumbentMargin: switchMargin * seasonScale)
+            squadIds = ai?.squad.map(\.id)
+            let budgetTenths = Int(budgetM * 10)
+            let spent = ai?.squad.reduce(0) { $0 + $1.cost } ?? budgetTenths
+            start = PlanStart(squadIds: squadIds, bank: max(budgetTenths - spent, 0),
+                              budget: budgetTenths, freeTransfers: 0, isUserTeam: false)
+        }
+        if let ids = squadIds {
+            out.squad = buildSquad(ids: ids, players: players, displayGw: gwFrom)
+        }
+
+        // --- the season plan
+        out.plan = reusablePlan ?? Planner.plan(
+            players: players, fitOnly: fitOnly, from: gwFrom, window: window,
+            start: start, chipsMeta: chipsMeta, doubleGws: doubleGws)
+
+        // --- decision tools
+        let held = out.squad?.squad ?? []
+        let bank = start.bank
+        if !held.isEmpty {
+            out.board = Advisor.transferBoard(squad: held, players: players, from: gwFrom,
+                                              horizon: horizon, bank: bank, fitOnly: fitOnly)
+            out.audit = Advisor.audit(squad: held, gw: gwFrom, bank: bank, players: players)
+        }
+        out.captains = Advisor.captainBoard(squad: held.isEmpty ? nil : held,
+                                            players: players, gw: gwFrom)
+        out.differentials = Advisor.differentials(players)
+        out.valuePicks = Advisor.valuePicks(players)
+        out.template = Advisor.template(players)
+        let watch = Advisor.priceWatch(players)
+        out.risers = watch.rising
+        out.fallers = watch.falling
+        return ComputeResult(insights: out, staleCustom: staleCustom)
+    }
+
+    // MARK: - manual team editing
+
     func applySwap(out: Player, inn: Player) {
         guard let current = squad?.squad else { return }
         let ids = current.map { $0.id == out.id ? inn.id : $0.id }
         customSquadIds = ids
-        UserDefaults.standard.set(ids, forKey: Self.customKey)
+        UserDefaults.standard.set(ids, forKey: Key.custom)
         rebuild()
     }
 
     func resetToAI() {
         customSquadIds = nil
-        UserDefaults.standard.removeObject(forKey: Self.customKey)
+        committedSquadIds = nil
+        UserDefaults.standard.removeObject(forKey: Key.custom)
+        UserDefaults.standard.removeObject(forKey: Key.committed)
         rebuild()
     }
 
@@ -237,7 +400,7 @@ final class AppState: ObservableObject {
     func swapCandidates(for out: Player) -> [Player] {
         guard let current = squad?.squad else { return [] }
         let ids = Set(current.map(\.id))
-        let budgetTenths = Int((budget * 10).rounded())
+        let budgetTenths = team?.budget ?? Int((budget * 10).rounded())
         let costWithoutOut = current.reduce(0) { $0 + $1.cost } - out.cost
         var clubs: [Int: Int] = [:]
         for p in current where p.id != out.id { clubs[p.team, default: 0] += 1 }
@@ -246,11 +409,11 @@ final class AppState: ObservableObject {
                 && costWithoutOut + p.cost <= budgetTenths
                 && clubs[p.team, default: 0] < 3
         }
+        .sorted { $0.proj != $1.proj ? $0.proj > $1.proj : $0.id < $1.id }
     }
 
-    /// Build a SquadResult from ids; with displayGw set, XI/captain/points are
-    /// computed for that single gameweek's projections.
-    nonisolated static func buildSquad(ids: [Int], players: [Player], displayGw: Int? = nil) -> SquadResult? {
+    nonisolated static func buildSquad(ids: [Int], players: [Player],
+                                       displayGw: Int? = nil) -> SquadResult? {
         var byId = [Int: Player](minimumCapacity: players.count)
         for p in players { byId[p.id] = p }
         var squad = ids.compactMap { byId[$0] }
@@ -262,7 +425,8 @@ final class AppState: ObservableObject {
                            cost: squad.reduce(0) { $0 + $1.cost })
     }
 
-    /// All upcoming fixtures for a team from the selected GW (for player detail).
+    // MARK: - fixture helpers (read the cached engine; never build one)
+
     func upcomingFixtures(teamId: Int, limit: Int = 12) -> [(gw: Int, fx: FixtureInfo)] {
         var out: [(Int, FixtureInfo)] = []
         for f in fixtures {
@@ -276,9 +440,10 @@ final class AppState: ObservableObject {
         return Array(out.sorted { $0.0 < $1.0 }.prefix(limit))
     }
 
-    // fixture grid helper — reads the cached engine instead of building one
     func gridFixtures(teamId: Int, gws: [Int]) -> [[FixtureInfo]] {
         guard let eng = engine else { return gws.map { _ in [] } }
         return gws.map { eng.teamFixtures(teamId, gw: $0) }
     }
+
+    func teamForm(_ teamId: Int) -> ProjectionEngine.TeamForm? { engine?.form(of: teamId) }
 }

@@ -22,42 +22,32 @@ struct ContentView: View {
             Theme.bg.ignoresSafeArea()
             switch state.phase {
             case .loading:
-                loadingView("Pulling live FPL data…")
+                VStack(spacing: 18) {
+                    ProgressView().tint(Theme.lime).scaleEffect(1.3)
+                    Text("Reading the season…").font(.mono(13)).foregroundColor(Theme.inkDim)
+                }
             case .error(let msg):
                 VStack(spacing: 16) {
-                    Text("⚠︎").font(.system(size: 40))
+                    Image(systemName: "wifi.exclamationmark")
+                        .font(.system(size: 34)).foregroundColor(Theme.amber)
                     Text(msg)
-                        .font(.system(size: 14))
-                        .foregroundColor(Theme.inkDim)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 40)
+                        .font(.system(size: 14)).foregroundColor(Theme.inkDim)
+                        .multilineTextAlignment(.center).padding(.horizontal, 40)
                     Button("Retry") { Task { await state.load() } }
-                        .buttonStyle(.borderedProminent)
-                        .tint(Theme.lime)
-                        .foregroundColor(.white)
+                        .buttonStyle(.borderedProminent).tint(Theme.lime)
                 }
-            default:
+            case .ready:
                 MainTabs()
             }
         }
         .task { await state.load() }
-        // refetch live data when the app comes back to the foreground, so
-        // played gameweeks (form, points, injuries, next GW) flow in automatically
         .onChange(of: scenePhase) { p in
             if p == .active { state.refreshIfStale() }
-        }
-    }
-
-    func loadingView(_ msg: String) -> some View {
-        VStack(spacing: 18) {
-            ProgressView().tint(Theme.lime).scaleEffect(1.4)
-            Text(msg).font(.mono(13)).foregroundColor(Theme.inkDim)
         }
     }
 }
 
 struct MainTabs: View {
-    @EnvironmentObject var state: AppState
     @State private var tab: Int
 
     init() {
@@ -78,104 +68,267 @@ struct MainTabs: View {
 
     var body: some View {
         TabView(selection: $tab) {
-            SquadView()
-                .tabItem { Label("Team", systemImage: "sportscourt") }.tag(0)
-            PlayersView()
-                .tabItem { Label("Players", systemImage: "list.number") }.tag(1)
-            CaptainsView()
-                .tabItem { Label("Captaincy", systemImage: "crown") }.tag(2)
-            FixturesView()
-                .tabItem { Label("Fixtures", systemImage: "calendar") }.tag(3)
+            SquadView().tabItem { Label("Team", systemImage: "sportscourt.fill") }.tag(0)
+            TransfersView().tabItem { Label("Transfers", systemImage: "arrow.left.arrow.right") }.tag(1)
+            PlayersView().tabItem { Label("Players", systemImage: "list.number") }.tag(2)
+            CaptainsView().tabItem { Label("Captain", systemImage: "crown.fill") }.tag(3)
+            FixturesView().tabItem { Label("Fixtures", systemImage: "calendar") }.tag(4)
         }
         .tint(Theme.lime)
     }
 }
 
-// MARK: - shared header controls
+// MARK: - header
 
-struct ControlsBar: View {
+/// One compact header shared by every tab: identity, freshness, and the way in
+/// to settings. The old build put four filter menus at the top of all four
+/// tabs, which pushed the actual content below the fold on a phone.
+struct AppHeader: View {
     @EnvironmentObject var state: AppState
+    var subtitle: String
+    @State private var showSettings = false
 
     var body: some View {
-        VStack(spacing: 10) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 0) {
-                        Text("PITCH").font(.system(size: 22, weight: .black))
-                        Text("IQ").font(.system(size: 22, weight: .black)).foregroundColor(Theme.lime)
-                    }
-                    Text(state.isPreseason ? "2026/27 · PRE-SEASON" : "2026/27 · LIVE")
-                        .font(.label(9)).tracking(2).foregroundColor(Theme.inkDim)
-                    if let updated = state.lastUpdated {
-                        Text("Updated \(updated.formatted(date: .omitted, time: .shortened))")
-                            .font(.label(8)).foregroundColor(Theme.inkDim.opacity(0.8))
-                            .lineLimit(1)
-                    }
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 0) {
+                    Text("PITCH").font(.system(size: 20, weight: .black)).foregroundColor(Theme.ink)
+                    Text("IQ").font(.system(size: 20, weight: .black)).foregroundColor(Theme.lime)
                 }
-                Spacer()
-                Button {
-                    state.rebuild()
-                } label: {
-                    Label("Rebuild", systemImage: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 14).padding(.vertical, 9)
-                        .background(Theme.lime)
-                        .clipShape(Capsule())
-                        .shadow(color: Theme.lime.opacity(0.3), radius: 6, x: 0, y: 3)
+                Text(subtitle.uppercased())
+                    .font(.label(8.5)).tracking(1.4).foregroundColor(Theme.inkDim)
+                    .lineLimit(1).minimumScaleFactor(0.75)
+            }
+            Spacer(minLength: 6)
+            if state.working || state.refreshing {
+                ProgressView().tint(Theme.limeDim).scaleEffect(0.75)
+            }
+            Button { showSettings = true } label: {
+                Image(systemName: state.isConnected ? "person.crop.circle.fill" : "slider.horizontal.3")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(state.isConnected ? Theme.lime : Theme.ink)
+                    .frame(width: 36, height: 36)
+                    .background(Theme.panel)
+                    .clipShape(Circle())
+                    .overlay(Circle().stroke(Theme.line, lineWidth: 1))
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+        .sheet(isPresented: $showSettings) { SettingsSheet() }
+    }
+}
+
+// MARK: - settings
+
+struct SettingsSheet: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var entryText = ""
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    connectCard
+                    modelCard
+                    dataCard
+                }
+                .padding(16)
+            }
+            .background(Theme.bg)
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }.tint(Theme.lime)
                 }
             }
-            ScrollView(.horizontal, showsIndicators: false) {
+        }
+        .preferredColorScheme(.light)
+        .onAppear { entryText = state.team.map { String($0.entryId) } ?? "" }
+    }
+
+    // --- connect an FPL team
+
+    var connectCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionLabel(text: "Your FPL team", accent: Theme.lime)
+            if let t = state.team {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(t.teamName).font(.system(size: 18, weight: .black)).foregroundColor(Theme.ink)
+                    Text(t.managerName).font(.system(size: 12)).foregroundColor(Theme.inkDim)
+                    HStack(spacing: 16) {
+                        miniStat("\(t.overallPoints)", "PTS")
+                        miniStat(t.overallRank > 0 ? rankText(t.overallRank) : "—", "RANK")
+                        miniStat(String(format: "£%.1fm", Double(t.bank) / 10), "BANK")
+                        miniStat("\(t.freeTransfers)", "FREE")
+                    }
+                    Text("Picks read from gameweek \(t.gw). The plan, the transfer board and the squad audit all work from these fifteen.")
+                        .font(.system(size: 12)).foregroundColor(Theme.inkDim)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(role: .destructive) {
+                        state.disconnect()
+                    } label: {
+                        Text("Disconnect").font(.system(size: 13, weight: .semibold))
+                    }
+                }
+            } else {
+                Text("Link your real team and every screen switches from “here is a good squad” to “here is what to do with yours”.")
+                    .font(.system(size: 13)).foregroundColor(Theme.ink)
+                    .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {
-                    Menu {
-                        ForEach(state.gwOptions, id: \.id) { e in
-                            Button("GW \(e.id)\(e.is_next ? " (next)" : "")") {
-                                state.gwFrom = e.id
-                                state.rebuild()
-                            }
+                    TextField("FPL team ID", text: $entryText)
+                        .keyboardType(.numberPad)
+                        .font(.mono(15, .bold))
+                        .padding(.horizontal, 12).padding(.vertical, 10)
+                        .background(Theme.bg2)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    Button {
+                        if let id = Int(entryText.trimmingCharacters(in: .whitespaces)) {
+                            Task { await state.connect(entryId: id) }
                         }
                     } label: {
-                        chip("GW \(state.gwFrom)", icon: "chevron.down")
+                        if state.importing {
+                            ProgressView().tint(.white).frame(width: 60)
+                        } else {
+                            Text("Connect").font(.system(size: 14, weight: .bold))
+                                .foregroundColor(.white).frame(width: 60)
+                        }
                     }
-                    Menu {
-                        Button("This GW only") { state.horizon = 1 }
-                        Button("Next 3 GWs") { state.horizon = 3 }
-                        Button("Next 6 GWs") { state.horizon = 6 }
-                    } label: {
-                        chip(state.horizon == 1 ? "1 GW" : "Next \(state.horizon)", icon: "chevron.down")
+                    .padding(.vertical, 11)
+                    .background(Theme.lime)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .disabled(state.importing || entryText.isEmpty)
+                }
+                Text("Find the ID in the URL when you open your team on the FPL website: fantasy.premierleague.com/entry/**1234567**/event/1")
+                    .font(.system(size: 11.5)).foregroundColor(Theme.inkDim)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let err = state.importError {
+                    Text(err).font(.system(size: 12)).foregroundColor(Theme.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(15)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panel()
+    }
+
+    func miniStat(_ v: String, _ k: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(v).font(.mono(14, .bold)).foregroundColor(Theme.ink)
+            Text(k).font(.label(8)).tracking(1).foregroundColor(Theme.inkDim)
+        }
+    }
+
+    func rankText(_ r: Int) -> String {
+        r >= 1_000_000 ? String(format: "%.1fM", Double(r) / 1_000_000)
+            : (r >= 1000 ? String(format: "%.0fk", Double(r) / 1000) : "\(r)")
+    }
+
+    // --- model settings
+
+    var modelCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            SectionLabel(text: "Model")
+            row("Planning from", "GW \(state.gwFrom)") {
+                Menu {
+                    ForEach(state.gwOptions, id: \.id) { e in
+                        Button("GW \(e.id)\(e.is_next ? "  (next)" : "")") {
+                            state.gwFrom = e.id
+                            state.rebuild()
+                        }
                     }
+                } label: { chevron("GW \(state.gwFrom)") }
+            }
+            row("Ranking horizon", "") {
+                Menu {
+                    ForEach([1, 3, 6, 8, 12], id: \.self) { h in
+                        Button(h == 1 ? "This gameweek only" : "Next \(h) gameweeks") {
+                            state.horizon = h
+                        }
+                    }
+                } label: {
+                    chevron(state.horizon == 1 ? "1 GW" : "Next \(state.horizon)")
+                }
+            }
+            if !state.isConnected {
+                row("Budget", "") {
                     Menu {
                         ForEach([95.0, 97.5, 100.0, 102.5, 105.0], id: \.self) { b in
-                            Button("£\(b == b.rounded() ? String(Int(b)) : String(format: "%.1f", b))m") {
+                            Button(String(format: "£%.1fm", b)) {
                                 state.budget = b
                                 state.rebuild()
                             }
                         }
-                    } label: {
-                        chip("£\(state.budget == state.budget.rounded() ? String(Int(state.budget)) : String(format: "%.1f", state.budget))m", icon: "chevron.down")
-                    }
-                    Button { state.fitOnly.toggle() } label: {
-                        chip(state.fitOnly ? "Fit only ✓" : "All players", icon: nil,
-                             color: state.fitOnly ? Theme.lime : Theme.inkDim)
-                    }
+                    } label: { chevron(String(format: "£%.1fm", state.budget)) }
                 }
             }
+            Toggle(isOn: Binding(get: { state.fitOnly }, set: { state.fitOnly = $0 })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Hide flagged players").font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(Theme.ink)
+                    Text("Injured, suspended and doubtful players are excluded from every recommendation.")
+                        .font(.system(size: 11.5)).foregroundColor(Theme.inkDim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .tint(Theme.lime)
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 6)
-        .padding(.bottom, 10)
+        .padding(15)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panel()
     }
 
-    func chip(_ text: String, icon: String?, color: Color = Theme.ink) -> some View {
-        HStack(spacing: 5) {
-            Text(text).font(.mono(12))
-            if let icon { Image(systemName: icon).font(.system(size: 9, weight: .semibold)) }
+    func row<C: View>(_ title: String, _ value: String,
+                      @ViewBuilder control: () -> C) -> some View {
+        HStack {
+            Text(title).font(.system(size: 14, weight: .semibold)).foregroundColor(Theme.ink)
+            Spacer()
+            control()
         }
-        .foregroundColor(color)
-        .padding(.horizontal, 13).padding(.vertical, 9)
-        .background(Theme.panel)
+    }
+
+    func chevron(_ text: String) -> some View {
+        HStack(spacing: 5) {
+            Text(text).font(.mono(13, .bold))
+            Image(systemName: "chevron.up.chevron.down").font(.system(size: 9, weight: .semibold))
+        }
+        .foregroundColor(Theme.lime)
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background(Theme.lime.opacity(0.1))
         .clipShape(Capsule())
-        .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
-        .shadow(color: Color.black.opacity(0.03), radius: 5, x: 0, y: 2)
+    }
+
+    // --- data
+
+    var dataCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionLabel(text: "Data")
+            if let u = state.lastUpdated {
+                Text("Live FPL data, updated \(u.formatted(date: .abbreviated, time: .shortened)).")
+                    .font(.system(size: 12.5)).foregroundColor(Theme.inkDim)
+            }
+            Text(state.isPreseason
+                 ? "Pre-season: projections run off last season's per-90 rates, minutes security and set-piece duty, adjusted for each opponent. Form joins the blend as soon as matches are played."
+                 : "Projections blend current form with xG/xA per-90 rates, minutes security, bonus rates and each opponent's strength, home and away.")
+                .font(.system(size: 12.5)).foregroundColor(Theme.inkDim)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                Task { await state.refresh() }
+            } label: {
+                Label("Refresh now", systemImage: "arrow.clockwise")
+                    .font(.system(size: 14, weight: .semibold)).foregroundColor(.white)
+                    .frame(maxWidth: .infinity).padding(.vertical, 11)
+                    .background(Theme.lime)
+                    .clipShape(RoundedRectangle(cornerRadius: 11))
+            }
+            .disabled(state.refreshing)
+        }
+        .padding(15)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panel()
     }
 }

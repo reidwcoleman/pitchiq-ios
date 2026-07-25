@@ -511,18 +511,115 @@ struct ProjectionEngine {
         return r
     }
 
-    func buildPlayers() -> [Player] {
+    // MARK: - score distribution
+    //
+    // The mean is what the optimiser maximises, but two players with the same
+    // mean are not the same asset: a striker's points arrive in lumps and a
+    // defender's arrive steadily. Captaincy and differential picks both turn on
+    // the shape of the distribution, so the next gameweek's score is convolved
+    // exactly over the components that actually vary — goals, assists, clean
+    // sheet — with the rest held at their expected value.
+
+    struct Outcome {
+        var ceiling = 0.0     // 90th percentile
+        var haul = 0.0        // P(10+)
+        var blank = 0.0       // P(2 or fewer)
+    }
+
+    static func distribution(_ r: PlayerRates, _ fxs: [FixtureContext]) -> Outcome {
+        guard !fxs.isEmpty, r.avail > 0.01 else { return Outcome(ceiling: 0, haul: 0, blank: 1) }
+
+        // Aggregate the fixture-scaled rates across (possibly two) matches, then
+        // rescale so the distribution's mean matches the projection the rest of
+        // the app shows. The projection blends this component model with the
+        // player's scoring history and FPL's own estimate; without the rescale a
+        // striker's ceiling would be quoted off a different number than his mean.
+        var lamG = 0.0, lamA = 0.0, csP = 0.0, extras = 0.0
+        var model = 0.0, final = 0.0
+        for fx in fxs {
+            let c = r.components(fx)
+            lamG += c.goals / max(goalPts[r.pos], 1)
+            lamA += c.assists / 3
+            csP += fx.csProb
+            extras += c.conceded + c.saves + c.defcon + c.bonus + c.cards
+            model += c.model
+            final += c.final
+        }
+        csP = min(csP / Double(fxs.count), 1)
+        let scale = model > 0.05 ? max(min(final / model, 3), 0.1) : 1
+        let gPts = goalPts[r.pos] * scale, aPts = 3.0 * scale
+        let cPts = csPts[r.pos] * scale
+        extras *= scale
+
+        // Appearance is the thing that actually creates a blank, so it is a
+        // random variable here rather than an expected value. Treating it as an
+        // average put a floor of two appearance points under every projection
+        // and reported a 0% chance of a blank for players who are benched one
+        // week in three. Three states: didn't play, came off the bench, started.
+        let pNone = max(1 - r.pPlay, 0) + (1 - r.avail) * r.pPlay
+        let pCameo = max(r.pPlay - r.p60, 0) * r.avail
+        let pFull = r.p60 * r.avail
+        // a substitute plays roughly a quarter of a match and never earns a
+        // clean sheet, which needs 60 minutes
+        let states: [(p: Double, appear: Double, rate: Double, cs: Double)] = [
+            (pNone, 0, 0, 0),
+            (pCameo, 1 * scale, 0.25, 0),
+            (pFull, 2 * scale, 1.0, csP),
+        ]
+
+        var pmf = [Double](repeating: 0, count: 61)      // points −5 … 55, offset 5
+        let offset = 5
+        for st in states where st.p > 1e-6 {
+            if st.rate == 0 {
+                pmf[offset] += st.p
+                continue
+            }
+            let lg = lamG * st.rate, la = lamA * st.rate
+            var pg = exp(-lg)
+            for g in 0...5 {
+                var pa = exp(-la)
+                for a in 0...4 {
+                    for (cs, pc) in [(1.0, st.cs), (0.0, 1 - st.cs)] where pc > 1e-6 {
+                        let pts = st.appear + extras * st.rate
+                            + Double(g) * gPts + Double(a) * aPts + cs * cPts
+                        let k = min(max(Int(pts.rounded()) + offset, 0), 60)
+                        pmf[k] += st.p * pg * pa * pc
+                    }
+                    pa *= la / Double(a + 1)
+                }
+                pg *= lg / Double(g + 1)
+            }
+        }
+        let mass = pmf.reduce(0, +)
+        if mass > 0.001 { for i in pmf.indices { pmf[i] /= mass } }
+
+        var out = Outcome()
+        var cum = 0.0
+        for k in 0...60 {
+            cum += pmf[k]
+            let pts = k - offset
+            if pts <= 2 { out.blank = cum }
+            if out.ceiling == 0, cum >= 0.90 { out.ceiling = Double(max(pts, 0)) }
+            if pts >= 10 { out.haul += pmf[k] }
+        }
+        if out.ceiling == 0 { out.ceiling = 55 }
+        return out
+    }
+
+    // MARK: - assembly
+
+    func buildPlayers(totalManagers: Int) -> [Player] {
         let teamById = Dictionary(uniqueKeysWithValues: boot.teams.map { ($0.id, $0) })
         let games = Double(statGames)
         let lastGw = 38
+        // FPL moves a price after net transfers pass roughly this fraction of
+        // the total manager base. The published threshold isn't exact, but the
+        // ratio ranks movers correctly, which is all the watchlist needs.
+        let priceUnit = Double(max(totalManagers, 1)) * 0.0011
 
         var players: [Player] = boot.elements.map { p in
             let pos = min(max(p.element_type, 1), 4)
             let r = rates(for: p)
-            let flagged = p.status != "a"
-            let penTaker = (p.penalties_order ?? 99) == 1
-            let setPieces = (p.corners_and_indirect_freekicks_order ?? 99) == 1
-                || (p.direct_freekicks_order ?? 99) == 1
             let mpg = min(Double(p.minutes) / games, 90)
 
             // per-GW projections for every remaining gameweek, so the planner
@@ -539,24 +636,39 @@ struct ProjectionEngine {
             let proj = (gwFrom..<min(gwFrom + horizon, 39))
                 .reduce(0.0) { $0 + projByGw.at($1) }
             let t = teamById[p.team]
+            let dist = Self.distribution(r, contexts(p.team, gw: gwFrom))
+            let net = (p.transfers_in_event ?? 0) - (p.transfers_out_event ?? 0)
 
-            return Player(
-                id: p.id, name: p.web_name, pos: pos, team: p.team,
-                teamShort: t?.short_name ?? "?", teamName: t?.name ?? "?",
-                cost: p.now_cost, proj: proj, perGw: proj / Double(max(horizon, 1)),
-                ppg: r.ppg, xgi90: (r.goalPts90 / Self.goalPts[pos]) + (r.assistPts90 / 3),
-                own: Double(p.selected_by_percent ?? "") ?? 0,
-                avail: r.avail, flagged: flagged, mins: p.minutes,
-                fixtures: horizonFixtures(p.team),
-                projByGw: projByGw,
-                totalPoints: p.total_points, goals: p.goals_scored, assists: p.assists,
-                cleanSheets: p.clean_sheets ?? 0, bonus: p.bonus, saves: p.saves,
-                starts: p.starts ?? 0, form: r.form,
-                xg: Double(p.expected_goals ?? "") ?? 0,
-                xa: Double(p.expected_assists ?? "") ?? 0,
-                news: p.news ?? "",
-                expMins: mpg, penTaker: penTaker, setPieces: setPieces
-            )
+            var pl = Player()
+            pl.id = p.id; pl.name = p.web_name; pl.pos = pos; pl.team = p.team
+            pl.teamShort = t?.short_name ?? "?"; pl.teamName = t?.name ?? "?"
+            pl.cost = p.now_cost; pl.proj = proj
+            pl.perGw = proj / Double(max(horizon, 1))
+            pl.ppg = r.ppg
+            pl.xgi90 = (r.goalPts90 / Self.goalPts[pos]) + (r.assistPts90 / 3)
+            pl.own = Double(p.selected_by_percent ?? "") ?? 0
+            pl.avail = r.avail; pl.flagged = p.status != "a"; pl.mins = p.minutes
+            pl.fixtures = horizonFixtures(p.team); pl.projByGw = projByGw
+            pl.totalPoints = p.total_points; pl.goals = p.goals_scored
+            pl.assists = p.assists; pl.cleanSheets = p.clean_sheets ?? 0
+            pl.bonus = p.bonus; pl.saves = p.saves; pl.starts = p.starts ?? 0
+            pl.form = r.form
+            pl.xg = Double(p.expected_goals ?? "") ?? 0
+            pl.xa = Double(p.expected_assists ?? "") ?? 0
+            pl.news = p.news ?? ""
+            pl.expMins = mpg
+            pl.penTaker = (p.penalties_order ?? 99) == 1
+            pl.setPieces = (p.corners_and_indirect_freekicks_order ?? 99) == 1
+                || (p.direct_freekicks_order ?? 99) == 1
+            pl.startRate = min(Double(p.starts ?? 0) / games, 1)
+            pl.ceiling = dist.ceiling; pl.haulProb = dist.haul; pl.blankProb = dist.blank
+            pl.netTransfers = net
+            pl.priceMomentum = max(min(Double(net) / priceUnit, 1.5), -1.5)
+            pl.costChangeStart = p.cost_change_start ?? 0
+            pl.ictIndex = Double(p.ict_index ?? "") ?? 0
+            pl.threat = Double(p.threat ?? "") ?? 0
+            pl.creativity = Double(p.creativity ?? "") ?? 0
+            return pl
         }
         players.sort { $0.proj != $1.proj ? $0.proj > $1.proj : $0.id < $1.id }
         return players
@@ -569,27 +681,28 @@ struct ProjectionEngine {
                           engine: ProjectionEngine) -> [Player] {
         let hi = min(gwFrom + horizon, 39)
         return players.map { p in
+            var out = p
             var total = 0.0
             for gw in gwFrom..<hi { total += p.projByGw.at(gw) }
-            var out = p.reprojected(total)
-            out = out.withHorizon(perGw: total / Double(max(horizon, 1)),
-                                  fixtures: engine.horizonFixtures(p.team))
+            out.proj = total
+            out.perGw = total / Double(max(horizon, 1))
+            out.fixtures = engine.horizonFixtures(p.team)
             return out
         }
         .sorted { $0.proj != $1.proj ? $0.proj > $1.proj : $0.id < $1.id }
     }
-}
 
-extension Player {
-    /// Horizon-dependent fields only; per-gameweek projections are unaffected.
-    func withHorizon(perGw: Double, fixtures: [FixtureInfo]) -> Player {
-        Player(id: id, name: name, pos: pos, team: team, teamShort: teamShort,
-               teamName: teamName, cost: cost, proj: proj, perGw: perGw, ppg: ppg,
-               xgi90: xgi90, own: own, avail: avail, flagged: flagged, mins: mins,
-               fixtures: fixtures, projByGw: projByGw,
-               totalPoints: totalPoints, goals: goals, assists: assists,
-               cleanSheets: cleanSheets, bonus: bonus, saves: saves, starts: starts,
-               form: form, xg: xg, xa: xa, news: news,
-               expMins: expMins, penTaker: penTaker, setPieces: setPieces)
+    // MARK: - team-level ratings, surfaced by the fixture tab
+
+    struct TeamForm {
+        let attack: Double      // expected goals scored per match, neutral ground
+        let defence: Double     // expected goals conceded per match
+    }
+
+    func form(of teamId: Int) -> TeamForm {
+        guard teamId >= 0, teamId < ratings.attack.count else {
+            return TeamForm(attack: TeamRatings.leagueGoals, defence: TeamRatings.leagueGoals)
+        }
+        return TeamForm(attack: ratings.attack[teamId], defence: ratings.defence[teamId])
     }
 }

@@ -1,17 +1,32 @@
 import Foundation
 
-// MARK: - Multi-gameweek transfer + chip planner
-// Picks an opening squad weighted across the season, then simulates week by
-// week with real FPL rules: 1 free transfer per GW (bankable to 5), every
-// banked FT spent whenever a move genuinely benefits the team (never when it
-// doesn't), -4 hits only when clearly worth it, injured players replaced
-// with priority. On top of the base plan it schedules every chip the game
-// gives you (Wildcard / Free Hit / Bench Boost / Triple Captain — one of
-// each per half-season) where each earns the most points:
-//   Wildcard      unlimited free transfers; the new squad persists
-//   Free Hit      one-week dream team (great for double gameweeks); reverts
-//   Bench Boost   bench points count that week
-//   Triple Cap    captain ×3 instead of ×2
+// MARK: - Season planner
+//
+// Simulates the rest of the season gameweek by gameweek under the real rules —
+// one free transfer a week banking to five, −4 for each extra, 2/5/5/3, max
+// three per club, a fixed budget — and schedules the eight chips where each
+// earns the most.
+//
+// What changed from the previous version, and why:
+//
+//   • It plans from the squad you actually own. Given an imported team it
+//     starts from those fifteen, that bank and that number of free transfers,
+//     and it knows which chips you have already spent. The old planner always
+//     began from a squad it had invented, so its first instruction was
+//     effectively "own a different team", which no amount of later advice can
+//     act on.
+//   • A chip is only scheduled when it gains something. The old build always
+//     played every chip, and reported wildcards worth +0.0 points — an
+//     instruction to burn a wildcard for nothing. Chips now have to clear a
+//     threshold, except when their window is about to close, in which case
+//     using one beats losing it and the plan says so.
+//   • Holding a free transfer is priced instead of guessed at. A banked
+//     transfer has real option value — it buys the right to react to next
+//     week's news — but that value collapses at the cap of five, where an
+//     unused transfer is simply lost, so the bar to spend one falls with it.
+//     Injuries override the bar entirely.
+//   • Every gameweek carries a one-line instruction and the reasoning behind
+//     it, so the plan reads as advice rather than as output.
 
 struct TransferMove: Identifiable {
     let id = UUID()
@@ -32,20 +47,24 @@ struct ChipPlay: Identifiable {
     let chip: String
     let gw: Int
     let gain: Double
+    let forced: Bool        // played only because the window was about to close
 }
 
 struct GWPlan: Identifiable {
     var id: Int { gw }
     let gw: Int
     let transfers: [TransferMove]
-    let xi: [Player]           // reprojected to this GW's values
+    let xi: [Player]           // reprojected to this gameweek's values
     let bench: [Player]
     let captain: Player
     let formation: String
-    let projPts: Double        // XI + captain bonus (+chip effects) - hits
+    let projPts: Double        // XI + captain (+ chip effects) − hits
     let ftsLeft: Int
     let hitPts: Int
-    let chip: String?          // chip played this GW, if any
+    let bank: Int              // tenths of £m
+    let chip: String?
+    let action: String         // the one-line instruction for this week
+    let reasons: [String]
 }
 
 struct SeasonPlan {
@@ -55,17 +74,32 @@ struct SeasonPlan {
     let totalHits: Int
     let fromUserSquad: Bool
     let chips: [ChipPlay]
-    let heldChips: [String]    // chips kept in reserve — no week currently gains
+    let heldChips: [String]    // no week in the window is worth playing them yet
+
+    var perGw: Double { gws.isEmpty ? 0 : totalPts / Double(gws.count) }
+}
+
+/// Everything the planner needs to know about the starting position.
+struct PlanStart {
+    var squadIds: [Int]?        // nil → build the opening squad from scratch
+    var bank = 0                // tenths of £m
+    var budget = 1000           // squad value + bank, tenths of £m
+    var freeTransfers = 1
+    var chipsUsed: Set<String> = []
+    /// True when these fifteen are a team the user actually owns. A squad the
+    /// app invented can't be "transferred out of" in the same gameweek it was
+    /// invented, so first-week moves are only offered on a real team.
+    var isUserTeam = true
 }
 
 // MARK: - Precomputed planning tables
 //
 // `weightedValue` — a player's decay-weighted points from gameweek g to the end
 // of the window — was recomputed by looping over up to 38 gameweeks, inside a
-// loop over every squad/pool pair, inside a loop over every gameweek. That is
-// the single hottest path in the app. Because the weights are geometric it
-// satisfies W(g) = proj(g) + decay·W(g+1), so the whole table is built once by
-// a backward pass and every later read is a single array index.
+// loop over every squad/pool pair, inside a loop over every gameweek: the
+// hottest path in the app. Because the weights are geometric it satisfies
+// W(g) = proj(g) + decay·W(g+1), so the whole table is built once by a backward
+// pass and every later read is a single array index.
 
 final class PlanContext {
     let players: [Player]
@@ -128,17 +162,46 @@ final class PlanContext {
 }
 
 enum Planner {
-    static let hitGainThreshold = 6.0
     static let decay = 0.88
 
-    static func freeThreshold(ftsBanked: Int, outInjured: Bool) -> Double {
-        if outInjured { return 0.0 }
-        if ftsBanked >= 5 { return 0.1 }
-        if ftsBanked >= 3 { return 0.25 }
-        return 0.5
+    /// Extra gain a move must show before it is worth taking a −4. Four points
+    /// is the cost; the margin on top covers the fact that a projection made
+    /// weeks out is an estimate, not a promise.
+    static let hitGainThreshold = 6.0
+
+    /// What a banked free transfer is worth, and therefore the bar a move has
+    /// to clear to be worth spending one.
+    static func optionValue(ftsBanked: Int, outInjured: Bool) -> Double {
+        if outInjured { return 0 }
+        switch ftsBanked {
+        case ...1: return 0.6
+        case 2: return 0.4
+        case 3: return 0.25
+        case 4: return 0.1
+        default: return 0        // at the cap an unused transfer is simply lost
+        }
     }
 
-    /// Kept for callers outside the simulation hot path.
+    /// Minimum gain before a chip is worth burning. Below this, keeping it for a
+    /// better week is worth more than the points on the table now.
+    static func chipThreshold(_ chip: String) -> Double {
+        switch chip {
+        case "bboost": return 8      // a bench boost that scores 6 is a wasted chip
+        case "3xc": return 5         // only the third captaincy is the gain
+        case "wildcard": return 8    // a rebuild should change the season, not tidy it
+        case "freehit": return 12    // the highest bar: the rarest opportunity
+        default: return 5
+        }
+    }
+
+    /// Median of a set of candidate weeks — the yardstick a chip week has to
+    /// beat before it is worth spending the chip rather than waiting.
+    static func typical(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let s = values.sorted()
+        return s[s.count / 2]
+    }
+
     static func weightedValue(_ p: Player, from gw: Int, to end: Int) -> Double {
         var v = 0.0, w = 1.0
         var g = gw
@@ -166,149 +229,172 @@ enum Planner {
         var ftsAtStart: [Int: Int] = [:]
     }
 
-    // MARK: entry point
+    // MARK: - entry point
 
-    static func plan(players: [Player], budgetM: Double, fitOnly: Bool,
-                     from: Int, window: Int, userSquad: [Player]? = nil,
-                     chipsMeta: [ChipMeta] = [], doubleGws: Set<Int> = []) -> SeasonPlan? {
+    static func plan(players: [Player], fitOnly: Bool, from: Int, window: Int,
+                     start: PlanStart, chipsMeta: [ChipMeta] = [],
+                     doubleGws: Set<Int> = []) -> SeasonPlan? {
         let end = min(from + window - 1, 38)
         guard end >= from else { return nil }
-        let budget = Int((budgetM * 10).rounded())
+        let budget = start.budget
+        let budgetM = Double(budget) / 10
         let poolPlayers = Optimizer.candidatePool(players, fitOnly: fitOnly)
         let ctx = PlanContext(players: players, pool: poolPlayers, from: from, end: end)
 
         var squad0: [Int]
         var fts0: Int
         let fromUser: Bool
-        if let user = userSquad, user.count == 15 {
-            squad0 = user.compactMap { ctx.index[$0.id] }
-            fts0 = 1
-            fromUser = true
+        if let ids = start.squadIds, ids.count == 15 {
+            squad0 = ids.compactMap { ctx.index[$0] }
+            fts0 = max(start.freeTransfers, 0)
+            fromUser = start.isUserTeam
         } else {
-            let scored = players
-                .map { $0.reprojected(weightedValue($0, from: from, to: end)) }
-            guard let opening = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly)
-            else { return nil }
+            // No imported team: build the squad that scores best across the
+            // whole remaining season, not just the next gameweek.
+            let scored = players.map { $0.reprojected(weightedValue($0, from: from, to: end)) }
+            guard let opening = Optimizer.optimize(players: scored, budgetM: budgetM,
+                                                   fitOnly: fitOnly) else { return nil }
             squad0 = opening.squad.compactMap { ctx.index[$0.id] }
             fts0 = 0
             fromUser = false
         }
         guard squad0.count == 15 else { return nil }
 
-        // pass 1: base plan without chips
+        // pass 1: base plan with no chips — the yardstick every chip is
+        // measured against
         let base = simulate(ctx: ctx, budget: budget, from: from, end: end,
                             initial: squad0, initialFts: fts0,
                             allowFirstMoves: fromUser, chips: [:], scoreOnly: false)
 
-        // pass 2: schedule chips where they earn the most
+        // pass 2: schedule the chips
         var actions: [Int: ChipAction] = [:]
         var plays: [ChipPlay] = []
         var heldChips: [String] = []
-        // Free Hit gets first claim within each half so a double gameweek is
-        // never taken by another chip before it can land there
+        // Free Hit picks first inside each half so a double gameweek isn't
+        // claimed by a lesser chip before it can land there.
         let order = ["freehit", "wildcard", "3xc", "bboost"]
-        let sortedMeta = chipsMeta
-            .filter { $0.stop >= from && $0.start <= end }
-            .sorted {
-                let h0 = $0.stop <= 19 ? 0 : 1
-                let h1 = $1.stop <= 19 ? 0 : 1
-                return h0 != h1 ? h0 < h1
-                    : (order.firstIndex(of: $0.name) ?? 9) < (order.firstIndex(of: $1.name) ?? 9)
-            }
+        let available = chipsMeta.filter {
+            $0.stop >= from && $0.start <= end && !start.chipsUsed.contains($0.name + "-\($0.stop)")
+        }
+        let sortedMeta = available.sorted {
+            let h0 = $0.stop <= 19 ? 0 : 1
+            let h1 = $1.stop <= 19 ? 0 : 1
+            return h0 != h1 ? h0 < h1
+                : (order.firstIndex(of: $0.name) ?? 9) < (order.firstIndex(of: $1.name) ?? 9)
+        }
         let basePts = Dictionary(uniqueKeysWithValues: base.gws.map { ($0.gw, $0.projPts) })
 
         for meta in sortedMeta {
-            // transfer chips can't be played the week the plan already builds a
-            // fresh squad; team chips can be played any week in window
-            let minGw = meta.name == "wildcard" || meta.name == "freehit"
+            // a transfer chip can't be played the week the plan is already
+            // inventing a fresh squad
+            let minGw = (meta.name == "wildcard" || meta.name == "freehit")
                 ? max(meta.start, fromUser ? from : from + 1)
                 : max(meta.start, from)
             let lo = minGw, hi = min(meta.stop, end)
             guard lo <= hi else { continue }
             let free = (lo...hi).filter { actions[$0] == nil }
-            guard !free.isEmpty else { continue }
+            guard !free.isEmpty else { heldChips.append(meta.name); continue }
             let freeSet = Set(free)
+            // Once the window is nearly gone, playing the chip anywhere beats
+            // losing it, so the threshold falls away. Measured from *now*, not
+            // from the window's own start: the plan re-runs every week, so a
+            // chip that isn't worth playing in September becomes worth playing
+            // as its deadline approaches, and only then.
+            let closing = hi - max(lo, from) <= 3
+            let bar = closing ? 0.0 : chipThreshold(meta.name)
 
             switch meta.name {
             case "3xc":
-                var bestGw: Int?; var bestGain = -1.0
+                // Absolute size isn't the test — every week has a captain worth
+                // five or six points, so an absolute bar would burn the chip in
+                // the first available gameweek. What matters is whether this
+                // week stands out from a typical one, which in practice means a
+                // double gameweek or a premium against a collapsing defence.
+                var bestGw: Int?
+                var bestGain = -1.0
+                var capPts: [Double] = []
                 for gp in base.gws where freeSet.contains(gp.gw) {
+                    capPts.append(gp.captain.proj)
                     if gp.captain.proj > bestGain { bestGain = gp.captain.proj; bestGw = gp.gw }
                 }
-                if let g = bestGw {
+                let capBar = max(bar, closing ? 0 : typical(capPts) * 1.30)
+                if let g = bestGw, bestGain >= capBar {
                     actions[g] = .tripleCaptain
-                    plays.append(ChipPlay(chip: "3xc", gw: g, gain: max(bestGain, 0)))
+                    plays.append(ChipPlay(chip: "3xc", gw: g, gain: max(bestGain, 0), forced: closing))
+                } else {
+                    heldChips.append("3xc")
                 }
 
             case "bboost":
-                var bestGw: Int?; var bestGain = -1.0
+                var bestGw: Int?
+                var bestGain = -1.0
+                var benchWeeks: [Double] = []
                 for gp in base.gws where freeSet.contains(gp.gw) {
                     let benchPts = gp.bench.reduce(0) { $0 + $1.proj }
+                    benchWeeks.append(benchPts)
                     if benchPts > bestGain { bestGain = benchPts; bestGw = gp.gw }
                 }
-                if let g = bestGw {
+                let benchBar = max(bar, closing ? 0 : typical(benchWeeks) * 1.30)
+                if let g = bestGw, bestGain >= benchBar {
                     actions[g] = .benchBoost
-                    plays.append(ChipPlay(chip: "bboost", gw: g, gain: max(bestGain, 0)))
+                    plays.append(ChipPlay(chip: "bboost", gw: g, gain: max(bestGain, 0), forced: closing))
+                } else {
+                    heldChips.append("bboost")
                 }
 
             case "freehit":
-                // the Free Hit exists for double gameweeks: if any DGW is in
-                // this window, it MUST go on one. With no DGW announced yet,
-                // hold the chip — doubles appear mid-season, and the plan
-                // re-runs on every refresh. Only if the window is about to
-                // expire with no DGW does it fall back to the best normal week.
+                // The Free Hit exists for double gameweeks. With none announced
+                // in the window, hold it — doubles appear mid-season when
+                // postponed matches are rescheduled, and the plan re-runs on
+                // every refresh.
                 let dgwCands = free.filter { doubleGws.contains($0) }
-                let windowClosing = hi - max(lo, from) <= 3
-                if dgwCands.isEmpty && !windowClosing {
-                    heldChips.append("freehit")
-                    continue
-                }
+                if dgwCands.isEmpty && !closing { heldChips.append("freehit"); continue }
                 let searchGws = dgwCands.isEmpty ? free : dgwCands
                 let cands = searchGws
                     .map { g -> (Int, Double) in
                         var top = players.map { $0.projByGw.at(g) }
                         top.sort(by: >)
-                        let ceiling = top.prefix(11).reduce(0, +)
-                        return (g, ceiling - (basePts[g] ?? 0))
+                        return (g, top.prefix(11).reduce(0, +) - (basePts[g] ?? 0))
                     }
                     .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }
                     .prefix(3)
-                var best: (gw: Int, pts: Double, sq: SquadResult)?
+                var best: (gw: Int, pts: Double, gain: Double, sq: SquadResult)?
                 for (g, _) in cands {
                     let scored = players.map { $0.reprojected($0.projByGw.at(g)) }
-                    guard let sq = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly,
-                                                      iters: 3000, restarts: 2) else { continue }
+                    guard let sq = Optimizer.optimize(players: scored, budgetM: budgetM,
+                                                      fitOnly: fitOnly, exactCaptain: false)
+                    else { continue }
                     let pts = sq.total + sq.captain.proj
-                    if best == nil || pts - (basePts[g] ?? 0) > best!.pts - (basePts[best!.gw] ?? 0) {
-                        best = (g, pts, sq)
-                    }
+                    let gain = pts - (basePts[g] ?? 0)
+                    if best == nil || gain > best!.gain { best = (g, pts, gain, sq) }
                 }
-                if let b = best {
-                    // always play it — the chip expires at the half; the pick
-                    // gravitates to double-gameweeks automatically because
-                    // two-fixture players carry doubled projections that week
-                    let gain = max(b.pts - (basePts[b.gw] ?? 0), 0)
+                if let b = best, b.gain >= bar {
                     actions[b.gw] = .freeHit(squad: b.sq, pts: b.pts)
-                    plays.append(ChipPlay(chip: "freehit", gw: b.gw, gain: gain))
+                    plays.append(ChipPlay(chip: "freehit", gw: b.gw, gain: max(b.gain, 0),
+                                          forced: closing))
+                } else {
+                    heldChips.append("freehit")
                 }
 
             case "wildcard":
-                // try spread candidates across the window: rebuild the squad
-                // there and re-simulate the rest of the season
-                let candSet = Set(stride(from: lo, through: hi, by: max((hi - lo) / 4, 1)))
+                // Try candidate weeks across the window: rebuild there, then
+                // re-simulate the rest of the season from the new squad.
+                let step = max((hi - lo) / 4, 1)
+                let candSet = Set(stride(from: lo, through: hi, by: step))
                     .filter { freeSet.contains($0) }
                 var evals: [(gw: Int, gain: Double, squad: [Int], changes: Int)] = []
-                let baseRestFrom = { (g: Int) in
+                func baseRestFrom(_ g: Int) -> Double {
                     base.gws.filter { $0.gw >= g }.reduce(0) { $0 + $1.projPts }
                 }
                 for g in candSet.sorted() {
-                    let scored = players
-                        .map { $0.reprojected(ctx.index[$0.id].map { ctx.weighted($0, g) } ?? 0) }
-                    guard let nsq = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly,
-                                                       iters: 8000, restarts: 3) else { continue }
+                    let scored = players.map {
+                        $0.reprojected(ctx.index[$0.id].map { ctx.weighted($0, g) } ?? 0)
+                    }
+                    guard let nsq = Optimizer.optimize(players: scored, budgetM: budgetM,
+                                                       fitOnly: fitOnly, exactCaptain: false)
+                    else { continue }
                     let newSquad = nsq.squad.compactMap { ctx.index[$0.id] }
                     guard newSquad.count == 15 else { continue }
-                    // score-only: this simulation is a comparison, not output
                     let rest = simulate(ctx: ctx, budget: budget, from: g, end: end,
                                         initial: newSquad, initialFts: base.ftsAtStart[g] ?? 1,
                                         allowFirstMoves: false, chips: [:], scoreOnly: true)
@@ -316,23 +402,14 @@ enum Planner {
                     let changes = newSquad.filter { !heldIds.contains($0) }.count
                     evals.append((g, rest.totalPts - baseRestFrom(g), newSquad, changes))
                 }
-                // prefer a week where the rebuild actually changes the team,
-                // as long as it's within a point of the best candidate
-                let topGain = evals.map(\.gain).max() ?? 0
+                // A wildcard that swaps two players is a wasted wildcard: those
+                // moves were reachable with free transfers anyway.
                 let best = evals
-                    .filter { $0.changes > 0 && $0.gain >= topGain - 1.0 }
+                    .filter { $0.changes >= 3 }
                     .max { $0.gain != $1.gain ? $0.gain < $1.gain : $0.gw > $1.gw }
-                    ?? evals.max { $0.gain != $1.gain ? $0.gain < $1.gain : $0.gw > $1.gw }
-                // always play it — each wildcard expires at its half's deadline,
-                // so it goes on the best rebuild week available
-                if let b = best {
-                    // only actually swap squads if the rebuild doesn't lose points
-                    if b.gain >= -0.5 {
-                        actions[b.gw] = .wildcard(b.squad)
-                    } else if let keep = base.squadAtStart[b.gw] {
-                        actions[b.gw] = .wildcard(keep) // "paper" wildcard: keep the squad
-                    }
-                    plays.append(ChipPlay(chip: "wildcard", gw: b.gw, gain: max(b.gain, 0)))
+                if let b = best, b.gain >= bar {
+                    actions[b.gw] = .wildcard(b.squad)
+                    plays.append(ChipPlay(chip: "wildcard", gw: b.gw, gain: b.gain, forced: closing))
                 } else {
                     heldChips.append("wildcard")
                 }
@@ -341,7 +418,7 @@ enum Planner {
             }
         }
 
-        // pass 3: final simulation with chips applied
+        // pass 3: final simulation with the chips applied
         let fin = simulate(ctx: ctx, budget: budget, from: from, end: end,
                            initial: squad0, initialFts: fts0,
                            allowFirstMoves: fromUser, chips: actions, scoreOnly: false)
@@ -349,10 +426,10 @@ enum Planner {
                           totalTransfers: fin.totalTransfers, totalHits: fin.totalHits,
                           fromUserSquad: fromUser,
                           chips: plays.sorted { $0.gw < $1.gw },
-                          heldChips: heldChips)
+                          heldChips: heldChips.sorted())
     }
 
-    // MARK: week-by-week simulation
+    // MARK: - week-by-week simulation
 
     static func simulate(ctx: PlanContext, budget: Int, from: Int, end: Int,
                          initial: [Int], initialFts: Int, allowFirstMoves: Bool,
@@ -374,8 +451,6 @@ enum Planner {
             if let action = chips[g] {
                 switch action {
                 case .wildcard(let newSquad):
-                    // unlimited free transfers: show exactly who comes in and
-                    // out; the rebuilt squad carries forward until changed
                     if !scoreOnly {
                         let newIds = Set(newSquad), oldIds = Set(squad)
                         for pos in 1...4 {
@@ -403,20 +478,31 @@ enum Planner {
             }
 
             var hitPts = 0
+            var heldFor = ""
             if !suppressMoves && (g > from || allowFirstMoves) {
-                // no artificial cap: spend every banked free transfer that
-                // genuinely benefits the team; stop when no move clears the bar
+                // Spend every banked free transfer whose best move clears the
+                // value of holding it, then consider paying for more. Capped at
+                // four moves a week — past that the plan stops being something a
+                // person would actually sit down and execute.
                 var made = 0
-                while made < 12 {
+                while made < 4 {
                     guard let best = bestTransfer(ctx: ctx, squad: squad, bank: bank, from: g)
                     else { break }
                     let outP = ctx.players[best.out]
                     let isFree = fts > 0
                     let outInjured = outP.flagged || outP.avail < 0.75
                     let threshold = isFree
-                        ? freeThreshold(ftsBanked: fts, outInjured: outInjured)
+                        ? optionValue(ftsBanked: fts, outInjured: outInjured)
                         : (outInjured ? 4.5 : hitGainThreshold)
-                    guard best.gain >= threshold else { break }
+                    guard best.gain >= threshold else {
+                        if made == 0 {
+                            heldFor = isFree
+                                ? String(format: "the best move on the board gains %.1f, under the %.1f a banked transfer is worth",
+                                         max(best.gain, 0), threshold)
+                                : "no move is worth a −4"
+                        }
+                        break
+                    }
                     guard let idx = squad.firstIndex(of: best.out) else { break }
                     squad[idx] = best.inn
                     bank += Int(ctx.picks[best.out].cost) - Int(ctx.picks[best.inn].cost)
@@ -429,12 +515,15 @@ enum Planner {
                 }
             }
 
-            // Free Hit: play the one-week dream team; squad itself unchanged
+            // Free Hit: a one-week dream team; the real squad is untouched
             if case .freeHit(let sq, let pts)? = chips[g] {
                 if !scoreOnly {
-                    res.gws.append(GWPlan(gw: g, transfers: [], xi: sq.xi, bench: sq.bench,
-                                          captain: sq.captain, formation: sq.formation,
-                                          projPts: pts, ftsLeft: fts, hitPts: 0, chip: chipName))
+                    res.gws.append(GWPlan(
+                        gw: g, transfers: [], xi: sq.xi, bench: sq.bench, captain: sq.captain,
+                        formation: sq.formation, projPts: pts, ftsLeft: fts, hitPts: 0,
+                        bank: bank, chip: chipName,
+                        action: "Play your Free Hit",
+                        reasons: freeHitReasons(sq: sq, pts: pts)))
                 }
                 res.totalPts += pts
                 continue
@@ -443,24 +532,99 @@ enum Planner {
             for (k, i) in squad.enumerated() { gwPicks[k] = ctx.pick(i, g) }
             guard let r = Optimizer.evaluate(gwPicks) else { continue }
             var pts = r.total + r.capProj - Double(hitPts)
-            if case .tripleCaptain? = chips[g] { pts += r.capProj }   // ×3 total
+            if case .tripleCaptain? = chips[g] { pts += r.capProj }   // ×3 in total
             if case .benchBoost? = chips[g] { pts += r.benchSum }
 
             res.totalPts += pts
-            if chipName != "wildcard" { res.totalTransfers += moves.count } // WC moves are unlimited/free
+            if chipName != "wildcard" { res.totalTransfers += moves.count }
             res.totalHits += hitPts
 
             guard !scoreOnly else { continue }
-            // materialise the display squad only for plans the user will see
             let gwSquad = squad.map { ctx.players[$0].reprojected(ctx.proj($0, g)) }
             guard let disp = Optimizer.bestXI(gwSquad) else { continue }
             let cap = disp.xi.max { $0.proj < $1.proj } ?? gwSquad[0]
-            res.gws.append(GWPlan(gw: g, transfers: moves, xi: disp.xi, bench: disp.bench,
-                                  captain: cap, formation: disp.formation,
-                                  projPts: pts, ftsLeft: fts, hitPts: hitPts, chip: chipName))
+            res.gws.append(GWPlan(
+                gw: g, transfers: moves, xi: disp.xi, bench: disp.bench, captain: cap,
+                formation: disp.formation, projPts: pts, ftsLeft: fts, hitPts: hitPts,
+                bank: bank, chip: chipName,
+                action: actionLine(moves: moves, chip: chipName, fts: fts, hits: hitPts,
+                                   captain: cap, isFirst: g == from),
+                reasons: weekReasons(moves: moves, chip: chipName, fts: fts,
+                                     captain: cap, bench: disp.bench, heldFor: heldFor,
+                                     bank: bank, isFirst: g == from, fromUser: allowFirstMoves)))
         }
         return res
     }
+
+    // MARK: - narration
+
+    private static func actionLine(moves: [TransferMove], chip: String?, fts: Int,
+                                   hits: Int, captain: Player, isFirst: Bool) -> String {
+        if let chip {
+            switch chip {
+            case "wildcard": return "Wildcard — rebuild the squad"
+            case "bboost": return "Bench Boost — all 15 score"
+            case "3xc": return "Triple Captain on \(captain.name)"
+            default: break
+            }
+        }
+        if moves.isEmpty {
+            return isFirst ? "Hold — captain \(captain.name)" : "Roll the transfer (\(fts) banked)"
+        }
+        let names = moves.map { "\($0.out.name) → \($0.inn.name)" }.joined(separator: ", ")
+        return hits > 0 ? "\(names)  (−\(hits))" : names
+    }
+
+    private static func freeHitReasons(sq: SquadResult, pts: Double) -> [String] {
+        ["This is a one-week team only. Your real squad comes straight back next gameweek, unchanged, with your free transfers intact.",
+         String(format: "The eleven below project %.1f pts including the captain — that gap over what your own squad would score is what makes the chip worth spending here.", pts),
+         "Captain \(sq.captain.name)."]
+    }
+
+    private static func weekReasons(moves: [TransferMove], chip: String?, fts: Int,
+                                    captain: Player, bench: [Player], heldFor: String,
+                                    bank: Int, isFirst: Bool, fromUser: Bool) -> [String] {
+        var out: [String] = []
+        if let chip {
+            switch chip {
+            case "wildcard":
+                out.append("Unlimited free transfers this week, and the rebuilt squad is the one you keep — everything below carries forward.")
+            case "bboost":
+                let benchPts = bench.reduce(0) { $0 + $1.proj }
+                out.append(String(format: "All four substitutes score this week: %.1f points that would otherwise sit on the bench.", benchPts))
+            case "3xc":
+                out.append(String(format: "%@ counts three times instead of twice — %.1f points on top of the normal captaincy.", captain.name, captain.proj))
+            default: break
+            }
+        }
+        for m in moves {
+            var line = String(format: "%@ → %@: +%.1f projected points across the rest of the season",
+                              m.out.name, m.inn.name, m.gain)
+            line += m.paid ? ", enough to clear the −4." : ", using a free transfer."
+            if m.out.flagged {
+                line += " \(m.out.name) is flagged\(m.out.news.isEmpty ? "" : " — \(m.out.news)")."
+            }
+            out.append(line)
+        }
+        if moves.isEmpty && !isFirst && chip == nil {
+            out.append(heldFor.isEmpty
+                ? "Nothing on the board beats holding, so the transfer banks — \(fts) saved, and they stack to five."
+                : "Hold: \(heldFor). The transfer banks (\(fts) saved).")
+        }
+        if isFirst && chip == nil {
+            out.append(fromUser
+                ? "This is your squad as it stands. Only moves that clearly add points are suggested."
+                : "This fifteen is picked to score now and still be strong in April — every remaining fixture through GW 38 is weighed, with the nearest weeks counting most.")
+        }
+        out.append(String(format: "Captain %@ — the highest projected scorer in the eleven at %.1f pts, doubled.",
+                          captain.name, captain.proj))
+        if bank >= 10 {
+            out.append(String(format: "£%.1fm sitting in the bank.", Double(bank) / 10))
+        }
+        return out
+    }
+
+    // MARK: - transfer search
 
     private static func bestTransfer(ctx: PlanContext, squad: [Int], bank: Int, from g: Int)
         -> (out: Int, inn: Int, gain: Double)? {

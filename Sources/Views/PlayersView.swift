@@ -6,17 +6,24 @@ struct PlayersView: View {
     @State private var posFilter = 0
     @State private var maxPrice = 16.0
     @State private var sortMode: SortMode = .proj
+    @State private var ownedOnly = false
     @State private var detail: Player?
 
     enum SortMode: String, CaseIterable {
-        case proj = "Projected pts"
-        case ppg = "PPG last season"
-        case price = "Price (low → high)"
+        case proj = "Projected"
+        case value = "Value per £m"
+        case ceiling = "Ceiling"
+        case form = "Form"
+        case owned = "Ownership"
+        case price = "Price"
     }
+
+    var squadIds: Set<Int> { Set(state.squad?.squad.map(\.id) ?? []) }
 
     var filtered: [Player] {
         var list = state.players.filter { Double($0.cost) / 10 <= maxPrice }
         if posFilter > 0 { list = list.filter { $0.pos == posFilter } }
+        if ownedOnly { let ids = squadIds; list = list.filter { ids.contains($0.id) } }
         if !search.isEmpty {
             let q = search.lowercased()
             list = list.filter {
@@ -26,42 +33,20 @@ struct PlayersView: View {
         }
         switch sortMode {
         case .proj: list.sort { $0.proj > $1.proj }
-        case .ppg: list.sort { $0.ppg != $1.ppg ? $0.ppg > $1.ppg : $0.proj > $1.proj }
+        case .value: list.sort { $0.valueScore > $1.valueScore }
+        case .ceiling: list.sort { $0.ceiling != $1.ceiling ? $0.ceiling > $1.ceiling : $0.proj > $1.proj }
+        case .form: list.sort { $0.form != $1.form ? $0.form > $1.form : $0.proj > $1.proj }
+        case .owned: list.sort { $0.own != $1.own ? $0.own > $1.own : $0.proj > $1.proj }
         case .price: list.sort { $0.cost != $1.cost ? $0.cost < $1.cost : $0.proj > $1.proj }
         }
-        return Array(list.prefix(100))
-    }
-
-    func filterChip(icon: String, text: String) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: icon).font(.system(size: 9, weight: .semibold))
-            Text(text).font(.mono(11))
-            Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
-        }
-        .foregroundColor(Theme.cyan)
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(Theme.panel)
-        .clipShape(Capsule())
-        .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
+        return Array(list.prefix(120))
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            ControlsBar()
+            AppHeader(subtitle: "Rankings · next \(state.horizon) GW")
             HStack(spacing: 8) {
-                HStack(spacing: 6) {
-                    Image(systemName: "magnifyingglass").font(.system(size: 12))
-                        .foregroundColor(Theme.inkDim)
-                    TextField("Search player or team", text: $search)
-                        .font(.system(size: 14))
-                        .foregroundColor(Theme.ink)
-                        .autocorrectionDisabled()
-                }
-                .padding(.horizontal, 12).padding(.vertical, 9)
-                .background(Theme.panel)
-                .clipShape(Capsule())
-                .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
-
+                SearchField(text: $search, placeholder: "Search player or team")
                 Picker("", selection: $posFilter) {
                     Text("All").tag(0)
                     Text("GK").tag(1)
@@ -72,46 +57,60 @@ struct PlayersView: View {
                 .pickerStyle(.menu)
                 .tint(Theme.lime)
             }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 6)
+            .padding(.horizontal, 16).padding(.bottom, 8)
 
-            HStack {
-                Menu {
-                    ForEach(SortMode.allCases, id: \.self) { m in
-                        Button(m.rawValue) { sortMode = m }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    Menu {
+                        ForEach(SortMode.allCases, id: \.self) { m in
+                            Button(m.rawValue) { sortMode = m }
+                        }
+                    } label: {
+                        pill("arrow.up.arrow.down", sortMode.rawValue, Theme.cyan)
                     }
-                } label: {
-                    filterChip(icon: "arrow.up.arrow.down", text: "Sort: \(sortMode.rawValue)")
-                }
-                Menu {
-                    Button("Any price") { maxPrice = 16 }
-                    ForEach([12.0, 10.0, 8.0, 6.5, 5.5, 4.5], id: \.self) { p in
-                        Button("≤ £\(String(format: "%.1f", p))m") { maxPrice = p }
+                    Menu {
+                        Button("Any price") { maxPrice = 16 }
+                        ForEach([12.0, 10.0, 8.0, 6.5, 5.5, 4.5], id: \.self) { p in
+                            Button("≤ £\(String(format: "%.1f", p))m") { maxPrice = p }
+                        }
+                    } label: {
+                        pill("sterlingsign.circle",
+                             maxPrice >= 16 ? "Any price" : "≤ £\(String(format: "%.1f", maxPrice))m",
+                             Theme.cyan)
                     }
-                } label: {
-                    filterChip(icon: "sterlingsign.circle",
-                               text: maxPrice >= 16 ? "Any price" : "≤ £\(String(format: "%.1f", maxPrice))m")
+                    Button { ownedOnly.toggle() } label: {
+                        pill("checkmark.circle", "In my squad",
+                             ownedOnly ? Theme.lime : Theme.inkDim)
+                    }
                 }
-                Spacer()
+                .padding(.horizontal, 16)
             }
-            .padding(.horizontal, 16)
             .padding(.bottom, 10)
 
             ScrollView {
                 LazyVStack(spacing: 8) {
                     ForEach(Array(filtered.enumerated()), id: \.element.id) { i, p in
-                        PlayerRow(rank: i + 1, player: p)
+                        PlayerRow(rank: i + 1, player: p, owned: squadIds.contains(p.id))
                             .onTapGesture { detail = p }
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.bottom, 20)
+                .padding(.horizontal, 14).padding(.bottom, 20)
             }
         }
         .background(Theme.bg)
-        .sheet(item: $detail) { p in
-            PlayerDetailSheet(player: p)
+        .sheet(item: $detail) { p in PlayerDetailSheet(player: p) }
+    }
+
+    func pill(_ icon: String, _ text: String, _ color: Color) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon).font(.system(size: 9, weight: .semibold))
+            Text(text).font(.mono(11))
         }
+        .foregroundColor(color)
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(Theme.panel)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
     }
 }
 
@@ -119,50 +118,42 @@ struct PlayerRow: View {
     @EnvironmentObject var state: AppState
     let rank: Int
     let player: Player
-
-    var posColor: Color {
-        switch player.pos {
-        case 1: return Theme.amber
-        case 2: return Theme.cyan
-        case 3: return Theme.lime
-        default: return Theme.magenta
-        }
-    }
+    var owned = false
 
     var body: some View {
-        HStack(spacing: 12) {
-            Text("\(rank)")
-                .font(.mono(13, .bold)).foregroundColor(Theme.inkDim)
-                .frame(width: 26)
+        HStack(spacing: 11) {
+            Text("\(rank)").font(.mono(12, .bold)).foregroundColor(Theme.inkDim)
+                .frame(width: 24)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text(player.name).font(.system(size: 14, weight: .heavy)).foregroundColor(Theme.ink)
                     if player.flagged {
-                        Image(systemName: "exclamationmark.triangle.fill")
+                        Image(systemName: "cross.case.fill")
+                            .font(.system(size: 9)).foregroundColor(Theme.red)
+                    }
+                    if player.penTaker {
+                        Image(systemName: "p.circle.fill")
                             .font(.system(size: 9)).foregroundColor(Theme.amber)
                     }
+                    if owned { Tag(text: "OWNED", color: Theme.lime) }
                 }
                 HStack(spacing: 6) {
-                    Text(player.posShort)
-                        .font(.mono(9, .bold)).foregroundColor(posColor)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(posColor.opacity(0.13))
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
-                    Text("\(player.teamShort) · £\(player.price) · PPG \(String(format: "%.1f", player.ppg)) · \(String(format: "%.1f", player.own))% owned")
+                    Tag(text: player.posShort, color: player.posColor)
+                    Text("\(player.teamShort) · £\(player.price) · \(String(format: "%.1f", player.own))%")
                         .font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
                 }
-                FixtureChips(fixtures: Array(player.fixtures.prefix(4)))
+                FixtureChips(fixtures: Array(player.fixtures.prefix(5)))
             }
-            Spacer()
+            Spacer(minLength: 4)
             VStack(alignment: .trailing, spacing: 2) {
                 Text(String(format: "%.1f", player.proj))
                     .font(.mono(18, .bold)).foregroundColor(Theme.lime)
-                Text("proj pts").font(.label(8)).tracking(1).foregroundColor(Theme.inkDim)
-                Text("xGI/90 \(String(format: "%.2f", player.xgi90))")
-                    .font(.mono(9, .medium)).foregroundColor(Theme.inkDim)
+                Text("proj").font(.label(8)).tracking(1).foregroundColor(Theme.inkDim)
+                Text(String(format: "%.0f ceil", player.ceiling))
+                    .font(.mono(9, .medium)).foregroundColor(Theme.cyan)
             }
         }
-        .padding(.horizontal, 14).padding(.vertical, 10)
+        .padding(.horizontal, 13).padding(.vertical, 10)
         .panel()
     }
 }
@@ -176,11 +167,11 @@ struct FixtureChips: View {
             if fixtures.isEmpty {
                 Text("BLANK").font(.mono(8, .bold)).foregroundColor(Theme.inkDim)
                     .padding(.horizontal, 5).padding(.vertical, 2)
-                    .background(Color.white.opacity(0.05))
+                    .background(Theme.bg2)
                     .clipShape(RoundedRectangle(cornerRadius: 4))
             }
             ForEach(Array(fixtures.enumerated()), id: \.offset) { _, fx in
-                Text("\(state.teamShort(fx.opp))\(fx.home ? "" : " (a)")")
+                Text("\(state.teamShort(fx.opp))\(fx.home ? "" : "ᵃ")")
                     .font(.mono(8, .bold))
                     .foregroundColor(Theme.diffColor(fx.diff))
                     .padding(.horizontal, 5).padding(.vertical, 2)
