@@ -25,6 +25,16 @@ func chipDisplayName(_ chip: String) -> String {
     }
 }
 
+func chipShortName(_ chip: String) -> String {
+    switch chip {
+    case "wildcard": return "WC"
+    case "freehit": return "FH"
+    case "bboost": return "BB"
+    case "3xc": return "TC"
+    default: return chip
+    }
+}
+
 /// Deterministic RNG (SplitMix64) so optimizer results are reproducible.
 struct SeededRandom: RandomNumberGenerator {
     private var state: UInt64
@@ -38,28 +48,26 @@ struct SeededRandom: RandomNumberGenerator {
     }
 }
 
-func chipShortName(_ chip: String) -> String {
-    switch chip {
-    case "wildcard": return "WC"
-    case "freehit": return "FH"
-    case "bboost": return "BB"
-    case "3xc": return "TC"
-    default: return chip
-    }
-}
-
 struct GWEvent: Decodable {
     let id: Int
     let name: String
     let deadline_time: String
     let is_next: Bool
     let finished: Bool
+    let is_current: Bool?
 }
 
 struct FPLTeam: Decodable, Identifiable {
     let id: Int
     let name: String
     let short_name: String
+    // Populated once the season is under way; 0/nil in pre-season.
+    let strength_attack_home: Int?
+    let strength_attack_away: Int?
+    let strength_defence_home: Int?
+    let strength_defence_away: Int?
+    let strength_overall_home: Int?
+    let strength_overall_away: Int?
 }
 
 struct FPLElement: Decodable {
@@ -71,6 +79,7 @@ struct FPLElement: Decodable {
     let minutes: Int
     let starts: Int?
     let bonus: Int
+    let bps: Int?
     let saves: Int
     let goals_scored: Int
     let assists: Int
@@ -82,10 +91,24 @@ struct FPLElement: Decodable {
     let expected_assists: String?
     let expected_goal_involvements: String?
     let expected_goals_conceded: String?
+    // Per-90s the API already computes — cheaper and better normalised than
+    // deriving them from season totals ourselves.
+    let expected_goals_per_90: Double?
+    let expected_assists_per_90: Double?
+    let expected_goals_conceded_per_90: Double?
+    let saves_per_90: Double?
+    let defensive_contribution: Int?
+    let defensive_contribution_per_90: Double?
     let selected_by_percent: String?
     let status: String
     let chance_of_playing_next_round: Int?
     let clean_sheets: Int?
+    let goals_conceded: Int?
+    let yellow_cards: Int?
+    let red_cards: Int?
+    let penalties_order: Int?
+    let direct_freekicks_order: Int?
+    let corners_and_indirect_freekicks_order: Int?
     let news: String?
 }
 
@@ -95,6 +118,7 @@ struct APIFixture: Decodable {
     let team_a: Int
     let team_h_difficulty: Int?
     let team_a_difficulty: Int?
+    let finished: Bool?
 }
 
 // MARK: - Derived types
@@ -108,6 +132,63 @@ struct FixtureInfo: Hashable {
 enum Position: Int, CaseIterable {
     case gk = 1, def = 2, mid = 3, fwd = 4
     var short: String { ["", "GK", "DEF", "MID", "FWD"][rawValue] }
+}
+
+/// Per-gameweek projections held in a contiguous buffer rather than a
+/// `Dictionary`. Projections are read in the optimizer's innermost loops —
+/// millions of times per rebuild — where a hashed lookup and the dictionary's
+/// copy-on-write bookkeeping dominated the profile. Keeps a dictionary-shaped
+/// API so call sites read the same.
+struct GWProjection: Hashable {
+    private let first: Int
+    private let values: [Double]
+
+    init(first: Int, values: [Double]) {
+        self.first = first
+        self.values = values
+    }
+
+    init() {
+        self.first = 1
+        self.values = []
+    }
+
+    subscript(gw: Int) -> Double? {
+        let i = gw - first
+        guard i >= 0, i < values.count else { return nil }
+        return values[i]
+    }
+
+    /// Unchecked read used on hot paths; out-of-range gameweeks read as 0.
+    @inline(__always)
+    func at(_ gw: Int) -> Double {
+        let i = gw - first
+        guard i >= 0, i < values.count else { return 0 }
+        return values[i]
+    }
+
+    var keys: [Int] { Array(first..<(first + values.count)) }
+}
+
+/// The optimizer's working unit: a 16-byte, reference-free view of a player.
+/// `Player` carries four strings, an array and a projection buffer, so every
+/// copy meant six retain/release pairs — and simulated annealing copies squads
+/// tens of thousands of times per rebuild. `Pick` copies are free.
+struct Pick {
+    let id: Int32
+    let pos: Int8
+    let team: Int8
+    let cost: Int16
+    var proj: Double
+
+    @inline(__always)
+    init(_ p: Player, proj: Double) {
+        self.id = Int32(p.id)
+        self.pos = Int8(p.pos)
+        self.team = Int8(p.team)
+        self.cost = Int16(p.cost)
+        self.proj = proj
+    }
 }
 
 struct Player: Identifiable, Hashable {
@@ -127,9 +208,9 @@ struct Player: Identifiable, Hashable {
     let flagged: Bool
     let mins: Int
     let fixtures: [FixtureInfo]
-    let projByGw: [Int: Double]   // per-GW projections across the planning window
+    let projByGw: GWProjection   // per-GW projections across the planning window
 
-    // last-season detail stats (for the player card)
+    // detail stats (for the player card)
     let totalPoints: Int
     let goals: Int
     let assists: Int
@@ -141,6 +222,11 @@ struct Player: Identifiable, Hashable {
     let xg: Double
     let xa: Double
     let news: String
+
+    // model diagnostics surfaced on the player card
+    let expMins: Double     // expected minutes per match
+    let penTaker: Bool
+    let setPieces: Bool
 
     var price: String { String(format: "%.1f", Double(cost) / 10) }
     var posShort: String { Position(rawValue: pos)?.short ?? "?" }
@@ -154,8 +240,12 @@ struct Player: Identifiable, Hashable {
                fixtures: fixtures, projByGw: projByGw,
                totalPoints: totalPoints, goals: goals, assists: assists,
                cleanSheets: cleanSheets, bonus: bonus, saves: saves, starts: starts,
-               form: form, xg: xg, xa: xa, news: news)
+               form: form, xg: xg, xa: xa, news: news,
+               expMins: expMins, penTaker: penTaker, setPieces: setPieces)
     }
+
+    @inline(__always)
+    func pick(_ v: Double) -> Pick { Pick(self, proj: v) }
 
     static func == (l: Player, r: Player) -> Bool { l.id == r.id }
     func hash(into h: inout Hasher) { h.combine(id) }

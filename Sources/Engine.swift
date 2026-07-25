@@ -1,326 +1,595 @@
 import Foundation
 
-// MARK: - Fetching
+// MARK: - Poisson helpers
 
-enum FPLService {
-    static func fetch() async throws -> (Bootstrap, [APIFixture]) {
-        async let boot: Bootstrap = get("https://fantasy.premierleague.com/api/bootstrap-static/")
-        async let fixtures: [APIFixture] = get("https://fantasy.premierleague.com/api/fixtures/")
-        return try await (boot, fixtures)
+enum Poisson {
+    /// P(X = 0)
+    @inline(__always)
+    static func zero(_ lambda: Double) -> Double { exp(-lambda) }
+
+    /// E[floor(X / 2)] — the FPL "1 point lost per 2 goals conceded" rule.
+    /// Summed exactly rather than approximated by λ/2, which overstates the
+    /// penalty at the low λ values that matter most for premium defences.
+    static func halfConceded(_ lambda: Double) -> Double {
+        var p = exp(-lambda)
+        var total = 0.0
+        var k = 0
+        while k <= 14 {
+            total += Double(k / 2) * p
+            k += 1
+            p *= lambda / Double(k)
+        }
+        return total
     }
 
-    private static func get<T: Decodable>(_ url: String) async throws -> T {
-        var req = URLRequest(url: URL(string: url)!)
-        req.setValue("Mozilla/5.0 (PitchIQ iOS)", forHTTPHeaderField: "User-Agent")
-        let (data, _) = try await URLSession.shared.data(for: req)
-        return try JSONDecoder().decode(T.self, from: data)
+    /// E[floor(X / d)] — FPL awards save points in whole blocks of three per
+    /// match, so the linear saves/3 the old model used systematically paid
+    /// keepers for remainders the game throws away (~0.2 pts a game).
+    static func expectedFloorDiv(_ lambda: Double, _ d: Int) -> Double {
+        guard lambda > 0.01 else { return 0 }
+        var p = exp(-lambda)
+        var total = 0.0
+        var k = 0
+        let limit = Int(lambda * 4) + 12
+        while k <= limit {
+            total += Double(k / d) * p
+            k += 1
+            p *= lambda / Double(k)
+        }
+        return total
+    }
+
+    /// P(X >= threshold) — used for defensive-contribution counts.
+    static func atLeast(_ threshold: Int, _ lambda: Double) -> Double {
+        guard lambda > 0, threshold > 0 else { return 0 }
+        var p = exp(-lambda)
+        var cdf = p
+        var k = 1
+        while k < threshold {
+            p *= lambda / Double(k)
+            cdf += p
+            k += 1
+        }
+        return max(0, min(1, 1 - cdf))
     }
 }
 
+/// Goals against are over-dispersed relative to Poisson: real matches produce
+/// both more shut-outs *and* more three-goal hidings than a Poisson with the
+/// same mean. Modelling clean sheets as Poisson under-counted them by ~15% and
+/// under-counted the concession penalty by a similar margin — measured against
+/// last season's actual clean-sheet and goals-conceded totals. A negative
+/// binomial with variance = 1.2λ reproduces both tails.
+enum GoalsAgainst {
+    private static let phi = 0.2       // variance inflation over Poisson
+
+    /// P(no goals conceded).
+    static func cleanSheet(_ lambda: Double) -> Double {
+        guard lambda > 0.01 else { return 1 }
+        let r = lambda / phi
+        return pow(r / (r + lambda), r)
+    }
+
+    /// E[floor(goals / 2)] — the "1 point lost per 2 conceded" rule.
+    static func halfConceded(_ lambda: Double) -> Double {
+        guard lambda > 0.01 else { return 0 }
+        let r = lambda / phi
+        let p = r / (r + lambda)
+        var pmf = pow(p, r)
+        var total = 0.0
+        var k = 0
+        while k <= 14 {
+            total += Double(k / 2) * pmf
+            pmf *= (r + Double(k)) / Double(k + 1) * (1 - p)
+            k += 1
+        }
+        return total
+    }
+}
+
+// MARK: - Team ratings
+// Attack and defence expressed as expected goals per match on neutral ground,
+// shrunk toward the league mean by how much data the club actually has. This
+// replaces bucketed FDR multipliers as the primary fixture signal — FDR is a
+// coarse 1-5 scale that can't tell a good defence from a great one, and it is
+// kept only as a stabiliser (and as the sole signal for promoted clubs).
+
+struct TeamRatings {
+    static let leagueGoals = 1.42     // goals per team per match, long-run PL average
+    static let homeAtk = 1.10         // home advantage on goals scored
+    static let awayAtk = 0.92
+
+    var attack: [Double]              // indexed by team id
+    var defence: [Double]
+
+    init(boot: Bootstrap, statGames: Int) {
+        let n = (boot.teams.map(\.id).max() ?? 20) + 1
+        attack = Array(repeating: Self.leagueGoals, count: n)
+        defence = Array(repeating: Self.leagueGoals, count: n)
+        let games = Double(max(statGames, 1))
+
+        var squadXG = [Double](repeating: 0, count: n)
+        var squadMins = [Double](repeating: 0, count: n)
+        var gkXgcWeighted = [Double](repeating: 0, count: n)
+        var gkMins = [Double](repeating: 0, count: n)
+
+        for p in boot.elements {
+            guard p.team < n else { continue }
+            squadXG[p.team] += Double(p.expected_goals ?? "") ?? 0
+            squadMins[p.team] += Double(p.minutes)
+            if p.element_type == 1, p.minutes > 0 {
+                let x90 = p.expected_goals_conceded_per_90
+                    ?? ((Double(p.expected_goals_conceded ?? "") ?? 0) / Double(p.minutes) * 90)
+                gkXgcWeighted[p.team] += x90 * Double(p.minutes)
+                gkMins[p.team] += Double(p.minutes)
+            }
+        }
+
+        for t in boot.teams {
+            let id = t.id
+            guard id < n else { continue }
+
+            // Attack: squad xG per match, credibility-weighted against a prior
+            // seeded from the club's overall strength rating when one exists.
+            let rawAtk = squadXG[id] / games
+            let wAtk = min(squadMins[id] / (games * 990), 1)          // 11 × 90 min per match
+            let atkPrior = Self.prior(strength: t.strength_overall_home, attacking: true)
+            attack[id] = wAtk * rawAtk + (1 - wAtk) * atkPrior
+
+            // Defence: minutes-weighted keeper xGC/90.
+            let rawDef = gkMins[id] > 0 ? gkXgcWeighted[id] / gkMins[id] : Self.leagueGoals
+            let wDef = min(gkMins[id] / (games * 90), 1)
+            let defPrior = Self.prior(strength: t.strength_overall_away, attacking: false)
+            defence[id] = wDef * rawDef + (1 - wDef) * defPrior
+        }
+
+        // Re-centre so the league averages sit on the true mean; keeps the
+        // multiplicative fixture model unbiased even when a few clubs have
+        // no data at all.
+        recentre(&attack, ids: boot.teams.map(\.id))
+        recentre(&defence, ids: boot.teams.map(\.id))
+    }
+
+    /// Prior for a club with little or no data. Promoted sides (no strength
+    /// rating yet) score less and concede more than the league average.
+    private static func prior(strength: Int?, attacking: Bool) -> Double {
+        guard let s = strength, s > 0 else {
+            return attacking ? leagueGoals * 0.82 : leagueGoals * 1.22
+        }
+        // FPL publishes 1 (weakest) … 5 (strongest).
+        let scale = 1.0 + (Double(s) - 3.0) * (attacking ? 0.13 : -0.13)
+        return leagueGoals * scale
+    }
+
+    private func recentre(_ v: inout [Double], ids: [Int]) {
+        let vals = ids.compactMap { $0 < v.count ? v[$0] : nil }
+        guard !vals.isEmpty else { return }
+        let mean = vals.reduce(0, +) / Double(vals.count)
+        guard mean > 0.01 else { return }
+        let k = Self.leagueGoals / mean
+        for i in ids where i < v.count { v[i] = max(v[i] * k, 0.25) }
+    }
+}
+
+// MARK: - Per-fixture context
+// Everything about a fixture that does not depend on which player we are
+// projecting is computed once, here. Previously each of ~560 players re-derived
+// clean-sheet and concession maths for each of 38 gameweeks; now ~760
+// fixture-views are evaluated once and every player reads the result.
+
+struct FixtureContext {
+    let opp: Int
+    let home: Bool
+    let diff: Int
+    let atkScale: Double      // multiplier on attacking output vs. a neutral game
+    let csProb: Double        // P(clean sheet)
+    let concedePen: Double    // expected points lost to goals conceded
+    let savesScale: Double    // keepers face more shots against better attacks
+    let histMult: Double      // fixture multiplier applied to history-based terms
+
+    var info: FixtureInfo { FixtureInfo(opp: opp, home: home, diff: diff) }
+}
+
 // MARK: - Projection model
-// Per-fixture expected points: blended xG/xA attacking rates, Poisson clean
-// sheets from team xGC/90, keeper saves, appearance + bonus rates, minutes
-// security, FDR fixture multipliers, anchored 42% to PPG history; thin-data
-// players (new signings / promoted clubs) lean on FPL's ep_next feed.
+//
+// Per fixture we build an expected-points total from FPL's actual scoring rules:
+//
+//   appearance   P(play) + P(60')
+//   goals        xG/90 blended with finishing, scaled by fixture, × position value
+//   assists      xA/90 blended with actual assists, set-piece duty applied
+//   clean sheet  Poisson P(0 goals against) from the ratings model × P(60')
+//   conceded     exact E[floor(goals/2)] for GK/DEF
+//   saves        saves/90 scaled by opponent attack strength
+//   def. contrib P(CBIT ≥ 10 | CBIRT ≥ 12) × 2  — the 2025/26 scoring rule
+//   cards        yellow/red rates
+//   bonus        historical bonus/90 blended with BPS rate, fixture-scaled
+//
+// That model is then blended with the player's own scoring history (PPG and
+// form) and with FPL's `ep_next`, weighted by a smooth credibility term rather
+// than the hard minute cliffs the old model used.
+
+/// One player's rate profile, derived once from their season stats. Split out
+/// from the projection itself so the same code path serves both the numbers the
+/// app ships and the per-component breakdown used to calibrate the model.
+struct PlayerRates {
+    var pos = 0
+    var goalPts90 = 0.0
+    var assistPts90 = 0.0
+    var saves90 = 0.0
+    var defconPts = 0.0
+    var bonusRate = 0.0
+    var cardPts = 0.0
+    var pPlay = 0.0
+    var p60 = 0.0
+    var minShare = 0.0
+    var ppg = 0.0
+    var form = 0.0
+    var epNext = 0.0
+    var avail = 1.0
+    var cred = 0.0        // trust in this player's own rate estimates
+    var epWeight = 0.0    // reliance on FPL's cold-start estimate
+
+    struct Components {
+        var appearance = 0.0
+        var goals = 0.0
+        var assists = 0.0
+        var cleanSheet = 0.0
+        var conceded = 0.0
+        var saves = 0.0
+        var defcon = 0.0
+        var bonus = 0.0
+        var cards = 0.0
+        var anchor = 0.0
+        var ep = 0.0
+        var final = 0.0
+        var model: Double {
+            appearance + goals + assists + cleanSheet + conceded + saves + defcon + bonus + cards
+        }
+    }
+
+    func components(_ fx: FixtureContext) -> Components {
+        var c = Components()
+        c.appearance = pPlay + p60
+        c.goals = goalPts90 * minShare * fx.atkScale
+        c.assists = assistPts90 * minShare * fx.atkScale
+        c.cleanSheet = ProjectionEngine.csPts[pos] * fx.csProb * p60
+        c.conceded = pos <= 2 ? -fx.concedePen * minShare : 0
+        c.saves = pos == 1
+            ? Poisson.expectedFloorDiv(saves90 * minShare * fx.savesScale, 3) : 0
+        c.defcon = defconPts
+        c.bonus = bonusRate * minShare * (0.55 + 0.45 * fx.atkScale)
+        c.cards = cardPts * minShare
+
+        // History anchor: PPG carries the things the model can't see (role,
+        // team quality, referee luck), form carries recency. PPG is points per
+        // *appearance*, so scaling by P(play) converts it to points per
+        // gameweek — the unit everything else in this model uses.
+        let hist = ppg * fx.histMult * max(pPlay, 0.3)
+        c.anchor = form > 0 ? 0.62 * hist + 0.38 * form * fx.histMult : hist
+        c.ep = epNext * fx.histMult
+
+        let blended = 0.62 * c.model + 0.38 * c.anchor
+        // Smooth handoff to FPL's own estimate for thin-data players instead of
+        // a hard cliff at 700 minutes, which made projections jump
+        // discontinuously as minutes accumulated. `epWeight` is deliberately a
+        // faster-saturating term than `cred`: rate estimates need a lot of
+        // minutes to stabilise, but a player with ten full matches behind them
+        // no longer needs FPL's cold-start estimate at all — leaving it in was
+        // taxing every established player by ~10%.
+        c.final = max((epWeight * (0.35 * blended + 0.65 * c.ep)
+                       + (1 - epWeight) * blended) * avail, 0)
+        return c
+    }
+
+    @inline(__always)
+    func project(_ fx: FixtureContext) -> Double { components(fx).final }
+}
 
 struct ProjectionEngine {
     let boot: Bootstrap
     let fixtures: [APIFixture]
     let gwFrom: Int
     let horizon: Int
-    private let teamGwFixtures: [Int: [Int: [FixtureInfo]]]
+    let statGames: Int
+    private let ratings: TeamRatings
+    private let ctx: [[[FixtureContext]]]        // team → gw → fixtures
+
+    // FPL scoring
+    static let goalPts: [Double] = [0, 6, 6, 5, 4]
+    static let csPts: [Double] = [0, 4, 4, 1, 0]
+    static let defconThreshold = [0, 99, 10, 12, 12]   // GK have no DefCon route
+
+    // FDR stabilisers (index = difficulty 1…5). The old model omitted 1
+    // entirely, so the easiest fixtures were silently scored as neutral.
+    private static let atkMult: [Double] = [1, 1.34, 1.19, 1.0, 0.86, 0.73]
+    private static let lambdaMult: [Double] = [1, 0.62, 0.77, 1.0, 1.26, 1.52]
+    private static let histMultTable: [Double] = [1, 1.20, 1.12, 1.0, 0.90, 0.80]
+
+    // Positional priors used to shrink thin samples toward something sane.
+    private static let xgPrior: [Double] = [0, 0.005, 0.055, 0.13, 0.30]
+    private static let xaPrior: [Double] = [0, 0.01, 0.07, 0.13, 0.11]
+    private static let dcPrior: [Double] = [0, 0, 7.4, 5.2, 2.4]
+    /// Expected defensive-contribution points per gameweek for a regular
+    /// starter, by position, used only while the CBIT/CBIRT feed is empty.
+    /// Measured: reconstructing last season's points from every other scoring
+    /// rule leaves exactly this much unexplained for defenders and midfielders,
+    /// and nothing for keepers and forwards. (Derived only from the components
+    /// that reconstruct exactly — goals, assists, clean sheets, bonus, cards
+    /// and appearances. Season totals cannot be used for conceded or saves,
+    /// whose points are floored per match rather than per season.)
+    private static let dcBasePts: [Double] = [0, 0, 0.46, 0.26, 0.02]
+    private static let bonusPrior: [Double] = [0, 0.14, 0.14, 0.18, 0.28]
+    private static let xaToAssist: [Double] = [1, 1.2, 1.32, 1.18, 1.35]
+    private static let xgToGoal: [Double] = [1, 1.0, 0.92, 1.02, 1.0]
 
     init(boot: Bootstrap, fixtures: [APIFixture], gwFrom: Int, horizon: Int) {
         self.boot = boot
         self.fixtures = fixtures
         self.gwFrom = gwFrom
         self.horizon = horizon
-        // precompute team → gw → fixtures once; projByGw spans the whole season
-        var map: [Int: [Int: [FixtureInfo]]] = [:]
+        let played = boot.events.filter(\.finished).count
+        // Pre-season: the API still carries last season's totals over 38 games.
+        self.statGames = played > 0 ? played : 38
+        let r = TeamRatings(boot: boot, statGames: statGames)
+        self.ratings = r
+
+        let nTeams = (boot.teams.map(\.id).max() ?? 20) + 1
+        var map = [[[FixtureContext]]](repeating: [[FixtureContext]](repeating: [], count: 40),
+                                       count: nTeams)
+        let lg = TeamRatings.leagueGoals
         for f in fixtures {
-            guard let gw = f.event else { continue }
-            map[f.team_h, default: [:]][gw, default: []]
-                .append(FixtureInfo(opp: f.team_a, home: true, diff: f.team_h_difficulty ?? 3))
-            map[f.team_a, default: [:]][gw, default: []]
-                .append(FixtureInfo(opp: f.team_h, home: false, diff: f.team_a_difficulty ?? 3))
+            guard let gw = f.event, gw >= 1, gw < 40,
+                  f.team_h < nTeams, f.team_a < nTeams else { continue }
+
+            for home in [true, false] {
+                let me = home ? f.team_h : f.team_a
+                let opp = home ? f.team_a : f.team_h
+                let diff = (home ? f.team_h_difficulty : f.team_a_difficulty) ?? 3
+                let d = min(max(diff, 1), 5)
+
+                // Multiplicative ratings model, blended with the FDR bucket.
+                let lean = home ? TeamRatings.homeAtk : TeamRatings.awayAtk
+                let oppLean = home ? TeamRatings.awayAtk : TeamRatings.homeAtk
+                let lamFor = r.attack[me] * (r.defence[opp] / lg) * lean
+                let lamAgModel = r.attack[opp] * (r.defence[me] / lg) * oppLean
+                let lamAg = max(0.72 * lamAgModel + 0.28 * (lg * Self.lambdaMult[d]), 0.15)
+
+                let scaleModel = lamFor / max(r.attack[me], 0.35)
+                let atkScale = 0.72 * scaleModel + 0.28 * Self.atkMult[d]
+
+                map[me][gw].append(FixtureContext(
+                    opp: opp, home: home, diff: d,
+                    atkScale: max(atkScale, 0.25),
+                    csProb: GoalsAgainst.cleanSheet(lamAg),
+                    concedePen: GoalsAgainst.halfConceded(lamAg),
+                    savesScale: max(min(lamAg / lg, 1.9), 0.45),
+                    histMult: 0.6 * Self.histMultTable[d] + 0.4 * min(max(atkScale, 0.6), 1.5)
+                ))
+            }
         }
-        self.teamGwFixtures = map
+        self.ctx = map
     }
 
-    private static let goalPts = [0, 10, 6, 5, 4]
-    private static let csPts = [0.0, 4, 4, 1, 0]
-    private static let atkMult = [2: 1.22, 3: 1.0, 4: 0.86, 5: 0.72]
-    private static let lambdaMult = [2: 0.72, 3: 1.0, 4: 1.28, 5: 1.55]
-    private static let histMult = [2: 1.14, 3: 1.0, 4: 0.9, 5: 0.79]
+    // MARK: fixture lookups
+
+    func contexts(_ teamId: Int, gw: Int) -> [FixtureContext] {
+        guard teamId >= 0, teamId < ctx.count, gw >= 1, gw < 40 else { return [] }
+        return ctx[teamId][gw]
+    }
 
     func teamFixtures(_ teamId: Int, gw: Int) -> [FixtureInfo] {
-        teamGwFixtures[teamId]?[gw] ?? []
+        contexts(teamId, gw: gw).map(\.info)
     }
 
     func horizonFixtures(_ teamId: Int) -> [FixtureInfo] {
         (gwFrom..<min(gwFrom + horizon, 39)).flatMap { teamFixtures(teamId, gw: $0) }
     }
 
-    func buildPlayers() -> [Player] {
-        let teamById = Dictionary(uniqueKeysWithValues: boot.teams.map { ($0.id, $0) })
+    // MARK: player projections
 
-        // team xGC/90 estimated from keepers' on-pitch xGC
-        var teamXgc90: [Int: Double] = [:]
-        for t in boot.teams {
-            var xgc = 0.0, mins = 0
-            for p in boot.elements where p.team == t.id && p.element_type == 1 {
-                xgc += Double(p.expected_goals_conceded ?? "") ?? 0
-                mins += p.minutes
-            }
-            teamXgc90[t.id] = mins > 900 ? xgc / Double(mins) * 90 : 1.45
+    /// Derive a player's rate profile from their season stats.
+    func rates(for p: FPLElement) -> PlayerRates {
+        var r = PlayerRates()
+        let games = Double(statGames)
+        let pos = min(max(p.element_type, 1), 4)
+        let mins = Double(p.minutes)
+        let starts = Double(p.starts ?? 0)
+        r.pos = pos
+
+        // ---- credibility: how much to trust this player's own numbers
+        let cred = mins / (mins + 540)          // ~6 full matches → 50%
+        r.cred = cred
+        r.epWeight = 1 - min(mins / 900, 1)     // gone by ~10 full matches
+
+        // ---- minutes model
+        // The old model used minutes/38 regardless of how many gameweeks had
+        // been played, and ignored `starts` entirely — so a nailed-on starter
+        // and a busy substitute with the same minutes looked identical. Starts
+        // are the strongest available minutes signal.
+        // Appearances split into starts plus bench cameos. The cameo rate is
+        // modelled as P(appears | doesn't start) rather than inferred from
+        // leftover minutes: residual-minute models break down because minutes
+        // per start vary far more between players than the cameo rate does.
+        // Fitted against true appearance counts (recoverable exactly as
+        // total_points / points_per_game) across three minutes bands, this
+        // form lands within ~1.5% at every level of squad status.
+        let startRate = min(starts / games, 1)
+        let mpg = min(mins / games, 90)
+        let cameoOdds = 0.24 + 0.24 * min(startRate / 0.5, 1)
+        r.pPlay = min(startRate + (1 - startRate) * cameoOdds, 1)
+        r.p60 = startRate * 0.93           // cameos essentially never reach 60'
+        r.minShare = min(mpg / 90, 1)
+        if p.minutes == 0 {
+            // No history at all (new signing, promoted club): fall back to a
+            // mid-table starter's profile and let ep_next do the work.
+            r.pPlay = 0.55; r.p60 = 0.42; r.minShare = 0.48
         }
 
+        // ---- availability
+        var avail = 1.0
+        if let c = p.chance_of_playing_next_round { avail = Double(c) / 100 }
+        switch p.status {
+        case "u", "n": avail = min(avail, 0.02)
+        case "i", "s": avail = min(avail, 0.08)
+        case "d": avail = min(avail, p.chance_of_playing_next_round.map { Double($0) / 100 } ?? 0.5)
+        default: break
+        }
+        r.avail = avail
+
+        // ---- attacking rates, shrunk toward positional priors
+        func per90(_ total: String?) -> Double {
+            mins > 0 ? (Double(total ?? "") ?? 0) / mins * 90 : 0
+        }
+        let rawXg90 = p.expected_goals_per_90 ?? per90(p.expected_goals)
+        let rawXa90 = p.expected_assists_per_90 ?? per90(p.expected_assists)
+        let g90 = mins > 0 ? Double(p.goals_scored) / mins * 90 : 0
+        let a90 = mins > 0 ? Double(p.assists) / mins * 90 : 0
+
+        // FPL's assist definition is looser than the one xA is built on — it
+        // credits the pass before a deflection, a rebound, or a won penalty.
+        // Measured across last season, actual assists exceeded xA by 38% for
+        // defenders and 18% for midfielders, so xA is converted into
+        // FPL-assist units before it is scored. Goals need only a small
+        // defender correction (headers from set pieces underperform their xG).
+        var xg90 = cred * (0.75 * rawXg90 * Self.xgToGoal[pos] + 0.25 * g90)
+            + (1 - cred) * Self.xgPrior[pos]
+        var xa90 = cred * (0.6 * rawXa90 * Self.xaToAssist[pos] + 0.4 * a90)
+            + (1 - cred) * Self.xaPrior[pos] * Self.xaToAssist[pos]
+
+        // ---- set-piece and penalty duty
+        // xG already contains penalties the player has taken, so an established
+        // taker only gets a partial top-up; someone newly on duty (little
+        // history) gets close to the full value of the role.
+        if (p.penalties_order ?? 99) == 1 { xg90 += 0.085 * (1 - 0.6 * cred) }
+        else if (p.penalties_order ?? 99) == 2 { xg90 += 0.02 * (1 - 0.6 * cred) }
+
+        let setPieces = (p.corners_and_indirect_freekicks_order ?? 99) == 1
+            || (p.direct_freekicks_order ?? 99) == 1
+        if setPieces { xa90 *= 1.10 + 0.10 * (1 - cred) }
+
+        r.goalPts90 = Self.goalPts[pos] * xg90
+        r.assistPts90 = 3 * xa90
+
+        // ---- defensive contribution (2 pts at 10 CBIT / 12 CBIRT)
+        // The per-90 feed only populates once the season is under way. When it
+        // is live, model the count as Poisson and take the tail above the
+        // threshold. Before then it reads zero for every player, so fall back
+        // to the positional base rate — the previous build ran the empty feed
+        // through Poisson and produced ~0 points for every outfielder, quietly
+        // removing a scoring rule worth around half a point a game to defenders.
+        let rawDc90 = p.defensive_contribution_per_90
+            ?? (mins > 0 ? Double(p.defensive_contribution ?? 0) / mins * 90 : 0)
+        if pos == 1 {
+            r.defconPts = 0
+        } else if rawDc90 > 0 {
+            let dc90 = cred * rawDc90 + (1 - cred) * Self.dcPrior[pos]
+            r.defconPts = 2 * Poisson.atLeast(Self.defconThreshold[pos], dc90 * r.minShare)
+        } else {
+            r.defconPts = Self.dcBasePts[pos] * min(r.minShare / 0.75, 1.3)
+        }
+
+        // ---- bonus: the player's own realised bonus rate, shrunk toward a
+        // positional prior. An earlier version blended in a BPS-derived
+        // estimate, but that estimate sat well below observed bonus rates and
+        // dragged every projection down by roughly a quarter of a bonus point
+        // a game; BPS totals are kept for the player card, not the projection.
+        let bonus90 = mins > 0 ? Double(p.bonus) / mins * 90 : 0
+        r.bonusRate = cred * bonus90 + (1 - cred) * Self.bonusPrior[pos]
+
+        // ---- cards
+        let y90 = mins > 0 ? Double(p.yellow_cards ?? 0) / mins * 90 : 0.10
+        let r90 = mins > 0 ? Double(p.red_cards ?? 0) / mins * 90 : 0.004
+        r.cardPts = -(y90 + 3 * r90)
+
+        r.saves90 = pos == 1
+            ? (p.saves_per_90 ?? (mins > 0 ? Double(p.saves) / mins * 90 : 0))
+            : 0
+
+        r.ppg = Double(p.points_per_game ?? "") ?? 0
+        r.form = Double(p.form ?? "") ?? 0
+        r.epNext = Double(p.ep_next ?? "") ?? 0
+        return r
+    }
+
+    func buildPlayers() -> [Player] {
+        let teamById = Dictionary(uniqueKeysWithValues: boot.teams.map { ($0.id, $0) })
+        let games = Double(statGames)
+        let lastGw = 38
+
         var players: [Player] = boot.elements.map { p in
-            let mins = Double(p.minutes)
-            func per90(_ s: String?) -> Double {
-                mins >= 400 ? (Double(s ?? "") ?? 0) / mins * 90 : 0
-            }
-            let ppg = Double(p.points_per_game ?? "") ?? 0
-            let form = Double(p.form ?? "") ?? 0
-            let epNext = Double(p.ep_next ?? "") ?? 0
-
-            var avail = 1.0
-            if let c = p.chance_of_playing_next_round { avail = Double(c) / 100 }
-            if ["i", "s", "u", "n"].contains(p.status) { avail = min(avail, 0.15) }
+            let pos = min(max(p.element_type, 1), 4)
+            let r = rates(for: p)
             let flagged = p.status != "a"
+            let penTaker = (p.penalties_order ?? 99) == 1
+            let setPieces = (p.corners_and_indirect_freekicks_order ?? 99) == 1
+                || (p.direct_freekicks_order ?? 99) == 1
+            let mpg = min(Double(p.minutes) / games, 90)
 
-            let expMins = min(mins / 38, 92)
-            let pPlay = min(expMins / 30, 1)
-            let p60 = min(expMins / 74, 1)
-            let minShare = min(expMins / 90, 1)
-
-            let xg90 = per90(p.expected_goals), xa90 = per90(p.expected_assists)
-            let g90 = mins >= 400 ? Double(p.goals_scored) / mins * 90 : 0
-            let a90 = mins >= 400 ? Double(p.assists) / mins * 90 : 0
-            let goals90 = 0.65 * xg90 + 0.35 * g90
-            let assists90 = 0.65 * xa90 + 0.35 * a90
-            let attack90 = Double(Self.goalPts[p.element_type]) * goals90 + 3 * assists90
-
-            let bonus90 = mins >= 400 ? Double(p.bonus) / mins * 90 : 0
-            let saves90 = (p.element_type == 1 && mins >= 400) ? Double(p.saves) / mins * 90 : 0
-            let lambda0 = teamXgc90[p.team] ?? 1.45
-
-            func perFixture(_ fx: FixtureInfo) -> Double {
-                let homeLean = fx.home ? 1.05 : 0.95
-                let atk = attack90 * minShare * (Self.atkMult[fx.diff] ?? 1) * homeLean
-                let lambda = lambda0 * (Self.lambdaMult[fx.diff] ?? 1) * (fx.home ? 0.92 : 1.08)
-                let cs = Self.csPts[p.element_type] * exp(-lambda) * p60
-                var keeper = 0.0
-                if p.element_type == 1 { keeper = saves90 / 3 * minShare - lambda / 2 * minShare }
-                let concede = p.element_type == 2 ? -(lambda / 2) * 0.5 * minShare : 0
-                let appear = pPlay + p60
-                let component = appear + atk + cs + keeper + concede + bonus90 * minShare
-                let histBase = mins >= 700 ? ppg : max(ppg, epNext)
-                let hist = histBase * (Self.histMult[fx.diff] ?? 1) * homeLean * max(pPlay, 0.3)
-                let anchor = form > 0 ? 0.6 * hist + 0.4 * form * (Self.histMult[fx.diff] ?? 1) : hist
-                var pts = 0.58 * component + 0.42 * anchor
-                if mins < 700 { pts = 0.35 * pts + 0.65 * epNext * (Self.histMult[fx.diff] ?? 1) }
-                return max(pts * avail, 0)
+            // per-GW projections for every remaining gameweek, so the planner
+            // can see all the way to GW 38
+            var values = [Double](repeating: 0, count: max(lastGw - gwFrom + 1, 0))
+            if !values.isEmpty {
+                for gw in gwFrom...lastGw {
+                    var sum = 0.0
+                    for fx in contexts(p.team, gw: gw) { sum += r.project(fx) }
+                    values[gw - gwFrom] = sum
+                }
             }
-
-            // per-GW projections for every remaining gameweek of the season,
-            // so the planner can see all the way to GW 38
-            var projByGw: [Int: Double] = [:]
-            for gw in gwFrom...38 {
-                projByGw[gw] = teamFixtures(p.team, gw: gw).reduce(0) { $0 + perFixture($1) }
-            }
-            let fxs = horizonFixtures(p.team)
-            let proj = (gwFrom..<min(gwFrom + horizon, 39)).reduce(0) { $0 + (projByGw[$1] ?? 0) }
+            let projByGw = GWProjection(first: gwFrom, values: values)
+            let proj = (gwFrom..<min(gwFrom + horizon, 39))
+                .reduce(0.0) { $0 + projByGw.at($1) }
             let t = teamById[p.team]
 
             return Player(
-                id: p.id, name: p.web_name, pos: p.element_type, team: p.team,
+                id: p.id, name: p.web_name, pos: pos, team: p.team,
                 teamShort: t?.short_name ?? "?", teamName: t?.name ?? "?",
                 cost: p.now_cost, proj: proj, perGw: proj / Double(max(horizon, 1)),
-                ppg: ppg, xgi90: per90(p.expected_goal_involvements),
+                ppg: r.ppg, xgi90: (r.goalPts90 / Self.goalPts[pos]) + (r.assistPts90 / 3),
                 own: Double(p.selected_by_percent ?? "") ?? 0,
-                avail: avail, flagged: flagged, mins: p.minutes, fixtures: fxs,
+                avail: r.avail, flagged: flagged, mins: p.minutes,
+                fixtures: horizonFixtures(p.team),
                 projByGw: projByGw,
                 totalPoints: p.total_points, goals: p.goals_scored, assists: p.assists,
                 cleanSheets: p.clean_sheets ?? 0, bonus: p.bonus, saves: p.saves,
-                starts: p.starts ?? 0, form: form,
+                starts: p.starts ?? 0, form: r.form,
                 xg: Double(p.expected_goals ?? "") ?? 0,
                 xa: Double(p.expected_assists ?? "") ?? 0,
-                news: p.news ?? ""
+                news: p.news ?? "",
+                expMins: mpg, penTaker: penTaker, setPieces: setPieces
             )
         }
-        players.sort { $0.proj > $1.proj }
+        players.sort { $0.proj != $1.proj ? $0.proj > $1.proj : $0.id < $1.id }
         return players
+    }
+
+    /// Recompute only the headline horizon total from cached per-GW values.
+    /// Changing the horizon doesn't change any per-gameweek projection, so
+    /// there is no reason to re-run the whole model for it.
+    static func reHorizon(_ players: [Player], gwFrom: Int, horizon: Int,
+                          engine: ProjectionEngine) -> [Player] {
+        let hi = min(gwFrom + horizon, 39)
+        return players.map { p in
+            var total = 0.0
+            for gw in gwFrom..<hi { total += p.projByGw.at(gw) }
+            var out = p.reprojected(total)
+            out = out.withHorizon(perGw: total / Double(max(horizon, 1)),
+                                  fixtures: engine.horizonFixtures(p.team))
+            return out
+        }
+        .sorted { $0.proj != $1.proj ? $0.proj > $1.proj : $0.id < $1.id }
     }
 }
 
-// MARK: - Squad optimizer
-// Greedy seed + simulated annealing with single- and double-swap moves so the
-// search can fund a premium upgrade by downgrading elsewhere in one move.
-
-enum Optimizer {
-    static let quota = [0, 2, 5, 5, 3]
-
-    static func bestXI(_ squad: [Player]) -> (xi: [Player], bench: [Player], total: Double, formation: String)? {
-        var by: [[Player]] = [[], [], [], [], []]
-        for p in squad { by[p.pos].append(p) }
-        for i in 1...4 { by[i].sort { $0.proj > $1.proj } }
-        var pre: [[Double]] = [[], [], [], [], []]
-        for i in 1...4 {
-            var run = 0.0; pre[i] = [0]
-            for p in by[i] { run += p.proj; pre[i].append(run) }
-        }
-        guard by[1].count >= 1 else { return nil }
-        var best: (total: Double, d: Int, m: Int, f: Int)?
-        for d in 3...5 {
-            for m in 2...5 {
-                let f = 10 - d - m
-                guard f >= 1, f <= 3, by[2].count >= d, by[3].count >= m, by[4].count >= f else { continue }
-                let total = pre[1][1] + pre[2][d] + pre[3][m] + pre[4][f]
-                if best == nil || total > best!.total { best = (total, d, m, f) }
-            }
-        }
-        guard let b = best else { return nil }
-        let xi = [by[1][0]] + by[2].prefix(b.d) + by[3].prefix(b.m) + by[4].prefix(b.f)
-        let xiSet = Set(xi.map(\.id))
-        var bench = squad.filter { !xiSet.contains($0.id) && $0.pos != 1 }.sorted { $0.proj > $1.proj }
-        if by[1].count > 1 { bench.insert(by[1][1], at: 0) }
-        return (xi, bench, b.total, "\(b.d)-\(b.m)-\(b.f)")
-    }
-
-    static func objective(_ squad: [Player]) -> Double {
-        guard let r = bestXI(squad) else { return -1e9 }
-        let cap = r.xi.map(\.proj).max() ?? 0
-        let benchSum = r.bench.reduce(0) { $0 + $1.proj }
-        return r.total + cap + 0.12 * benchSum
-    }
-
-    static func feasible(_ squad: [Player], budget: Int) -> Bool {
-        guard squad.reduce(0, { $0 + $1.cost }) <= budget else { return false }
-        var clubs: [Int: Int] = [:]
-        for p in squad {
-            clubs[p.team, default: 0] += 1
-            if clubs[p.team]! > 3 { return false }
-        }
-        return true
-    }
-
-    static func candidatePool(_ players: [Player], fitOnly: Bool) -> [Player] {
-        var pool: [Player] = []
-        for pos in 1...4 {
-            let byPos = players.filter { $0.pos == pos && (fitOnly ? !$0.flagged : $0.avail > 0.5) }
-            let top = byPos.prefix(48)
-            let cheap = byPos.sorted { $0.cost != $1.cost ? $0.cost < $1.cost : $0.proj > $1.proj }.prefix(10)
-            var seen = Set<Int>()
-            for p in Array(top) + Array(cheap) where seen.insert(p.id).inserted { pool.append(p) }
-        }
-        return pool
-    }
-
-    static func greedySeed(_ pool: [Player], budget: Int, jitter: Bool,
-                           rng: inout SeededRandom) -> [Player] {
-        var byPos: [[Player]] = [[], [], [], [], []]
-        for p in pool { byPos[p.pos].append(p) }
-        for i in 1...4 {
-            byPos[i].sort { $0.proj > $1.proj }
-            if jitter { byPos[i] = byPos[i].filter { _ in Double.random(in: 0...1, using: &rng) > 0.25 } }
-        }
-        var squad: [Player] = []
-        var clubs: [Int: Int] = [:]
-        var needs = quota
-
-        func cheapestRest() -> Int {
-            var sum = 0
-            let inSquad = Set(squad.map(\.id))
-            for pos in 1...4 {
-                let remaining = byPos[pos].filter { !inSquad.contains($0.id) }.sorted { $0.cost < $1.cost }
-                for i in 0..<needs[pos] { sum += i < remaining.count ? remaining[i].cost : 9990 }
-            }
-            return sum
-        }
-
-        for pos in 1...4 {
-            for _ in 0..<quota[pos] {
-                for p in byPos[pos] {
-                    guard !squad.contains(p), clubs[p.team, default: 0] < 3 else { continue }
-                    let cost = squad.reduce(0) { $0 + $1.cost } + p.cost
-                    needs[pos] -= 1
-                    let restMin = cheapestRest()
-                    needs[pos] += 1
-                    if cost + restMin <= budget {
-                        squad.append(p)
-                        clubs[p.team, default: 0] += 1
-                        needs[pos] -= 1
-                        break
-                    }
-                }
-            }
-        }
-        // pad if incomplete
-        for pos in 1...4 {
-            while squad.filter({ $0.pos == pos }).count < quota[pos] {
-                guard let cand = byPos[pos]
-                    .filter({ p in !squad.contains(p) && clubs[p.team, default: 0] < 3 })
-                    .min(by: { $0.cost < $1.cost }) else { break }
-                squad.append(cand)
-                clubs[cand.team, default: 0] += 1
-            }
-        }
-        return squad
-    }
-
-    static func optimize(players: [Player], budgetM: Double, fitOnly: Bool,
-                         iters: Int = 12000, restarts: Int = 4,
-                         seed: UInt64 = 0xC0FFEE) -> SquadResult? {
-        let budget = Int((budgetM * 10).rounded())
-        let pool = candidatePool(players, fitOnly: fitOnly)
-        var byPos: [[Player]] = [[], [], [], [], []]
-        for p in pool { byPos[p.pos].append(p) }
-
-        // seeded RNG: same data in → same squad out, so the plan the user sees
-        // doesn't reshuffle on every rebuild
-        var rng = SeededRandom(seed: seed)
-        var bestSquad: [Player]?
-        var bestScore = -Double.infinity
-
-        for restart in 0..<restarts {
-            var squad = greedySeed(pool, budget: budget, jitter: restart > 0, rng: &rng)
-            guard squad.count == 15, feasible(squad, budget: budget) else { continue }
-            var score = objective(squad)
-            var localBest = squad
-            var localBestScore = score
-
-            for it in 0..<iters {
-                let T = 1.4 * (1 - Double(it) / Double(iters)) + 0.02
-                var next = squad
-                let swaps = Double.random(in: 0...1, using: &rng) < 0.35 ? 2 : 1
-                var ok = true
-                var touched = Set<Int>()
-                for _ in 0..<swaps {
-                    var i: Int
-                    repeat { i = Int.random(in: 0..<15, using: &rng) } while touched.contains(i)
-                    touched.insert(i)
-                    let cands = byPos[next[i].pos]
-                    guard let inn = cands.randomElement(using: &rng), !next.contains(inn) else { ok = false; break }
-                    next[i] = inn
-                }
-                guard ok, feasible(next, budget: budget) else { continue }
-                let ns = objective(next)
-                let d = ns - score
-                if d > 0 || Double.random(in: 0...1, using: &rng) < exp(d / T) {
-                    squad = next; score = ns
-                    if ns > localBestScore { localBest = squad; localBestScore = ns }
-                }
-            }
-            if localBestScore > bestScore { bestScore = localBestScore; bestSquad = localBest }
-        }
-
-        guard let squad = bestSquad, let r = bestXI(squad) else { return nil }
-        let sorted = r.xi.sorted { $0.proj > $1.proj }
-        return SquadResult(
-            squad: squad, xi: r.xi, bench: r.bench, formation: r.formation,
-            total: r.total, captain: sorted[0], vice: sorted[1],
-            cost: squad.reduce(0) { $0 + $1.cost }
-        )
+extension Player {
+    /// Horizon-dependent fields only; per-gameweek projections are unaffected.
+    func withHorizon(perGw: Double, fixtures: [FixtureInfo]) -> Player {
+        Player(id: id, name: name, pos: pos, team: team, teamShort: teamShort,
+               teamName: teamName, cost: cost, proj: proj, perGw: perGw, ppg: ppg,
+               xgi90: xgi90, own: own, avail: avail, flagged: flagged, mins: mins,
+               fixtures: fixtures, projByGw: projByGw,
+               totalPoints: totalPoints, goals: goals, assists: assists,
+               cleanSheets: cleanSheets, bonus: bonus, saves: saves, starts: starts,
+               form: form, xg: xg, xa: xa, news: news,
+               expMins: expMins, penTaker: penTaker, setPieces: setPieces)
     }
 }

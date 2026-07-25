@@ -58,6 +58,75 @@ struct SeasonPlan {
     let heldChips: [String]    // chips kept in reserve — no week currently gains
 }
 
+// MARK: - Precomputed planning tables
+//
+// `weightedValue` — a player's decay-weighted points from gameweek g to the end
+// of the window — was recomputed by looping over up to 38 gameweeks, inside a
+// loop over every squad/pool pair, inside a loop over every gameweek. That is
+// the single hottest path in the app. Because the weights are geometric it
+// satisfies W(g) = proj(g) + decay·W(g+1), so the whole table is built once by
+// a backward pass and every later read is a single array index.
+
+final class PlanContext {
+    let players: [Player]
+    let from: Int
+    let end: Int
+    let span: Int
+    let index: [Int: Int]          // player id → compact index
+    let gwProj: [Double]           // [i * span + (gw - from)]
+    let wv: [Double]               // decay-weighted value from gw to end
+    let pool: [Int]                // compact indices of transfer candidates
+    let picks: [Pick]              // identity/cost/team, proj filled per use
+
+    init(players: [Player], pool poolPlayers: [Player], from: Int, end: Int) {
+        self.players = players
+        self.from = from
+        self.end = end
+        let span = max(end - from + 1, 1)
+        self.span = span
+
+        var idx = [Int: Int](minimumCapacity: players.count)
+        for (i, p) in players.enumerated() { idx[p.id] = i }
+        self.index = idx
+
+        var proj = [Double](repeating: 0, count: players.count * span)
+        var weighted = [Double](repeating: 0, count: players.count * span)
+        for (i, p) in players.enumerated() {
+            let base = i * span
+            for k in 0..<span { proj[base + k] = p.projByGw.at(from + k) }
+            var acc = 0.0
+            var k = span - 1
+            while k >= 0 {
+                acc = proj[base + k] + Planner.decay * acc
+                weighted[base + k] = acc
+                k -= 1
+            }
+        }
+        self.gwProj = proj
+        self.wv = weighted
+        self.pool = poolPlayers.compactMap { idx[$0.id] }
+        self.picks = players.map { $0.pick(0) }
+    }
+
+    @inline(__always) func proj(_ i: Int, _ gw: Int) -> Double {
+        let k = gw - from
+        guard k >= 0, k < span else { return 0 }
+        return gwProj[i * span + k]
+    }
+
+    @inline(__always) func weighted(_ i: Int, _ gw: Int) -> Double {
+        let k = gw - from
+        guard k >= 0, k < span else { return 0 }
+        return wv[i * span + k]
+    }
+
+    @inline(__always) func pick(_ i: Int, _ gw: Int) -> Pick {
+        var p = picks[i]
+        p.proj = proj(i, gw)
+        return p
+    }
+}
+
 enum Planner {
     static let hitGainThreshold = 6.0
     static let decay = 0.88
@@ -69,11 +138,12 @@ enum Planner {
         return 0.5
     }
 
+    /// Kept for callers outside the simulation hot path.
     static func weightedValue(_ p: Player, from gw: Int, to end: Int) -> Double {
         var v = 0.0, w = 1.0
         var g = gw
         while g <= end {
-            v += (p.projByGw[g] ?? 0) * w
+            v += p.projByGw.at(g) * w
             w *= decay
             g += 1
         }
@@ -81,8 +151,8 @@ enum Planner {
     }
 
     enum ChipAction {
-        case wildcard([Player])
-        case freeHit(xi: [Player], bench: [Player], captain: Player, formation: String, pts: Double)
+        case wildcard([Int])                     // compact indices
+        case freeHit(squad: SquadResult, pts: Double)
         case tripleCaptain
         case benchBoost
     }
@@ -92,7 +162,7 @@ enum Planner {
         var totalPts = 0.0
         var totalTransfers = 0
         var totalHits = 0
-        var squadAtStart: [Int: [Player]] = [:]
+        var squadAtStart: [Int: [Int]] = [:]
         var ftsAtStart: [Int: Int] = [:]
     }
 
@@ -104,32 +174,31 @@ enum Planner {
         let end = min(from + window - 1, 38)
         guard end >= from else { return nil }
         let budget = Int((budgetM * 10).rounded())
-        let pool = Optimizer.candidatePool(players, fitOnly: fitOnly)
-        let byId = Dictionary(uniqueKeysWithValues: players.map { ($0.id, $0) })
+        let poolPlayers = Optimizer.candidatePool(players, fitOnly: fitOnly)
+        let ctx = PlanContext(players: players, pool: poolPlayers, from: from, end: end)
 
-        var squad0: [Player]
+        var squad0: [Int]
         var fts0: Int
         let fromUser: Bool
         if let user = userSquad, user.count == 15 {
-            squad0 = user
+            squad0 = user.compactMap { ctx.index[$0.id] }
             fts0 = 1
             fromUser = true
         } else {
             let scored = players
                 .map { $0.reprojected(weightedValue($0, from: from, to: end)) }
-                .sorted { $0.proj > $1.proj }
             guard let opening = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly)
             else { return nil }
-            squad0 = opening.squad.compactMap { byId[$0.id] }
+            squad0 = opening.squad.compactMap { ctx.index[$0.id] }
             fts0 = 0
             fromUser = false
         }
         guard squad0.count == 15 else { return nil }
 
         // pass 1: base plan without chips
-        let base = simulate(players: players, pool: pool, budget: budget,
-                            from: from, end: end, initial: squad0, initialFts: fts0,
-                            allowFirstMoves: fromUser, chips: [:])
+        let base = simulate(ctx: ctx, budget: budget, from: from, end: end,
+                            initial: squad0, initialFts: fts0,
+                            allowFirstMoves: fromUser, chips: [:], scoreOnly: false)
 
         // pass 2: schedule chips where they earn the most
         var actions: [Int: ChipAction] = [:]
@@ -146,6 +215,7 @@ enum Planner {
                 return h0 != h1 ? h0 < h1
                     : (order.firstIndex(of: $0.name) ?? 9) < (order.firstIndex(of: $1.name) ?? 9)
             }
+        let basePts = Dictionary(uniqueKeysWithValues: base.gws.map { ($0.gw, $0.projPts) })
 
         for meta in sortedMeta {
             // transfer chips can't be played the week the plan already builds a
@@ -157,11 +227,12 @@ enum Planner {
             guard lo <= hi else { continue }
             let free = (lo...hi).filter { actions[$0] == nil }
             guard !free.isEmpty else { continue }
+            let freeSet = Set(free)
 
             switch meta.name {
             case "3xc":
                 var bestGw: Int?; var bestGain = -1.0
-                for gp in base.gws where free.contains(gp.gw) {
+                for gp in base.gws where freeSet.contains(gp.gw) {
                     if gp.captain.proj > bestGain { bestGain = gp.captain.proj; bestGw = gp.gw }
                 }
                 if let g = bestGw {
@@ -171,7 +242,7 @@ enum Planner {
 
             case "bboost":
                 var bestGw: Int?; var bestGain = -1.0
-                for gp in base.gws where free.contains(gp.gw) {
+                for gp in base.gws where freeSet.contains(gp.gw) {
                     let benchPts = gp.bench.reduce(0) { $0 + $1.proj }
                     if benchPts > bestGain { bestGain = benchPts; bestGw = gp.gw }
                 }
@@ -193,19 +264,18 @@ enum Planner {
                     continue
                 }
                 let searchGws = dgwCands.isEmpty ? free : dgwCands
-                let basePts = Dictionary(uniqueKeysWithValues: base.gws.map { ($0.gw, $0.projPts) })
                 let cands = searchGws
                     .map { g -> (Int, Double) in
-                        let ceiling = players.map { $0.projByGw[g] ?? 0 }.sorted(by: >).prefix(11).reduce(0, +)
+                        var top = players.map { $0.projByGw.at(g) }
+                        top.sort(by: >)
+                        let ceiling = top.prefix(11).reduce(0, +)
                         return (g, ceiling - (basePts[g] ?? 0))
                     }
-                    .sorted { $0.1 > $1.1 }
+                    .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }
                     .prefix(3)
                 var best: (gw: Int, pts: Double, sq: SquadResult)?
                 for (g, _) in cands {
-                    let scored = players
-                        .map { $0.reprojected($0.projByGw[g] ?? 0) }
-                        .sorted { $0.proj > $1.proj }
+                    let scored = players.map { $0.reprojected($0.projByGw.at(g)) }
                     guard let sq = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly,
                                                       iters: 3000, restarts: 2) else { continue }
                     let pts = sq.total + sq.captain.proj
@@ -218,8 +288,7 @@ enum Planner {
                     // gravitates to double-gameweeks automatically because
                     // two-fixture players carry doubled projections that week
                     let gain = max(b.pts - (basePts[b.gw] ?? 0), 0)
-                    actions[b.gw] = .freeHit(xi: b.sq.xi, bench: b.sq.bench, captain: b.sq.captain,
-                                             formation: b.sq.formation, pts: b.pts)
+                    actions[b.gw] = .freeHit(squad: b.sq, pts: b.pts)
                     plays.append(ChipPlay(chip: "freehit", gw: b.gw, gain: gain))
                 }
 
@@ -227,32 +296,33 @@ enum Planner {
                 // try spread candidates across the window: rebuild the squad
                 // there and re-simulate the rest of the season
                 let candSet = Set(stride(from: lo, through: hi, by: max((hi - lo) / 4, 1)))
-                    .filter { free.contains($0) }
-                var evals: [(gw: Int, gain: Double, squad: [Player], changes: Int)] = []
+                    .filter { freeSet.contains($0) }
+                var evals: [(gw: Int, gain: Double, squad: [Int], changes: Int)] = []
+                let baseRestFrom = { (g: Int) in
+                    base.gws.filter { $0.gw >= g }.reduce(0) { $0 + $1.projPts }
+                }
                 for g in candSet.sorted() {
                     let scored = players
-                        .map { $0.reprojected(weightedValue($0, from: g, to: end)) }
-                        .sorted { $0.proj > $1.proj }
+                        .map { $0.reprojected(ctx.index[$0.id].map { ctx.weighted($0, g) } ?? 0) }
                     guard let nsq = Optimizer.optimize(players: scored, budgetM: budgetM, fitOnly: fitOnly,
                                                        iters: 8000, restarts: 3) else { continue }
-                    let newSquad = nsq.squad.compactMap { byId[$0.id] }
+                    let newSquad = nsq.squad.compactMap { ctx.index[$0.id] }
                     guard newSquad.count == 15 else { continue }
-                    let rest = simulate(players: players, pool: pool, budget: budget,
-                                        from: g, end: end, initial: newSquad,
-                                        initialFts: base.ftsAtStart[g] ?? 1,
-                                        allowFirstMoves: false, chips: [:])
-                    let baseRest = base.gws.filter { $0.gw >= g }.reduce(0) { $0 + $1.projPts }
-                    let heldIds = Set((base.squadAtStart[g] ?? []).map(\.id))
-                    let changes = newSquad.filter { !heldIds.contains($0.id) }.count
-                    evals.append((g, rest.totalPts - baseRest, newSquad, changes))
+                    // score-only: this simulation is a comparison, not output
+                    let rest = simulate(ctx: ctx, budget: budget, from: g, end: end,
+                                        initial: newSquad, initialFts: base.ftsAtStart[g] ?? 1,
+                                        allowFirstMoves: false, chips: [:], scoreOnly: true)
+                    let heldIds = Set(base.squadAtStart[g] ?? [])
+                    let changes = newSquad.filter { !heldIds.contains($0) }.count
+                    evals.append((g, rest.totalPts - baseRestFrom(g), newSquad, changes))
                 }
                 // prefer a week where the rebuild actually changes the team,
                 // as long as it's within a point of the best candidate
                 let topGain = evals.map(\.gain).max() ?? 0
                 let best = evals
                     .filter { $0.changes > 0 && $0.gain >= topGain - 1.0 }
-                    .max { $0.gain < $1.gain }
-                    ?? evals.max { $0.gain < $1.gain }
+                    .max { $0.gain != $1.gain ? $0.gain < $1.gain : $0.gw > $1.gw }
+                    ?? evals.max { $0.gain != $1.gain ? $0.gain < $1.gain : $0.gw > $1.gw }
                 // always play it — each wildcard expires at its half's deadline,
                 // so it goes on the best rebuild week available
                 if let b = best {
@@ -272,9 +342,9 @@ enum Planner {
         }
 
         // pass 3: final simulation with chips applied
-        let fin = simulate(players: players, pool: pool, budget: budget,
-                           from: from, end: end, initial: squad0, initialFts: fts0,
-                           allowFirstMoves: fromUser, chips: actions)
+        let fin = simulate(ctx: ctx, budget: budget, from: from, end: end,
+                           initial: squad0, initialFts: fts0,
+                           allowFirstMoves: fromUser, chips: actions, scoreOnly: false)
         return SeasonPlan(gws: fin.gws, totalPts: fin.totalPts,
                           totalTransfers: fin.totalTransfers, totalHits: fin.totalHits,
                           fromUserSquad: fromUser,
@@ -284,13 +354,14 @@ enum Planner {
 
     // MARK: week-by-week simulation
 
-    static func simulate(players: [Player], pool: [Player], budget: Int,
-                         from: Int, end: Int, initial: [Player], initialFts: Int,
-                         allowFirstMoves: Bool, chips: [Int: ChipAction]) -> SimResult {
+    static func simulate(ctx: PlanContext, budget: Int, from: Int, end: Int,
+                         initial: [Int], initialFts: Int, allowFirstMoves: Bool,
+                         chips: [Int: ChipAction], scoreOnly: Bool) -> SimResult {
         var squad = initial
         var fts = initialFts
-        var bank = max(budget - squad.reduce(0) { $0 + $1.cost }, 0)
+        var bank = max(budget - squad.reduce(0) { $0 + Int(ctx.picks[$1].cost) }, 0)
         var res = SimResult()
+        var gwPicks = [Pick](repeating: ctx.picks[0], count: 15)
 
         for g in from...end {
             res.squadAtStart[g] = squad
@@ -305,19 +376,20 @@ enum Planner {
                 case .wildcard(let newSquad):
                     // unlimited free transfers: show exactly who comes in and
                     // out; the rebuilt squad carries forward until changed
-                    let oldSquad = squad
-                    let newIds = Set(newSquad.map(\.id))
-                    let oldIds = Set(oldSquad.map(\.id))
-                    for pos in 1...4 {
-                        let outs = oldSquad.filter { $0.pos == pos && !newIds.contains($0.id) }
-                        let ins = newSquad.filter { $0.pos == pos && !oldIds.contains($0.id) }
-                        for k in 0..<min(outs.count, ins.count) {
-                            moves.append(TransferMove(out: outs[k], inn: ins[k], paid: false,
-                                                      gain: (ins[k].projByGw[g] ?? 0) - (outs[k].projByGw[g] ?? 0)))
+                    if !scoreOnly {
+                        let newIds = Set(newSquad), oldIds = Set(squad)
+                        for pos in 1...4 {
+                            let outs = squad.filter { ctx.picks[$0].pos == Int8(pos) && !newIds.contains($0) }
+                            let ins = newSquad.filter { ctx.picks[$0].pos == Int8(pos) && !oldIds.contains($0) }
+                            for k in 0..<min(outs.count, ins.count) {
+                                moves.append(TransferMove(
+                                    out: ctx.players[outs[k]], inn: ctx.players[ins[k]], paid: false,
+                                    gain: ctx.proj(ins[k], g) - ctx.proj(outs[k], g)))
+                            }
                         }
                     }
                     squad = newSquad
-                    bank = max(budget - squad.reduce(0) { $0 + $1.cost }, 0)
+                    bank = max(budget - squad.reduce(0) { $0 + Int(ctx.picks[$1].cost) }, 0)
                     chipName = "wildcard"
                     suppressMoves = true
                 case .freeHit:
@@ -334,68 +406,83 @@ enum Planner {
             if !suppressMoves && (g > from || allowFirstMoves) {
                 // no artificial cap: spend every banked free transfer that
                 // genuinely benefits the team; stop when no move clears the bar
-                while moves.count < 12 {
-                    guard let best = bestTransfer(squad: squad, pool: pool, bank: bank,
-                                                  from: g, to: end) else { break }
+                var made = 0
+                while made < 12 {
+                    guard let best = bestTransfer(ctx: ctx, squad: squad, bank: bank, from: g)
+                    else { break }
+                    let outP = ctx.players[best.out]
                     let isFree = fts > 0
-                    let outInjured = best.out.flagged || best.out.avail < 0.75
+                    let outInjured = outP.flagged || outP.avail < 0.75
                     let threshold = isFree
                         ? freeThreshold(ftsBanked: fts, outInjured: outInjured)
                         : (outInjured ? 4.5 : hitGainThreshold)
                     guard best.gain >= threshold else { break }
-                    let idx = squad.firstIndex(of: best.out)!
+                    guard let idx = squad.firstIndex(of: best.out) else { break }
                     squad[idx] = best.inn
-                    bank += best.out.cost - best.inn.cost
+                    bank += Int(ctx.picks[best.out].cost) - Int(ctx.picks[best.inn].cost)
                     if isFree { fts -= 1 } else { hitPts += 4 }
-                    moves.append(TransferMove(out: best.out, inn: best.inn,
-                                              paid: !isFree, gain: best.gain))
+                    made += 1
+                    if !scoreOnly {
+                        moves.append(TransferMove(out: outP, inn: ctx.players[best.inn],
+                                                  paid: !isFree, gain: best.gain))
+                    }
                 }
             }
 
             // Free Hit: play the one-week dream team; squad itself unchanged
-            if case .freeHit(let xi, let bench, let captain, let formation, let pts)? = chips[g] {
-                res.gws.append(GWPlan(gw: g, transfers: [], xi: xi, bench: bench,
-                                      captain: captain, formation: formation,
-                                      projPts: pts, ftsLeft: fts, hitPts: 0, chip: chipName))
+            if case .freeHit(let sq, let pts)? = chips[g] {
+                if !scoreOnly {
+                    res.gws.append(GWPlan(gw: g, transfers: [], xi: sq.xi, bench: sq.bench,
+                                          captain: sq.captain, formation: sq.formation,
+                                          projPts: pts, ftsLeft: fts, hitPts: 0, chip: chipName))
+                }
                 res.totalPts += pts
                 continue
             }
 
-            let gwSquad = squad.map { $0.reprojected($0.projByGw[g] ?? 0) }
-            guard let r = Optimizer.bestXI(gwSquad) else { continue }
-            let sorted = r.xi.sorted { $0.proj > $1.proj }
-            let cap = sorted[0]
-            var pts = r.total + cap.proj - Double(hitPts)
-            if case .tripleCaptain? = chips[g] { pts += cap.proj }   // ×3 total
-            if case .benchBoost? = chips[g] { pts += r.bench.reduce(0) { $0 + $1.proj } }
+            for (k, i) in squad.enumerated() { gwPicks[k] = ctx.pick(i, g) }
+            guard let r = Optimizer.evaluate(gwPicks) else { continue }
+            var pts = r.total + r.capProj - Double(hitPts)
+            if case .tripleCaptain? = chips[g] { pts += r.capProj }   // ×3 total
+            if case .benchBoost? = chips[g] { pts += r.benchSum }
 
             res.totalPts += pts
             if chipName != "wildcard" { res.totalTransfers += moves.count } // WC moves are unlimited/free
             res.totalHits += hitPts
-            res.gws.append(GWPlan(gw: g, transfers: moves, xi: r.xi, bench: r.bench,
-                                  captain: cap, formation: r.formation,
+
+            guard !scoreOnly else { continue }
+            // materialise the display squad only for plans the user will see
+            let gwSquad = squad.map { ctx.players[$0].reprojected(ctx.proj($0, g)) }
+            guard let disp = Optimizer.bestXI(gwSquad) else { continue }
+            let cap = disp.xi.max { $0.proj < $1.proj } ?? gwSquad[0]
+            res.gws.append(GWPlan(gw: g, transfers: moves, xi: disp.xi, bench: disp.bench,
+                                  captain: cap, formation: disp.formation,
                                   projPts: pts, ftsLeft: fts, hitPts: hitPts, chip: chipName))
         }
         return res
     }
 
-    private static func bestTransfer(squad: [Player], pool: [Player], bank: Int,
-                                     from g: Int, to end: Int)
-        -> (out: Player, inn: Player, gain: Double)? {
-        var clubs: [Int: Int] = [:]
-        for p in squad { clubs[p.team, default: 0] += 1 }
-        let squadIds = Set(squad.map(\.id))
+    private static func bestTransfer(ctx: PlanContext, squad: [Int], bank: Int, from g: Int)
+        -> (out: Int, inn: Int, gain: Double)? {
+        var clubs = [Int](repeating: 0, count: 32)
+        for i in squad { clubs[Int(ctx.picks[i].team)] += 1 }
+        let squadSet = Set(squad)
 
-        var best: (out: Player, inn: Player, gain: Double)?
-        var bestInjured: (out: Player, inn: Player, gain: Double)?
+        var best: (out: Int, inn: Int, gain: Double)?
+        var bestInjured: (out: Int, inn: Int, gain: Double)?
         for out in squad {
-            let outValue = weightedValue(out, from: g, to: end)
-            let outInjured = out.flagged || out.avail < 0.75
-            for inn in pool where inn.pos == out.pos && !squadIds.contains(inn.id) {
-                guard inn.cost <= out.cost + bank else { continue }
-                let clubCount = clubs[inn.team, default: 0] - (inn.team == out.team ? 1 : 0)
+            let outPick = ctx.picks[out]
+            let outValue = ctx.weighted(out, g)
+            let outPlayer = ctx.players[out]
+            let outInjured = outPlayer.flagged || outPlayer.avail < 0.75
+            let maxCost = Int(outPick.cost) + bank
+            for inn in ctx.pool {
+                let innPick = ctx.picks[inn]
+                guard innPick.pos == outPick.pos, !squadSet.contains(inn),
+                      Int(innPick.cost) <= maxCost else { continue }
+                let clubCount = clubs[Int(innPick.team)] - (innPick.team == outPick.team ? 1 : 0)
                 guard clubCount < 3 else { continue }
-                let gain = weightedValue(inn, from: g, to: end) - outValue
+                let gain = ctx.weighted(inn, g) - outValue
                 if best == nil || gain > best!.gain { best = (out, inn, gain) }
                 if outInjured, bestInjured == nil || gain > bestInjured!.gain {
                     bestInjured = (out, inn, gain)
