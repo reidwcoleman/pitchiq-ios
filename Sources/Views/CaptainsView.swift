@@ -54,8 +54,7 @@ struct CaptainsView: View {
         VStack(alignment: .leading, spacing: 12) {
             SectionLabel(text: "The pick", accent: Theme.magenta)
             HStack(spacing: 12) {
-                ShirtShape().fill(Theme.teamColor(c.player.teamShort))
-                    .frame(width: 44, height: 38)
+                PlayerShot(player: c.player, size: 52)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(c.player.name).font(.system(size: 21, weight: .black)).foregroundColor(Theme.ink)
                     Text("\(c.player.teamName) · \(c.player.posShort) · £\(c.player.price)")

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct PlayersView: View {
     @EnvironmentObject var state: AppState
+    var embedded = false
     @State private var search = ""
     @State private var posFilter = 0
     @State private var maxPrice = 16.0
@@ -44,7 +45,7 @@ struct PlayersView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            AppHeader(subtitle: "Rankings · next \(state.horizon) GW")
+            if !embedded { AppHeader(subtitle: "Rankings · next \(state.horizon) GW") }
             HStack(spacing: 8) {
                 SearchField(text: $search, placeholder: "Search player or team")
                 Picker("", selection: $posFilter) {
@@ -121,9 +122,10 @@ struct PlayerRow: View {
     var owned = false
 
     var body: some View {
-        HStack(spacing: 11) {
+        HStack(spacing: 10) {
             Text("\(rank)").font(.mono(12, .bold)).foregroundColor(Theme.inkDim)
-                .frame(width: 24)
+                .frame(width: 20)
+            PlayerShot(player: player, size: 40)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text(player.name).font(.system(size: 14, weight: .heavy)).foregroundColor(Theme.ink)

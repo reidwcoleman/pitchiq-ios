@@ -102,7 +102,7 @@ struct TeamRatings {
     var attack: [Double]              // indexed by team id
     var defence: [Double]
 
-    init(boot: Bootstrap, statGames: Int) {
+    init(boot: Bootstrap, fixtures: [APIFixture], statGames: Int) {
         let n = (boot.teams.map(\.id).max() ?? 20) + 1
         attack = Array(repeating: Self.leagueGoals, count: n)
         defence = Array(repeating: Self.leagueGoals, count: n)
@@ -125,22 +125,29 @@ struct TeamRatings {
             }
         }
 
+        let seeded = Self.seedStrength(boot: boot, fixtures: fixtures, teamCount: n)
+
+        // How far a club's own numbers have earned the right to override the
+        // prior. One match of expected goals is a coin flip: Newcastle put up
+        // 2.1 xG on the opening weekend and the old ramp — which reached full
+        // weight after a single fixture — promptly rated them the best attack
+        // in the league. Half weight arrives at eight matches, which is about
+        // where a club's expected-goals rate starts to mean something.
+        let credit = games / (games + 8)
+
         for t in boot.teams {
             let id = t.id
             guard id < n else { continue }
 
-            // Attack: squad xG per match, credibility-weighted against a prior
-            // seeded from the club's overall strength rating when one exists.
+            // Attack: squad xG per match against the seeded prior.
             let rawAtk = squadXG[id] / games
-            let wAtk = min(squadMins[id] / (games * 990), 1)          // 11 × 90 min per match
-            let atkPrior = Self.prior(strength: t.strength_overall_home, attacking: true)
-            attack[id] = wAtk * rawAtk + (1 - wAtk) * atkPrior
+            let wAtk = credit * min(squadMins[id] / (games * 990), 1)
+            attack[id] = wAtk * rawAtk + (1 - wAtk) * seeded.attack[id]
 
             // Defence: minutes-weighted keeper xGC/90.
             let rawDef = gkMins[id] > 0 ? gkXgcWeighted[id] / gkMins[id] : Self.leagueGoals
-            let wDef = min(gkMins[id] / (games * 90), 1)
-            let defPrior = Self.prior(strength: t.strength_overall_away, attacking: false)
-            defence[id] = wDef * rawDef + (1 - wDef) * defPrior
+            let wDef = credit * min(gkMins[id] / (games * 90), 1)
+            defence[id] = wDef * rawDef + (1 - wDef) * seeded.defence[id]
         }
 
         // Re-centre so the league averages sit on the true mean; keeps the
@@ -150,15 +157,55 @@ struct TeamRatings {
         recentre(&defence, ids: boot.teams.map(\.id))
     }
 
-    /// Prior for a club with little or no data. Promoted sides (no strength
-    /// rating yet) score less and concede more than the league average.
-    private static func prior(strength: Int?, attacking: Bool) -> Double {
-        guard let s = strength, s > 0 else {
-            return attacking ? leagueGoals * 0.82 : leagueGoals * 1.22
+    /// Where a club starts the season in the model's eyes.
+    ///
+    /// FPL publishes `strength_attack_home` and friends, and they are the
+    /// obvious source — except that they are zero for all twenty clubs from
+    /// pre-season until well into the campaign, which left every team on an
+    /// identical prior and handed the whole fixture signal to one match of
+    /// noise.
+    ///
+    /// The fixture list is a better source and it is complete from day one.
+    /// FPL assigns every fixture a 1-5 difficulty from each side's point of
+    /// view, and the difficulty a club's *opponents* are given, averaged over
+    /// all 38 matches, is FPL's own season-long verdict on how strong that club
+    /// is. It separates Manchester City (4.50) from Coventry (2.00) with a
+    /// full range in between, it is fixed for the season, and it is available
+    /// before a ball is kicked.
+    private static func seedStrength(boot: Bootstrap, fixtures: [APIFixture],
+                                     teamCount n: Int) -> (attack: [Double], defence: [Double]) {
+        var sum = [Double](repeating: 0, count: n)
+        var count = [Double](repeating: 0, count: n)
+        for f in fixtures {
+            guard f.event != nil, f.team_h < n, f.team_a < n else { continue }
+            // The home side's difficulty rating measures the away side.
+            if let d = f.team_h_difficulty { sum[f.team_a] += Double(d); count[f.team_a] += 1 }
+            if let d = f.team_a_difficulty { sum[f.team_h] += Double(d); count[f.team_h] += 1 }
         }
-        // FPL publishes 1 (weakest) … 5 (strongest).
-        let scale = 1.0 + (Double(s) - 3.0) * (attacking ? 0.13 : -0.13)
-        return leagueGoals * scale
+
+        let ids = boot.teams.map(\.id).filter { $0 < n }
+        var strength = [Double](repeating: 3, count: n)
+        for id in ids where count[id] > 0 { strength[id] = sum[id] / count[id] }
+        // Fall back to FPL's published strength if the fixture list is thin,
+        // and to the league average if that is empty too.
+        for id in ids where count[id] == 0 {
+            let s = boot.teams.first { $0.id == id }?.strength_overall_home ?? 0
+            strength[id] = s > 0 ? Double(s) : 3
+        }
+        let mean = ids.map { strength[$0] }.reduce(0, +) / Double(max(ids.count, 1))
+
+        // Slopes chosen so the two ends of the scale land on the real ends of
+        // the Premier League: the top club is modelled at ~1.9 xG for and
+        // ~0.95 against per match, a promoted side at ~1.1 and ~1.75. Those
+        // are the observed extremes of the last several seasons.
+        var attack = [Double](repeating: leagueGoals, count: n)
+        var defence = [Double](repeating: leagueGoals, count: n)
+        for id in ids {
+            let z = strength[id] - mean
+            attack[id] = max(leagueGoals * (1 + 0.22 * z), 0.6)
+            defence[id] = max(leagueGoals * (1 - 0.23 * z), 0.55)
+        }
+        return (attack, defence)
     }
 
     private func recentre(_ v: inout [Double], ids: [Int]) {
@@ -298,6 +345,7 @@ struct ProjectionEngine {
     let horizon: Int
     let statGames: Int
     let seasonUnderway: Bool
+    let pastForm: PastFormBook
     private let ratings: TeamRatings
     private let ctx: [[[FixtureContext]]]        // team → gw → fixtures
 
@@ -346,19 +394,31 @@ struct ProjectionEngine {
     private static let creativityToXa: [Double] = [0, 0, 0.00632, 0.00643, 0.00551]
     private static let bpsToBonus: [Double] = [0, 0, 0.01735, 0.01880, 0.03542]
 
-    init(boot: Bootstrap, fixtures: [APIFixture], gwFrom: Int, horizon: Int) {
+    init(boot: Bootstrap, fixtures: [APIFixture], gwFrom: Int, horizon: Int,
+         pastForm: PastFormBook = PastFormBook()) {
         self.boot = boot
         self.fixtures = fixtures
         self.gwFrom = gwFrom
         self.horizon = horizon
-        let played = boot.events.filter(\.finished).count
-        // Pre-season: the API still carries last season's totals over 38 games.
-        self.statGames = played > 0 ? played : 38
+        self.pastForm = pastForm
+        // How many matches the season totals actually cover. Counting finished
+        // events is wrong twice over: FPL does not set `finished` until every
+        // fixture in the week has been verified — so mid-gameweek the count is
+        // still zero and every per-match rate gets divided by 38, which is how
+        // a Haaland projection ends up at 2.6 — and in pre-season the feed
+        // carries last season's totals, which really do span 38 games. Reading
+        // it off the data avoids both: the busiest player in the league plays
+        // one match per gameweek, so his minutes divided by 90 *is* the number
+        // of gameweeks the totals cover, and in pre-season it lands on 38 by
+        // itself.
+        let maxMins = boot.elements.map(\.minutes).max() ?? 0
+        let observed = Int((Double(maxMins) / 90).rounded(.up))
+        self.statGames = max(observed, 1)
         // Form is a 30-day rolling average, so it reads 0.0 for every player
         // until matches are played. Applying it in pre-season would zero the
         // whole league.
-        self.seasonUnderway = played > 0
-        let r = TeamRatings(boot: boot, statGames: statGames)
+        self.seasonUnderway = observed > 0 && observed < 38
+        let r = TeamRatings(boot: boot, fixtures: fixtures, statGames: statGames)
         self.ratings = r
 
         let nTeams = (boot.teams.map(\.id).max() ?? 20) + 1
@@ -415,7 +475,16 @@ struct ProjectionEngine {
 
     // MARK: player projections
 
-    /// Derive a player's rate profile from their season stats.
+    /// Derive a player's rate profile from their season stats — pooled with
+    /// whatever the previous seasons said, weighted by how much this one has
+    /// had a chance to say.
+    ///
+    /// Every rate below is a per-90 read off *pooled totals*: this season's
+    /// figure plus the prior seasons' figure scaled down to a shrinking number
+    /// of pseudo-minutes. One concept, applied to goals, assists, bonus, BPS,
+    /// cards, saves, defensive contributions and minutes alike, which is what
+    /// keeps the model honest in August and lets it forget the prior by
+    /// November without a single hard cut-over.
     func rates(for p: FPLElement) -> PlayerRates {
         var r = PlayerRates()
         let games = Double(statGames)
@@ -424,47 +493,72 @@ struct ProjectionEngine {
         let starts = Double(p.starts ?? 0)
         r.pos = pos
 
-        // ---- credibility: how much to trust this player's own numbers
-        let cred = mins / (mins + 540)          // ~6 full matches → 50%
+        // ---- prior seasons, folded in as pseudo-observations
+        //
+        // `lam` is how much of the prior still counts: all of it before a ball
+        // is kicked, half of it after ten full matches, a quarter by February.
+        // The cap stops a 3,000-minute season from outweighing the current one
+        // indefinitely, and `pScale` restates the prior's totals as if they had
+        // been accumulated over `pMin` minutes, so pooling is just addition.
+        let past = pastForm[p.id] ?? PastForm()
+        let lam = 900 / (900 + mins)
+        let pMin = min(past.minutes, 2600) * lam
+        let pScale = past.minutes > 90 ? pMin / past.minutes : 0
+        let effMins = mins + pMin
+
+        /// Per-90 of this season's total pooled with the prior's.
+        func pooled90(_ own: Double, _ prior: Double) -> Double {
+            effMins > 1 ? (own + prior * pScale) / effMins * 90 : 0
+        }
+
+        // ---- credibility: how much to trust the pooled rate estimates
+        let cred = effMins / (effMins + 540)          // ~6 full matches → 50%
         r.cred = cred
-        r.epWeight = 1 - min(mins / 900, 1)     // gone by ~10 full matches
+        r.epWeight = 1 - min(effMins / 900, 1)        // gone by ~10 full matches
 
         // ---- minutes model
-        // The old model used minutes/38 regardless of how many gameweeks had
-        // been played, and ignored `starts` entirely — so a nailed-on starter
-        // and a busy substitute with the same minutes looked identical. Starts
-        // are the strongest available minutes signal.
+        // Starts are the strongest available minutes signal, and the one that
+        // takes longest to accumulate — a player is three gameweeks into the
+        // season before "starts two of three" means anything at all. The prior
+        // carries proportionally less weight here than it does on scoring
+        // rates, because a move, a new manager or a breakout changes minutes
+        // far faster than it changes finishing.
+        let sScale = 0.6 * lam
+        let pGames = past.seasons * 38 * sScale
+        let pStarts = past.starts * sScale
+        let pMinsG = past.minutes * sScale
+        let effGames = games + pGames
+        let effStarts = starts + pStarts
+        let effMinsG = mins + pMinsG
+
         // Appearances split into starts plus bench cameos. The cameo rate is
         // modelled as P(appears | doesn't start) rather than inferred from
         // leftover minutes: residual-minute models break down because minutes
         // per start vary far more between players than the cameo rate does.
-        // Fitted against true appearance counts (recoverable exactly as
-        // total_points / points_per_game) across three minutes bands, this
-        // form lands within ~1.5% at every level of squad status.
-        let startRate = min(starts / games, 1)
-        let mpg = min(mins / games, 90)
+        let startRate = min(effStarts / max(effGames, 1), 1)
+        let mpg = min(effMinsG / max(effGames, 1), 90)
         let cameoOdds = 0.24 + 0.24 * min(startRate / 0.5, 1)
         r.pPlay = min(startRate + (1 - startRate) * cameoOdds, 1)
         r.p60 = startRate * 0.93           // cameos essentially never reach 60'
         r.minShare = min(mpg / 90, 1)
-        if p.minutes == 0 {
-            // No history at all (new signing, promoted club): fall back to a
+        if effMinsG < 45 {
+            // No history at all (a genuinely new name): fall back to a
             // mid-table starter's profile and let ep_next do the work.
             r.pPlay = 0.55; r.p60 = 0.42; r.minShare = 0.48
         }
 
-        // How safe does the starting place look? `starts_per_90` is starts per
-        // 90 minutes played, so it separates a man who plays 90 every week from
-        // one who is hooked on the hour — two players can share a start rate and
-        // not share a role. Combined with minutes per appearance it gives a
-        // single number for squad status, which is what decides whether a
-        // projection made for April is worth anything.
-        let per90Starts = p.starts_per_90 ?? (mins > 0 ? starts / mins * 90 : 0)
+        // How safe does the starting place look? Starts per 90 minutes played
+        // separates a man who plays 90 every week from one who is hooked on the
+        // hour — two players can share a start rate and not share a role.
+        // Combined with minutes per appearance it gives a single number for
+        // squad status, which is what decides whether a projection made for
+        // April is worth anything.
+        let per90Starts = effMinsG > 45 ? effStarts / effMinsG * 90 : 0
         let minsPerApp = r.pPlay > 0.05 ? mpg / r.pPlay : 0
         r.startSecurity = min(startRate, 1) * 0.55
             + min(per90Starts, 1) * 0.2
             + min(minsPerApp / 90, 1) * 0.25
-        if p.minutes == 0 { r.startSecurity = 0.42 }
+        if effMinsG < 45 { r.startSecurity = 0.42 }
 
         // ---- availability
         var avail = 1.0
@@ -481,13 +575,10 @@ struct ProjectionEngine {
         r.avail = avail
 
         // ---- attacking rates, shrunk toward positional priors
-        func per90(_ total: String?) -> Double {
-            mins > 0 ? (Double(total ?? "") ?? 0) / mins * 90 : 0
-        }
-        let rawXg90 = p.expected_goals_per_90 ?? per90(p.expected_goals)
-        let rawXa90 = p.expected_assists_per_90 ?? per90(p.expected_assists)
-        let g90 = mins > 0 ? Double(p.goals_scored) / mins * 90 : 0
-        let a90 = mins > 0 ? Double(p.assists) / mins * 90 : 0
+        let rawXg90 = pooled90(Double(p.expected_goals ?? "") ?? 0, past.xg)
+        let rawXa90 = pooled90(Double(p.expected_assists ?? "") ?? 0, past.xa)
+        let g90 = pooled90(Double(p.goals_scored), past.goals)
+        let a90 = pooled90(Double(p.assists), past.assists)
 
         // FPL's assist definition is looser than the one xA is built on — it
         // credits the pass before a deflection, a rebound, or a won penalty.
@@ -499,8 +590,8 @@ struct ProjectionEngine {
         // xG/xA units by the fitted coefficients above. They see things the xG
         // feed doesn't — shot volume and chance creation — and for outfielders
         // they are the single best predictor available after xG itself.
-        let threat90 = mins > 0 ? (Double(p.threat ?? "") ?? 0) / mins * 90 : 0
-        let creat90 = mins > 0 ? (Double(p.creativity ?? "") ?? 0) / mins * 90 : 0
+        let threat90 = pooled90(Double(p.threat ?? "") ?? 0, past.threat)
+        let creat90 = pooled90(Double(p.creativity ?? "") ?? 0, past.creativity)
         let threatXg = Self.threatToXg[pos] * threat90
         let creatXa = Self.creativityToXa[pos] * creat90
         let hasIndices = pos >= 2 && (threat90 > 0 || creat90 > 0)
@@ -529,14 +620,17 @@ struct ProjectionEngine {
         r.assistPts90 = 3 * xa90
 
         // ---- defensive contribution (2 pts at 10 CBIT / 12 CBIRT)
-        // The per-90 feed only populates once the season is under way. When it
-        // is live, model the count as Poisson and take the tail above the
-        // threshold. Before then it reads zero for every player, so fall back
-        // to the positional base rate — the previous build ran the empty feed
-        // through Poisson and produced ~0 points for every outfielder, quietly
-        // removing a scoring rule worth around half a point a game to defenders.
-        let rawDc90 = p.defensive_contribution_per_90
-            ?? (mins > 0 ? Double(p.defensive_contribution ?? 0) / mins * 90 : 0)
+        // The per-90 feed only populates once the season is under way, and the
+        // rule itself only exists from 2025/26, so a prior season may record
+        // zero for a player who would have cleared the threshold every week.
+        // Use the prior only where it is non-zero; fall back to the positional
+        // base rate otherwise, rather than running an empty feed through
+        // Poisson and quietly deleting a scoring rule worth half a point a game
+        // to defenders.
+        let ownDc = Double(p.defensive_contribution ?? 0)
+        let rawDc90 = past.defcon > 0
+            ? pooled90(ownDc, past.defcon)
+            : (mins > 0 ? ownDc / mins * 90 : 0)
         if pos == 1 {
             r.defconPts = 0
         } else if rawDc90 > 0 {
@@ -547,15 +641,12 @@ struct ProjectionEngine {
         }
 
         // ---- bonus: realised bonus rate, blended with a BPS-derived estimate
-        // and shrunk toward a positional prior. An earlier build dropped BPS
-        // because the estimate it used sat well below observed bonus rates and
-        // taxed every projection; the coefficient here is fitted to reproduce
-        // the observed mean, so it re-ranks players without moving the total.
-        // Bonus is lumpy — a player can out-earn his BPS for half a season by
-        // being narrowly first rather than narrowly third — which is exactly why
-        // the smoother BPS signal is worth carrying alongside the realised rate.
-        let bonus90 = mins > 0 ? Double(p.bonus) / mins * 90 : 0
-        let bps90 = mins > 0 ? Double(p.bps ?? 0) / mins * 90 : 0
+        // and shrunk toward a positional prior. Bonus is lumpy — a player can
+        // out-earn his BPS for half a season by being narrowly first rather
+        // than narrowly third — which is exactly why the smoother BPS signal is
+        // worth carrying alongside the realised rate.
+        let bonus90 = pooled90(Double(p.bonus), past.bonus)
+        let bps90 = pooled90(Double(p.bps ?? 0), past.bps)
         let bpsBonus = Self.bpsToBonus[pos] * bps90
         // keepers excluded: their BPS barely predicts their bonus (r = 0.19)
         if pos >= 2, bps90 > 0 {
@@ -566,34 +657,39 @@ struct ProjectionEngine {
         }
 
         // ---- cards
-        let y90 = mins > 0 ? Double(p.yellow_cards ?? 0) / mins * 90 : 0.10
-        let r90 = mins > 0 ? Double(p.red_cards ?? 0) / mins * 90 : 0.004
+        let y90 = effMins > 45 ? pooled90(Double(p.yellow_cards ?? 0), past.yellows) : 0.10
+        let r90 = effMins > 45 ? pooled90(Double(p.red_cards ?? 0), past.reds) : 0.004
         r.cardPts = -(y90 + 3 * r90)
 
-        r.saves90 = pos == 1
-            ? (p.saves_per_90 ?? (mins > 0 ? Double(p.saves) / mins * 90 : 0))
-            : 0
+        r.saves90 = pos == 1 ? pooled90(Double(p.saves), past.saves) : 0
 
-        r.ppg = Double(p.points_per_game ?? "") ?? 0
+        // ---- the history anchor
+        // Points per appearance is the single number that carries everything
+        // the rate model cannot see: role, team quality, the referee, the
+        // penalty box. Pooled the same way as everything else, so a player with
+        // one gameweek behind him is anchored to what he actually is rather
+        // than to what one afternoon said.
+        let pooledPoints = Double(p.total_points) + past.points * sScale
+        let apps = max(effGames * r.pPlay, 1)
+        r.ppg = pooledPoints / apps
         r.form = Double(p.form ?? "") ?? 0
         r.epNext = Double(p.ep_next ?? "") ?? 0
 
         // ---- form
-        // Form is points per match over the last 30 days; points per game is the
-        // season-long level. Their ratio is the trend, and it is applied to the
-        // parts of the projection that genuinely move with a player's run of
-        // touch — goals, assists, bonus — and not to the parts that don't, like
-        // appearance points or his team's clean-sheet odds.
+        // Form is points per match over the last 30 days; the anchor above is
+        // the player's settled level. Their ratio is the trend, and it is
+        // applied to the parts of the projection that genuinely move with a
+        // player's run of touch — goals, assists, bonus — and not to the parts
+        // that don't, like appearance points or his team's clean-sheet odds.
         //
-        // The weight is deliberately well under 1. Four good matches is a small
-        // sample, and chasing it is the standard way to lose a season; but
-        // ignoring a player who has changed role, moved up the pecking order or
-        // started taking the penalties throws away the freshest information
-        // there is. 0.4 splits that difference, and the clamp stops one hat-trick
-        // from doubling anyone.
+        // The weight is deliberately well under 1, and it is scaled by how many
+        // matches have actually been played: in August "form" is one fixture,
+        // and letting one quiet afternoon cut a projection by a quarter is how
+        // the previous build ended up rating Haaland below a full-back.
         if seasonUnderway, r.ppg > 0.5, r.form > 0 {
             let trend = r.form / r.ppg
-            r.formMult = min(max(1 + 0.4 * (trend - 1), 0.72), 1.45)
+            let weight = 0.4 * min(games / 4, 1)
+            r.formMult = min(max(1 + weight * (trend - 1), 0.72), 1.45)
             r.goalPts90 *= r.formMult
             r.assistPts90 *= r.formMult
             r.bonusRate *= r.formMult
@@ -607,9 +703,8 @@ struct ProjectionEngine {
         // thing at r = 0.71 against goals actually conceded. Applied as a
         // multiplier on the fixture's concession rate: for a Poisson clean sheet
         // P(0) = e^-λ, so scaling λ by s is exactly P(0)^s.
-        if pos <= 2, mins >= 450 {
-            let ownXgc = p.expected_goals_conceded_per_90
-                ?? (mins > 0 ? (Double(p.expected_goals_conceded ?? "") ?? 0) / mins * 90 : 0)
+        if pos <= 2, effMins >= 450 {
+            let ownXgc = pooled90(Double(p.expected_goals_conceded ?? "") ?? 0, past.xgc)
             let teamXgc = ratings.defence[min(p.team, ratings.defence.count - 1)]
             if ownXgc > 0.05, teamXgc > 0.05 {
                 r.defScale = min(max(ownXgc / teamXgc, 0.78), 1.28)
@@ -727,7 +822,6 @@ struct ProjectionEngine {
         var players: [Player] = boot.elements.map { p in
             let pos = min(max(p.element_type, 1), 4)
             let r = rates(for: p)
-            let mpg = min(Double(p.minutes) / games, 90)
 
             // per-GW projections for every remaining gameweek, so the planner
             // can see all the way to GW 38
@@ -747,7 +841,7 @@ struct ProjectionEngine {
             let net = (p.transfers_in_event ?? 0) - (p.transfers_out_event ?? 0)
 
             var pl = Player()
-            pl.id = p.id; pl.name = p.web_name; pl.pos = pos; pl.team = p.team
+            pl.id = p.id; pl.code = p.code; pl.name = p.web_name; pl.pos = pos; pl.team = p.team
             pl.teamShort = t?.short_name ?? "?"; pl.teamName = t?.name ?? "?"
             pl.cost = p.now_cost; pl.proj = proj
             pl.perGw = proj / Double(max(horizon, 1))
@@ -763,16 +857,33 @@ struct ProjectionEngine {
             pl.xg = Double(p.expected_goals ?? "") ?? 0
             pl.xa = Double(p.expected_assists ?? "") ?? 0
             pl.news = p.news ?? ""
-            pl.expMins = mpg
+            // The model's own view of minutes, not this season's average: after
+            // one gameweek the two are wildly different, and it is the model's
+            // number the rest of the app reasons about.
+            pl.expMins = r.minShare * 90
             pl.penTaker = (p.penalties_order ?? 99) == 1
             pl.setPieces = (p.corners_and_indirect_freekicks_order ?? 99) == 1
                 || (p.direct_freekicks_order ?? 99) == 1
-            pl.startRate = min(Double(p.starts ?? 0) / games, 1)
+            pl.startRate = min(r.p60 / 0.93, 1)
             pl.startSecurity = r.startSecurity
             pl.formMult = r.formMult
             pl.ceiling = dist.ceiling; pl.haulProb = dist.haul; pl.blankProb = dist.blank
             pl.netTransfers = net
-            pl.priceMomentum = max(min(Double(net) / priceUnit, 1.5), -1.5)
+            // Prefer FPL's published meter; fall back to the net-transfer
+            // estimate for feeds that don't carry it.
+            if let pct = Double(p.price_change_percent ?? "") {
+                pl.priceMomentum = max(min(pct / 100, 1.5), -1.5)
+            } else {
+                pl.priceMomentum = max(min(Double(net) / priceUnit, 1.5), -1.5)
+            }
+            if let projections = p.price_change_projections {
+                let rising = pl.priceMomentum >= 0
+                let hit = projections
+                    .sorted { $0.offset < $1.offset }
+                    .first { rising ? $0.percent >= 100 : $0.percent <= -100 }
+                pl.priceChangeIn = hit?.offset
+                pl.priceConfidence = min(Double(abs(hit?.likelihood ?? 0)) / 5, 1)
+            }
             pl.costChangeStart = p.cost_change_start ?? 0
             pl.ictIndex = Double(p.ict_index ?? "") ?? 0
             pl.threat = Double(p.threat ?? "") ?? 0

@@ -339,21 +339,39 @@ enum Advisor {
             case .steady: return "Steady"
             }
         }
+
+        /// When FPL's own model expects the change to land.
+        var timing: String? {
+            guard let nights = player.priceChangeIn else { return nil }
+            switch nights {
+            case 0: return "tonight"
+            case 1: return "tomorrow"
+            default: return "in \(nights) nights"
+            }
+        }
     }
 
     /// Players closest to a price change tonight. FPL moves a price once net
     /// transfers pass a threshold proportional to the size of the game, so the
     /// ranking is by how far through that threshold a player is.
+    /// Ranked by how close a change is, not by how many people transferred
+    /// them. FPL publishes both the progress meter and its own projection for
+    /// the next three nights, so a player at 96% tonight belongs above one at
+    /// 60% with more transfers behind him.
     static func priceWatch(_ players: [Player], limit: Int = 10) -> (rising: [PriceMove], falling: [PriceMove]) {
+        func rank(_ p: Player) -> Double {
+            // A projected change tonight outranks any amount of progress that
+            // isn't going to land.
+            let soon = p.priceChangeIn.map { 3.0 - Double($0) } ?? 0
+            return abs(p.priceMomentum) + soon * 0.6 + p.priceConfidence * 0.2
+        }
         let moves = players.filter { abs($0.priceMomentum) > 0.08 }
         let rising = moves.filter { $0.priceMomentum > 0 }
-            .sorted { $0.priceMomentum != $1.priceMomentum
-                ? $0.priceMomentum > $1.priceMomentum : $0.id < $1.id }
+            .sorted { rank($0) != rank($1) ? rank($0) > rank($1) : $0.id < $1.id }
             .prefix(limit)
             .map { PriceMove(player: $0, direction: .rising, progress: min($0.priceMomentum, 1)) }
         let falling = moves.filter { $0.priceMomentum < 0 }
-            .sorted { $0.priceMomentum != $1.priceMomentum
-                ? $0.priceMomentum < $1.priceMomentum : $0.id < $1.id }
+            .sorted { rank($0) != rank($1) ? rank($0) > rank($1) : $0.id < $1.id }
             .prefix(limit)
             .map { PriceMove(player: $0, direction: .falling, progress: min(-$0.priceMomentum, 1)) }
         return (Array(rising), Array(falling))

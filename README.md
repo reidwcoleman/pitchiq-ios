@@ -16,6 +16,12 @@ xcodebuild -scheme PitchIQ -destination 'generic/platform=iOS' -configuration De
 
 ## What it does
 
+**Live** — the gameweek as it happens. Your eleven with points as they are
+scored, the bonus FPL has not awarded yet worked out from live BPS, who is still
+to play, the substitutions that will be made at full time, your mini-league
+places and every score in the round. It polls once a minute while matches are on
+and not at all when they aren't.
+
 **Team** — the season plan. Every gameweek from now to GW38 carries one
 instruction ("roll the transfer", "Sonny → Saka", "Bench Boost — all 15 score"),
 the eleven to field that week, and the reasoning. Chips are scheduled only where
@@ -36,7 +42,10 @@ ceiling, chance of a haul, chance of a blank, and effective ownership.
 
 **Fixtures** — the ticker, ranked by the model's own attack and defence ratings
 in expected goals rather than FPL's 1-5 badge, with separate views for what
-attackers want and what defenders want.
+attackers want and what defenders want. Shares the Players tab, because iOS only
+gives five tabs before it starts hiding screens behind a More button.
+
+The deadline counts down in the header of every screen.
 
 ### Connect your team
 
@@ -49,6 +58,44 @@ import reports a readable message rather than an error before the season starts.
 ---
 
 ## How the numbers are made
+
+### The prior season (`History.swift`)
+
+The hardest week to project anything is the first one, and it is also the week
+that decides the most transfers. After one gameweek FPL's feed said Haaland had
+scored two points off ninety minutes at 0.85 expected goals; a model that trusts
+only the current season shrinks him toward a generic forward, and this app duly
+projected him at 2.6 a week and ranked a full-back above him.
+
+FPL publishes every player's per-season totals at `element-summary/{id}/` —
+minutes, starts, expected goals, expected assists, expected goals conceded, BPS,
+bonus, cards, saves — back to 2022/23. Those seasons become the prior, weighted
+by recency (1, 0.45, 0.18) and folded into the current season's totals as
+pseudo-observations:
+
+```
+lam    = 900 / (900 + minutes played this season)   // all of it in August,
+pMin   = min(prior minutes, 2600) · lam             // half after ten matches
+rate   = (this season's total + prior total · pMin/prior minutes) / (minutes + pMin) · 90
+```
+
+One idea, applied to goals, assists, bonus, BPS, cards, saves, defensive
+contributions, expected goals conceded and minutes alike. This season's numbers
+are evidence *against* the prior rather than a replacement for it, and by
+November they have overwhelmed it without a single hard cut-over. 600 small
+requests, cached on disk for a week, since finished seasons do not change.
+
+### How many matches the totals cover
+
+Every per-match rate divides by this, and it used to be the count of events
+FPL had marked `finished` — which is zero from the moment a gameweek's first
+match kicks off until every fixture in it has been verified, and 38 in
+pre-season, when the feed carries last season's totals. Divide one match of
+data by 38 and the whole league projects at a quarter of its true rate.
+
+It is now read off the data: the busiest player in the league plays one match a
+gameweek, so his minutes divided by 90 is the number of gameweeks the totals
+cover. In pre-season it lands on 38 by itself.
 
 ### Projection (`Engine.swift`)
 
@@ -315,7 +362,10 @@ Sources/
   AppState.swift      loading, caching, persistence, team connection
   DataCache.swift     FPL API + on-disk payload cache
   FPLModels.swift     API payloads and derived types
-  Views/              Team · Transfers · Players · Captain · Fixtures
+  History.swift       prior-season digests: fetch, cache, recency-weighting
+  Live.swift          live points, provisional bonus, auto-subs, standings
+  Images.swift        player photographs and club crests, cached twice
+  Views/              Live · Team · Transfers · Players+Fixtures · Captain
 ```
 
 ### Testing the engine without a simulator
@@ -325,11 +375,25 @@ the model can be compiled and run headlessly against cached JSON:
 
 ```bash
 swiftc -O -o bench main.swift \
-  Sources/{Engine,Optimizer,Solver,Planner,Advisor,FPLModels}.swift
+  Sources/{Engine,Optimizer,Solver,Planner,Advisor,FPLModels,History,Live,DataCache}.swift
 ```
 
-### Gotcha
+The calibration check worth running after any engine change is the league-wide
+total: summing every player's projection for one gameweek should land near
+**1000**, which is what a real gameweek pays out across all 609 players. It
+currently reads 939 (GK 101 · DEF 305 · MID 421 · FWD 113).
 
-FPL's pre-season bootstrap carries last season's player stats but zeroes the team
-strength fields. Use fixture `team_h_difficulty` / `team_a_difficulty` for
-difficulty, never the team strength ratings.
+### Gotchas
+
+**Team strengths are always zero.** `strength_attack_home` and friends read 0 for
+all twenty clubs in pre-season *and* through the opening weeks, so they cannot
+seed anything. The fixture list can: the difficulty FPL assigns to a club's
+opponents, averaged over all 38 matches, is its own season-long verdict on that
+club, and it separates Manchester City (4.50) from Coventry (2.00) before a ball
+is kicked. `TeamRatings.seedStrength` builds the prior from it, and a club's own
+expected goals only take over at half weight after eight matches.
+
+**`price_change_percent` is a string.** So are `projected_percent`, `form`,
+`points_per_game` and every expected-goals field. `price_change_hourly_rate` and
+`likelihood` are integers. Decoding one of them with the wrong type fails the
+whole bootstrap and the app shows a network error for what is a parsing bug.

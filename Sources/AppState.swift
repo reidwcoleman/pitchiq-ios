@@ -38,6 +38,13 @@ final class AppState: ObservableObject {
     @Published var fixtures: [APIFixture] = []
     @Published var insights = Insights()
     @Published var lastUpdated: Date?
+    /// Prior-season form for every player. Empty until the first fetch lands;
+    /// the projections work without it and get materially better with it.
+    @Published var pastForm = PastFormBook()
+    /// The gameweek in progress: every player's points as they are scored.
+    @Published var live = LiveBook()
+    @Published var liveSquad = LiveSquad()
+    @Published var liveRefreshing = false
     @Published var refreshing = false
     /// A rebuild is in flight but the previous answer is still on screen. The
     /// old build swapped the whole team view for a spinner on every settings
@@ -129,7 +136,78 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - the live gameweek
+
+    /// The gameweek being played, which is not the one being planned: FPL keeps
+    /// a week "current" from its deadline until the next one's, so between
+    /// Sunday night and Friday the app plans for GW n+1 while GW n is still the
+    /// one with points on it.
+    var liveGw: Int {
+        boot?.events.first { $0.is_current == true }?.id
+            ?? boot?.events.last { $0.finished }?.id
+            ?? max(gwFrom - 1, 1)
+    }
+
+    /// The next deadline, and how long there is left. The single most useful
+    /// number in fantasy football, and the app did not show it anywhere.
+    var nextDeadline: (gw: Int, date: Date)? {
+        let now = Date()
+        let upcoming = (boot?.events ?? [])
+            .compactMap { e -> (Int, Date)? in e.deadline.map { (e.id, $0) } }
+            .filter { $0.1 > now }
+            .min { $0.1 < $1.1 }
+        return upcoming.map { (gw: $0.0, date: $0.1) }
+    }
+
+    var liveFixtures: [APIFixture] {
+        fixtures.filter { $0.event == liveGw }
+            .sorted { ($0.kickoff ?? .distantFuture) < ($1.kickoff ?? .distantFuture) }
+    }
+
+    var fixtureStates: [Int: MatchState] {
+        var out: [Int: MatchState] = [:]
+        for f in fixtures where f.id != nil { out[f.id!] = f.liveState }
+        return out
+    }
+
+    /// True while at least one match in the current gameweek is being played.
+    var matchesInPlay: Bool { liveFixtures.contains { $0.liveState.isLive } }
+
+    /// Live points for the whole gameweek, refreshed while matches are on.
+    func refreshLive() async {
+        guard boot != nil, !liveRefreshing else { return }
+        let gw = liveGw
+        liveRefreshing = true
+        defer { liveRefreshing = false }
+        guard let payload = try? await FPLService.fetchLive(gw: gw) else { return }
+        live = LiveBook(gw: gw, live: payload, fixtures: fixtures)
+        // The picks that are actually on the pitch this week may be a gameweek
+        // ahead of the ones the planner is working from.
+        if let t = team, t.gw != gw || t.picks == nil,
+           let picks = try? await FPLService.fetchPicks(entryId: t.entryId, gw: gw) {
+            var updated = t
+            updated.picks = picks.squadPicks
+            updated.activeChip = picks.active_chip
+            updated.transferCost = picks.entry_history?.event_transfers_cost ?? 0
+            team = updated
+        }
+        rebuildLiveSquad()
+    }
+
+    func rebuildLiveSquad() {
+        guard let picks = team?.picks, !picks.isEmpty, !live.isEmpty else {
+            liveSquad = LiveSquad(); return
+        }
+        var byId: [Int: Player] = [:]
+        for p in players { byId[p.id] = p }
+        liveSquad = LiveSquad(picks: picks, players: byId, live: live,
+                              fixtures: fixtureStates,
+                              transferCost: team?.transferCost ?? 0,
+                              chip: team?.activeChip)
+    }
+
     func teamShort(_ id: Int) -> String { teams[id]?.short_name ?? "?" }
+    func teamCode(_ id: Int) -> Int? { teams[id]?.code }
     func teamName(_ id: Int) -> String { teams[id]?.name ?? "?" }
 
     // MARK: - loading
@@ -139,15 +217,49 @@ final class AppState: ObservableObject {
     /// before showing anything, every single time.
     func load() async {
         if boot == nil {
-            let cached = await Task.detached(priority: .userInitiated) { DataCache.read() }.value
-            if let cached {
-                apply(boot: cached.boot, fixtures: cached.fixtures, stamp: cached.fetched)
+            let cached = await Task.detached(priority: .userInitiated) {
+                (DataCache.read(), DataCache.readPastForm())
+            }.value
+            if let book = cached.1 { pastForm = book }
+            if let payload = cached.0 {
+                apply(boot: payload.boot, fixtures: payload.fixtures, stamp: payload.fetched)
             }
         }
         let age = lastUpdated.map { Date().timeIntervalSince($0) } ?? .infinity
         // FPL prices move once a day and injury news a few times a day; a
         // fifteen-minute cache costs nothing and removes the wait entirely.
         if age > 15 * 60 { await refresh() }
+        // testing hook, alongside `-tab`: launch with `-entry N` to connect a
+        // team without typing an id into the simulator
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-entry"), i + 1 < args.count,
+           let id = Int(args[i + 1]), team?.entryId != id {
+            await connect(entryId: id)
+        }
+        await refreshLive()
+        await refreshPastFormIfNeeded()
+    }
+
+    /// Six hundred requests, so this runs at most once a week — and once
+    /// whenever the player list has moved on far enough that the cache no
+    /// longer covers it (a January window, or a fresh install mid-season).
+    private func refreshPastFormIfNeeded() async {
+        guard let boot else { return }
+        let ids = boot.elements.map(\.id)
+        let covered = ids.filter { pastForm[$0] != nil }.count
+        let stale = Date().timeIntervalSince(pastForm.built) > 7 * 24 * 3600
+        // Roughly a fifth of any squad list is academy players with no senior
+        // record, so full coverage is never expected — half is the signal that
+        // the cache is genuinely for a different season.
+        guard stale || Double(covered) < Double(ids.count) * 0.5 else { return }
+        let book = await FPLService.fetchPastForm(ids: ids)
+        guard !book.isEmpty else { return }
+        pastForm = book
+        engine = nil
+        engineGw = nil
+        modelPlayers = []
+        cachedPlanKey = nil
+        rebuild()
     }
 
     /// Fetch live data. Keeps whatever is on screen if the network fails.
@@ -184,6 +296,7 @@ final class AppState: ObservableObject {
     }
 
     func refreshIfStale() {
+        Task { await refreshLive() }
         guard let last = lastUpdated, Date().timeIntervalSince(last) > 15 * 60 else { return }
         Task { await refresh() }
     }
@@ -225,7 +338,8 @@ final class AppState: ObservableObject {
         if let e = engine, engineGw == gwFrom {
             eng = e
         } else {
-            eng = ProjectionEngine(boot: boot, fixtures: fixtures, gwFrom: gwFrom, horizon: horizon)
+            eng = ProjectionEngine(boot: boot, fixtures: fixtures, gwFrom: gwFrom,
+                                   horizon: horizon, pastForm: pastForm)
             engine = eng
             engineGw = gwFrom
             modelPlayers = []
@@ -290,6 +404,7 @@ final class AppState: ObservableObject {
                 }
                 self.working = false
                 self.phase = .ready
+                self.rebuildLiveSquad()
             }
         }
     }

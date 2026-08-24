@@ -268,11 +268,17 @@ struct TransfersView: View {
                 ForEach(moves.prefix(6)) { m in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 8) {
+                            PlayerShot(player: m.player, size: 26)
                             Text(m.player.name).font(.system(size: 13, weight: .bold))
                                 .foregroundColor(Theme.ink)
-                            Text("\(m.player.teamShort) £\(m.player.price)")
+                            Text("£\(m.player.price)")
                                 .font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
                             Spacer()
+                            if let timing = m.timing {
+                                Text(timing).font(.mono(9.5, .bold)).foregroundColor(color)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(color.opacity(0.13)).clipShape(Capsule())
+                            }
                             Text("\(Int(m.progress * 100))%")
                                 .font(.mono(11, .bold)).foregroundColor(color)
                         }

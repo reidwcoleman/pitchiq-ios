@@ -447,10 +447,7 @@ struct PlayerCard: View {
 
     var body: some View {
         VStack(spacing: 4) {
-            ShirtShape()
-                .fill(Theme.teamColor(player.teamShort))
-                .overlay(ShirtShape().stroke(Color.black.opacity(0.08), lineWidth: 1))
-                .frame(width: 30, height: 26)
+            PlayerShot(player: player, size: 38)
             Text(player.name)
                 .font(.system(size: 11, weight: .bold)).foregroundColor(Theme.ink)
                 .lineLimit(1).minimumScaleFactor(0.7)
@@ -487,25 +484,6 @@ struct PlayerCard: View {
                     .offset(x: 6, y: -6)
             }
         }
-    }
-}
-
-struct ShirtShape: Shape {
-    func path(in rect: CGRect) -> Path {
-        var p = Path()
-        let w = rect.width, h = rect.height
-        p.move(to: CGPoint(x: w * 0.25, y: 0))
-        p.addLine(to: CGPoint(x: w * 0.75, y: 0))
-        p.addLine(to: CGPoint(x: w, y: h * 0.22))
-        p.addLine(to: CGPoint(x: w * 0.86, y: h * 0.42))
-        p.addLine(to: CGPoint(x: w * 0.82, y: h * 0.3))
-        p.addLine(to: CGPoint(x: w * 0.82, y: h))
-        p.addLine(to: CGPoint(x: w * 0.18, y: h))
-        p.addLine(to: CGPoint(x: w * 0.18, y: h * 0.3))
-        p.addLine(to: CGPoint(x: w * 0.14, y: h * 0.42))
-        p.addLine(to: CGPoint(x: 0, y: h * 0.22))
-        p.closeSubpath()
-        return p
     }
 }
 

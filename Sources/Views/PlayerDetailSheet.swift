@@ -18,6 +18,7 @@ struct PlayerDetailSheet: View {
                     header
                     if !full.news.isEmpty { newsBox }
                     outlookSection
+                    lastSeasonSection
                     projSection
                     signalSection
                     statSection
@@ -40,10 +41,7 @@ struct PlayerDetailSheet: View {
 
     var header: some View {
         HStack(spacing: 14) {
-            ShirtShape()
-                .fill(Theme.teamColor(full.teamShort))
-                .overlay(ShirtShape().stroke(Color.black.opacity(0.08), lineWidth: 1))
-                .frame(width: 50, height: 44)
+            PlayerShot(player: full, size: 60)
             VStack(alignment: .leading, spacing: 4) {
                 Text(full.name).font(.system(size: 21, weight: .black)).foregroundColor(Theme.ink)
                 Text("\(full.teamName) · \(full.posShort) · £\(full.price)")
@@ -63,6 +61,55 @@ struct PlayerDetailSheet: View {
         }
         .padding(14)
         .panel()
+    }
+
+    /// What the player did last season. It is the single biggest input to the
+    /// projection in August, so the card should say so rather than showing four
+    /// gameweeks of noise and leaving the reader to guess where the number came
+    /// from.
+    @ViewBuilder var lastSeasonSection: some View {
+        if let past = state.pastForm[full.id], let last = past.last, last.minutes > 90 {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionLabel(text: "Last season · \(last.name)")
+                HStack(spacing: 10) {
+                    StatTile(value: "\(last.points)", caption: "Points", color: Theme.ink)
+                    StatTile(value: String(format: "%.1f", last.per90),
+                             caption: "Per 90", color: Theme.lime)
+                    StatTile(value: "\(last.starts)", caption: "Starts", color: Theme.cyan)
+                }
+                HStack(spacing: 14) {
+                    smallStat("\(last.goals)", "goals")
+                    smallStat("\(last.assists)", "assists")
+                    smallStat(String(format: "%.2f", last.xg90), "xG/90")
+                    smallStat(String(format: "%.2f", last.xa90), "xA/90")
+                    if full.pos <= 2 { smallStat("\(last.cleanSheets)", "CS") }
+                }
+                Text(bridge(last))
+                    .font(.system(size: 12)).foregroundColor(Theme.inkDim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .panel()
+        }
+    }
+
+    func smallStat(_ value: String, _ caption: String) -> some View {
+        VStack(spacing: 1) {
+            Text(value).font(.mono(13, .bold)).foregroundColor(Theme.ink)
+            Text(caption).font(.label(8)).foregroundColor(Theme.inkDim)
+        }
+    }
+
+    /// How much of the projection is still coming from last season.
+    func bridge(_ last: SeasonLine) -> String {
+        let mins = Double(full.mins)
+        let carry = 900 / (900 + mins)
+        let pct = Int((carry * 100).rounded())
+        if mins < 90 {
+            return "He has not played yet this season, so the projection is essentially last season's rates against this season's fixtures."
+        }
+        return "\(full.mins) minutes played since August. Roughly \(pct)% of the rate estimates behind his projection still come from last season; that share falls every week he plays."
     }
 
     var newsBox: some View {

@@ -6,6 +6,7 @@ import SwiftUI
 /// is not the same green row a defender wants.
 struct FixturesView: View {
     @EnvironmentObject var state: AppState
+    var embedded = false
     @State private var lens = 0        // 0 = overall, 1 = for attackers, 2 = for defenders
     @State private var span = 6
 
@@ -60,7 +61,9 @@ struct FixturesView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            AppHeader(subtitle: "Fixtures · GW \(state.gwFrom)–\(gws.last ?? state.gwFrom)")
+            if !embedded {
+                AppHeader(subtitle: "Fixtures · GW \(state.gwFrom)–\(gws.last ?? state.gwFrom)")
+            }
             Picker("", selection: $lens) {
                 Text("Overall").tag(0)
                 Text("For attack").tag(1)

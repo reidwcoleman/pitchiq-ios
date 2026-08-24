@@ -68,13 +68,38 @@ struct MainTabs: View {
 
     var body: some View {
         TabView(selection: $tab) {
-            SquadView().tabItem { Label("Team", systemImage: "sportscourt.fill") }.tag(0)
-            TransfersView().tabItem { Label("Transfers", systemImage: "arrow.left.arrow.right") }.tag(1)
-            PlayersView().tabItem { Label("Players", systemImage: "list.number") }.tag(2)
-            CaptainsView().tabItem { Label("Captain", systemImage: "crown.fill") }.tag(3)
-            FixturesView().tabItem { Label("Fixtures", systemImage: "calendar") }.tag(4)
+            LiveView().tabItem { Label("Live", systemImage: "dot.radiowaves.left.and.right") }.tag(0)
+            SquadView().tabItem { Label("Team", systemImage: "sportscourt.fill") }.tag(1)
+            TransfersView().tabItem { Label("Transfers", systemImage: "arrow.left.arrow.right") }.tag(2)
+            BrowseView().tabItem { Label("Players", systemImage: "list.number") }.tag(3)
+            CaptainsView().tabItem { Label("Captain", systemImage: "crown.fill") }.tag(4)
         }
         .tint(Theme.lime)
+    }
+}
+
+/// Rankings and the fixture ticker are both "look at the league" screens, and
+/// iOS only gives five tabs before it starts hiding things behind a More
+/// button. They share one.
+struct BrowseView: View {
+    @EnvironmentObject var state: AppState
+    @State private var mode = 0
+
+    var body: some View {
+        VStack(spacing: 0) {
+            AppHeader(subtitle: mode == 0
+                      ? "Rankings · next \(state.horizon) GW"
+                      : "Fixtures · from GW \(state.gwFrom)")
+            Picker("", selection: $mode) {
+                Text("Players").tag(0)
+                Text("Fixtures").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
+            if mode == 0 { PlayersView(embedded: true) } else { FixturesView(embedded: true) }
+        }
+        .background(Theme.bg)
     }
 }
 
@@ -100,6 +125,7 @@ struct AppHeader: View {
                     .lineLimit(1).minimumScaleFactor(0.75)
             }
             Spacer(minLength: 6)
+            DeadlineChip()
             if state.working || state.refreshing {
                 ProgressView().tint(Theme.limeDim).scaleEffect(0.75)
             }
@@ -117,6 +143,37 @@ struct AppHeader: View {
         .padding(.top, 4)
         .padding(.bottom, 8)
         .sheet(isPresented: $showSettings) { SettingsSheet() }
+    }
+}
+
+/// Time to the next deadline, counted down in the header of every screen.
+/// Turns amber inside twelve hours and red inside two.
+struct DeadlineChip: View {
+    @EnvironmentObject var state: AppState
+    @State private var now = Date()
+    private let tick = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        if let next = state.nextDeadline {
+            let left = next.date.timeIntervalSince(now)
+            let color: Color = left < 2 * 3600 ? Theme.red : (left < 12 * 3600 ? Theme.amber : Theme.inkDim)
+            VStack(alignment: .trailing, spacing: 0) {
+                Text(Self.format(left))
+                    .font(.mono(12.5, .bold)).foregroundColor(color)
+                    .monospacedDigit()
+                Text("GW \(next.gw) DEADLINE")
+                    .font(.label(7)).tracking(0.8).foregroundColor(Theme.inkDim)
+            }
+            .onReceive(tick) { now = $0 }
+        }
+    }
+
+    static func format(_ seconds: TimeInterval) -> String {
+        let s = max(Int(seconds), 0)
+        let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
+        if d > 0 { return "\(d)d \(h)h" }
+        if h > 0 { return "\(h)h \(m)m" }
+        return "\(m)m"
     }
 }
 

@@ -56,10 +56,14 @@ struct GWEvent: Decodable {
     let is_next: Bool
     let finished: Bool
     let is_current: Bool?
+
+    var deadline: Date? { ISO8601DateFormatter().date(from: deadline_time) }
 }
 
 struct FPLTeam: Decodable, Identifiable {
     let id: Int
+    /// Club code, used for the crest asset. Also stable across seasons.
+    let code: Int?
     let name: String
     let short_name: String
     // Populated once the season is under way; 0/nil in pre-season.
@@ -73,6 +77,9 @@ struct FPLTeam: Decodable, Identifiable {
 
 struct FPLElement: Decodable {
     let id: Int
+    /// Stable across seasons, and the key to the player's photograph on
+    /// resources.premierleague.com. `id` is not — it is reassigned every July.
+    let code: Int
     let web_name: String
     let element_type: Int
     let team: Int
@@ -119,6 +126,20 @@ struct FPLElement: Decodable {
     let transfers_out_event: Int?
     let cost_change_event: Int?
     let cost_change_start: Int?
+    /// FPL's own price-change meter, added for 2026/27: how far the player is
+    /// toward a change (100 = it happens), how fast, and what it projects for
+    /// tonight and the two nights after, with a −5…5 confidence. Strictly
+    /// better than inferring it from net transfers, which is what this app did.
+    let price_change_percent: String?
+    let price_change_hourly_rate: Int?
+    let price_change_projections: [PriceProjection]?
+
+    struct PriceProjection: Decodable {
+        let offset: Int              // nights from now
+        let projected_percent: String
+        let likelihood: Int          // −5 … 5
+        var percent: Double { Double(projected_percent) ?? 0 }
+    }
 
     // Underlying-performance indices, used on the player card and to separate
     // players whose projections are close.
@@ -136,15 +157,42 @@ struct FPLElement: Decodable {
 // MARK: - A manager's own team (public entry endpoints)
 
 struct EntrySummary: Decodable {
+    struct Leagues: Decodable { let classic: [League]? }
+    struct League: Decodable {
+        let id: Int
+        let name: String
+        let entry_rank: Int?
+        let entry_last_rank: Int?
+        let rank_count: Int?
+        let league_type: String?
+    }
     let id: Int
     let name: String
     let player_first_name: String?
     let player_last_name: String?
     let summary_overall_points: Int?
     let summary_overall_rank: Int?
+    let summary_event_points: Int?
+    let summary_event_rank: Int?
     let last_deadline_bank: Int?
     let last_deadline_value: Int?
     let current_event: Int?
+    let leagues: Leagues?
+}
+
+/// One mini-league as it appears on the manager's own entry — enough for a
+/// standings card without a second request per league.
+struct LeagueSummary: Codable, Equatable, Identifiable {
+    var id: Int
+    var name: String
+    var rank: Int
+    var lastRank: Int
+    var size: Int
+    var isGlobal: Bool
+
+    /// Places gained (positive) or lost since last gameweek. A last rank of
+    /// zero means the league had not been ranked yet, not a climb of a million.
+    var movement: Int { lastRank > 0 && rank > 0 ? lastRank - rank : 0 }
 }
 
 struct EntryPicks: Decodable {
@@ -166,6 +214,12 @@ struct EntryPicks: Decodable {
     let picks: [Pick]
     let entry_history: History?
     let active_chip: String?
+
+    var squadPicks: [SquadPick] {
+        picks.map { SquadPick(element: $0.element, position: $0.position,
+                              multiplier: $0.multiplier,
+                              isCaptain: $0.is_captain, isVice: $0.is_vice_captain) }
+    }
 }
 
 struct EntryHistory: Decodable {
@@ -188,17 +242,71 @@ struct TeamState: Codable, Equatable {
     var overallRank: Int
     var gw: Int                // the gameweek these picks are from
     var fetched: Date
+    // Added after the first release, so all optional: an existing saved team
+    // decodes without them and fills them in on the next refresh.
+    var picks: [SquadPick]?        // with multipliers and bench order
+    var activeChip: String?
+    var transferCost: Int?
+    var eventPoints: Int?
+    var leagues: [LeagueSummary]?
 
     var budget: Int { squadValue + bank }
 }
 
-struct APIFixture: Decodable {
+// MARK: - mini-league standings
+
+struct LeagueStandings: Decodable {
+    struct Meta: Decodable { let id: Int; let name: String }
+    struct Page: Decodable { let has_next: Bool; let results: [Row] }
+    struct Row: Decodable, Identifiable {
+        let entry: Int?
+        let entry_name: String
+        let player_name: String
+        let rank: Int
+        let last_rank: Int
+        let event_total: Int
+        let total: Int
+
+        var id: Int { entry ?? rank }
+        var movement: Int { last_rank > 0 ? last_rank - rank : 0 }
+    }
+    let league: Meta
+    let standings: Page
+}
+
+struct APIFixture: Decodable, Identifiable {
+    let id: Int?
     let event: Int?
     let team_h: Int
     let team_a: Int
     let team_h_difficulty: Int?
     let team_a_difficulty: Int?
     let finished: Bool?
+    let finished_provisional: Bool?
+    let started: Bool?
+    let minutes: Int?
+    let team_h_score: Int?
+    let team_a_score: Int?
+    let kickoff_time: String?
+
+    var kickoff: Date? {
+        guard let kickoff_time else { return nil }
+        return ISO8601DateFormatter().date(from: kickoff_time)
+    }
+    /// Everything about where this match is in its life, in one value.
+    var liveState: MatchState {
+        if finished == true || finished_provisional == true { return .finished }
+        if started == true { return .live(minutes ?? 0) }
+        return .upcoming
+    }
+}
+
+enum MatchState: Equatable {
+    case upcoming
+    case live(Int)
+    case finished
+
+    var isLive: Bool { if case .live = self { return true }; return false }
 }
 
 // MARK: - Derived types
@@ -278,6 +386,7 @@ struct Pick {
 /// field was added, and silently dropped anything forgotten.
 struct Player: Identifiable, Hashable {
     var id = 0
+    var code = 0            // stable player code — the photo asset
     var name = ""
     var pos = 0
     var team = 0
@@ -324,6 +433,10 @@ struct Player: Identifiable, Hashable {
     // market
     var netTransfers = 0    // this gameweek's transfers in minus out
     var priceMomentum = 0.0 // -1 … +1, progress toward a fall or a rise
+    /// Nights until FPL's own model expects the price to change, and how
+    /// confident it is. Nil when no change is projected within three nights.
+    var priceChangeIn: Int?
+    var priceConfidence = 0.0   // 0…1
     var costChangeStart = 0 // price movement since the season opened
     var ictIndex = 0.0
     var threat = 0.0

@@ -23,6 +23,7 @@ enum DataCache {
 
     private static var bootURL: URL { dir.appendingPathComponent("bootstrap.json") }
     private static var fixturesURL: URL { dir.appendingPathComponent("fixtures.json") }
+    private static var pastURL: URL { dir.appendingPathComponent("pastform.json") }
 
     /// Decoded cached payload, or nil when there's nothing usable on disk.
     /// Runs off the main actor — decoding 1.3 MB is not free.
@@ -41,6 +42,25 @@ enum DataCache {
     static func write(boot: Data, fixtures: Data) {
         try? boot.write(to: bootURL, options: .atomic)
         try? fixtures.write(to: fixturesURL, options: .atomic)
+    }
+
+    // MARK: prior-season form
+    //
+    // Six hundred small requests, so this is cached hard: previous seasons are
+    // finished and cannot change. It is re-fetched only when the file is more
+    // than a week old, or when the squad list has moved on enough that a
+    // meaningful number of players are missing from it.
+
+    static func readPastForm() -> PastFormBook? {
+        guard let data = try? Data(contentsOf: pastURL),
+              let book = try? JSONDecoder().decode(PastFormBook.self, from: data),
+              !book.isEmpty else { return nil }
+        return book
+    }
+
+    static func write(pastForm book: PastFormBook) {
+        guard let data = try? JSONEncoder().encode(book) else { return }
+        try? data.write(to: pastURL, options: .atomic)
     }
 
     static var age: TimeInterval? {
@@ -72,6 +92,15 @@ enum FPLService {
         let fixtures = try dec.decode([APIFixture].self, from: f)
         DataCache.write(boot: b, fixtures: f)
         return (boot, fixtures)
+    }
+
+    /// Prior-season digests for every player. Cheap to keep, expensive to
+    /// rebuild, and the difference between a sane August projection and a
+    /// nonsense one.
+    static func fetchPastForm(ids: [Int]) async -> PastFormBook {
+        let book = await PastFormService.fetch(ids: ids, session: session)
+        if !book.isEmpty { DataCache.write(pastForm: book) }
+        return book
     }
 
     // MARK: - a manager's own team
@@ -129,6 +158,12 @@ enum FPLService {
         let usedLast = hist?.event_transfers ?? 0
         let fts = max(1, min(usedLast == 0 ? 2 : 1, 5))
 
+        let leagues = (summary.leagues?.classic ?? []).map {
+            LeagueSummary(id: $0.id, name: $0.name,
+                          rank: $0.entry_rank ?? 0, lastRank: $0.entry_last_rank ?? 0,
+                          size: $0.rank_count ?? 0, isGlobal: $0.league_type == "s")
+        }
+
         return TeamState(
             entryId: entryId,
             teamName: summary.name,
@@ -140,8 +175,16 @@ enum FPLService {
             chipsUsed: chipsUsed,
             overallPoints: summary.summary_overall_points ?? 0,
             overallRank: summary.summary_overall_rank ?? 0,
-            gw: pickGw, fetched: Date())
+            gw: pickGw, fetched: Date(),
+            picks: picks.squadPicks,
+            activeChip: picks.active_chip,
+            transferCost: hist?.event_transfers_cost ?? 0,
+            eventPoints: summary.summary_event_points,
+            leagues: leagues)
     }
+
+    /// Shared GET for the endpoints defined in other files.
+    static func get(_ url: String) async throws -> Data { try await getData(url) }
 
     private static func getData(_ url: String) async throws -> Data {
         var req = URLRequest(url: URL(string: url)!)
