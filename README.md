@@ -424,7 +424,18 @@ are kept. Three did:
   season to go on.** Points per appearance quietly knows the things the
   component model can't see: role, team quality, who takes the penalties. So the
   rate model earns its weight as real minutes accumulate instead of being handed
-  it.
+  it — except for midfielders, who are the one group where the component model
+  wins outright in all three seasons, because their points come from goals,
+  assists and defensive contributions the model sees directly while their role
+  changes more between seasons than anyone else's.
+
+Also tried, measured, and not kept: regressing predicted minutes toward the
+league mean (the regression that suggested it was right about the level and
+irrelevant to the ranking, which is monotone under it); and a penalty for a
+patchy minutes record, on the theory that a player with one injured season in
+three is the one who wrecks a frozen squad. It is a good story and it moves
+nothing — fifteen backtested squads and three seasons of rank correlation both
+say so.
 
 An age penalty on scoring rates looked like a consistent winner right up until
 the anchor was reweighted, after which the fitter stopped reaching for it —
@@ -456,6 +467,53 @@ allowed to act on it, at every threshold tested, because spending two transfers
 this week burns the banked one that next week's injury list would have spent
 better. The search is still there and still shown to you; the planner just
 doesn't take pairs on its own.
+
+### Actually playing the finished seasons (`bench --season`)
+
+The obvious question is what this would have scored. The honest answer is
+bounded by what FPL publishes: per-gameweek player data exists only for the
+season in progress. For finished seasons the API gives season totals and
+nothing else, so a week-by-week replay — transfers, captain changes, chips,
+automatic substitutions — is not possible, and a number claiming to be one
+would be invented.
+
+What *is* possible is a real backtest of the decision the data supports: pick a
+squad before the season from earlier seasons only, pick the eleven and the
+captain on projections and never on hindsight, and count what those players
+really scored. No transfers, no chips, one captain all year.
+
+| same frozen-squad rules | mean over three seasons |
+|---|---|
+| **the model** | **1571** |
+| ranked on last season's points | 1464 |
+| the most expensive squad affordable | 1391 |
+| perfect hindsight | 2307 |
+
+So the model is worth about a hundred points a season over the obvious
+heuristic, and takes 68% of what a frozen squad could theoretically have taken.
+
+**But that format is not the game.** Even played *perfectly* — the best fifteen
+anyone could have bought, with hindsight — a frozen squad finishes around rank
+605k, 2.5m and 60k in the three seasons. Never transferring is not a route to a
+good rank no matter how good the squad is, and the reason is in one line of the
+report:
+
+> the fifteen were expected to play 85% of the available minutes and played 70%
+
+A sixth of a squad's season evaporates into injuries and lost places. That is
+what transfers are for. Calibrating the season simulator until its squads lose
+minutes at the same rate the real ones did (an injury every eleven gameweeks per
+player) and then turning transfers on is worth **+139 ± 9 points a season**, and
+chips, weekly captaincy and weekly bench decisions are on top of that and are
+not modelled at all. Which is why no rank is claimed here for full play: the
+parts of the game that close the gap are exactly the parts the public API cannot
+replay.
+
+Two more caveats that make the backtest *harsher* than reality: it blanks
+`status` and `chance_of_playing`, so the model buys players FPL had already
+flagged as injured, which the app never would; and past-season fixture lists
+aren't published either, so every projection in the backtest is made against a
+league-average opponent with none of the fixture model switched on.
 
 ### Testing the engine without a simulator
 

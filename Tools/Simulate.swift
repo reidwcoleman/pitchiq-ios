@@ -44,8 +44,27 @@ struct SeasonSim {
 
     /// Injuries are the reason transfers exist. Without them a squad picked in
     /// August is optimal in May and every policy scores the same.
-    static let injuryChancePerGw = 0.035
-    static let injuryLengthMean = 3.4
+    static var injuryChancePerGw = 0.035
+    static var injuryLengthMean = 3.4
+
+    /// The share of the minutes a squad was expected to play that it actually
+    /// plays, under the current injury settings. Real squads land near 0.82 —
+    /// the historical backtest shows fifteen players expected to cover 85% of
+    /// the available minutes covering 70% — so this is what the simulator is
+    /// calibrated against.
+    func realisedMinuteShare(seeds: Int = 40) -> Double {
+        var expected = 0.0, got = 0.0
+        for s in 0..<seeds {
+            let truth = draw(seed: UInt64(bitPattern: Int64(s &* 2862933555777941757 &+ 3)))
+            for (row, p) in players.enumerated() where p.playProb > 0.4 && p.expMins > 45 {
+                for w in 0..<(end - from + 1) {
+                    expected += p.playProb
+                    got += truth.played[row][w] ? 1 : 0
+                }
+            }
+        }
+        return expected > 0 ? got / expected : 0
+    }
 
     func draw(seed: UInt64) -> Truth {
         var rng = SeededRandom(seed: seed)

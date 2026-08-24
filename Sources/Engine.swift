@@ -386,6 +386,30 @@ struct Tuning: Equatable {
     /// Weighted gameweeks of recent evidence at which the last few matches
     /// carry as much weight as the whole season behind them.
     var recentMinutesHalf = 1.6
+    /// Minutes regress to the mean hard, and the model was not regressing them
+    /// at all. Fitted against three replayed seasons: a player's own record is
+    /// worth about as much as the population average once he has this many
+    /// weighted gameweeks behind him. Zero switches the shrinkage off.
+    var minutesShrinkGames = 0.0
+    /// How much a patchy minutes record counts against a player. Two players
+    /// can average the same minutes over three seasons and be nothing alike:
+    /// one played every week three years running, the other had a long injury
+    /// and two good years around it. It is a good story and it does not work —
+    /// measured across three replayed seasons and fifteen backtested squads it
+    /// moves nothing, and it costs a little rank correlation. Left in, switched
+    /// off, so the next person does not have to find that out again.
+    var durabilityPenalty = 0.0
+    var minutesShrinkStart = 0.45      // population mean start share
+    var minutesShrinkMins = 0.50       // population mean share of 90 minutes
+    /// The rate model earns its weight differently by position: a keeper's
+    /// score is almost entirely fixture, a forward's almost entirely himself.
+    /// Indexed by position. Midfielders are the one group where the component
+    /// model clearly beats the points-per-appearance anchor out of sample, in
+    /// all three replayed seasons — their points come from goals, assists and
+    /// defensive contributions, which the model sees directly, while their
+    /// role varies more between seasons than anyone else's, which is exactly
+    /// what makes their own history less reliable.
+    var modelShareByPos: [Double]? = [0.32, 0.32, 0.32, 0.70, 0.32]
     /// Minutes fall away at the end of a career faster than finishing does.
     var minutesPeakAge = 29.0
     var minutesAgePenalty = 0.0
@@ -552,6 +576,20 @@ struct ProjectionEngine {
         return Double(tuning.seasonYearOverride ?? seasonStartYear) - year
     }
 
+    /// A player's minutes record read as steadiness rather than as a level.
+    /// Returns a multiplier on the minutes prior: 1 for someone whose seasons
+    /// look alike, less for someone whose don't.
+    func durability(_ history: PastForm) -> Double {
+        guard tuning.durabilityPenalty > 0 else { return 1 }
+        let mins = history.lines.prefix(3).map(\.minutes)
+        guard mins.count >= 2 else { return 1 }
+        let mean = mins.reduce(0, +) / Double(mins.count)
+        guard mean > 200 else { return 1 }
+        let variance = mins.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(mins.count)
+        let cv = variance.squareRoot() / mean
+        return max(1 - tuning.durabilityPenalty * min(cv, 1.2), 0.5)
+    }
+
     /// Minutes fall away at the end of a career sooner and harder than
     /// finishing does — a thirty-four-year-old who scored every other week last
     /// season will still score, but he will start twenty games instead of
@@ -635,8 +673,9 @@ struct ProjectionEngine {
         // far faster than it changes finishing.
         let sScale = tuning.minutesPriorScale * lam * minutesDamp(p)
         let pGames = pastMins.seasons * 38 * sScale
-        let pStarts = pastMins.starts * sScale * minutesAgeScale(of: p)
-        let pMinsG = pastMins.minutes * sScale * minutesAgeScale(of: p)
+        let minutesTrust = minutesAgeScale(of: p) * durability(history)
+        let pStarts = pastMins.starts * sScale * minutesTrust
+        let pMinsG = pastMins.minutes * sScale * minutesTrust
         let effGames = games + pGames
         let effStarts = starts + pStarts
         let effMinsG = mins + pMinsG
@@ -653,6 +692,17 @@ struct ProjectionEngine {
         // has started thirty and is still first choice; the last six gameweeks
         // can, and that distinction is worth more than any refinement of the
         // scoring rates.
+        // Regression to the mean. Ninety minutes last April is not a promise
+        // about next August, and the previous model treated it as one: it read
+        // a player's own record straight off, which out of sample is worse than
+        // the same record pulled a little toward what a squad player typically
+        // does.
+        if tuning.minutesShrinkGames > 0 {
+            let w = effGames / (effGames + tuning.minutesShrinkGames)
+            startRate = w * startRate + (1 - w) * tuning.minutesShrinkStart
+            mpg = w * mpg + (1 - w) * tuning.minutesShrinkMins * 90
+        }
+
         if let lately = recent.read(p.id), lately.evidence > 0 {
             let w = lately.evidence / (lately.evidence + tuning.recentMinutesHalf)
             startRate = w * lately.startRate + (1 - w) * startRate
@@ -799,8 +849,10 @@ struct ProjectionEngine {
         r.ppg = pooledPoints / apps
         r.form = Double(p.form ?? "") ?? 0
         r.epNext = Double(p.ep_next ?? "") ?? 0
-        r.modelShare = tuning.modelShare
-            + (tuning.modelShareFull - tuning.modelShare) * min(mins / 900, 1)
+        let coldShare = tuning.modelShareByPos.map { $0[min(pos, $0.count - 1)] }
+            ?? tuning.modelShare
+        r.modelShare = coldShare
+            + (tuning.modelShareFull - coldShare) * min(mins / 900, 1)
         r.formShare = 0.28 * min(games / 4, 1)
 
         // ---- form

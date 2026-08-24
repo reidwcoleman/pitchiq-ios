@@ -185,13 +185,19 @@ struct Eval {
             spend += swap.into.cost - chosen[swap.out].cost
             chosen[swap.out] = swap.into
         }
-        // Only eleven score in any week; approximate a season of best XIs by
-        // taking the eleven with the highest actual return under a legal shape.
-        let xi = bestEleven(chosen)
-        return (xi.reduce(0) { $0 + $1.actual }, xi.sorted { $0.actual > $1.actual }.prefix(4).map(\.name))
+        // The eleven is chosen on the ranking under test, not on what happened
+        // — picking it with hindsight flatters every ranking equally and tells
+        // you nothing about which is better.
+        let xi = bestEleven(chosen, by: score)
+        let named = xi.sorted { score($0) > score($1) }.prefix(4).map { $0.name }
+        return (xi.reduce(0) { $0 + $1.actual }, Array(named))
     }
 
     static func bestEleven(_ squad: [Case]) -> [Case] {
+        bestEleven(squad, by: { $0.actual })
+    }
+
+    static func bestEleven(_ squad: [Case], by rank: (Case) -> Double) -> [Case] {
         var best: [Case] = []
         var bestTotal = -1.0
         for defs in 3...5 {
@@ -199,12 +205,12 @@ struct Eval {
                 let fwds = 10 - defs - mids
                 guard fwds >= 1, fwds <= 3 else { continue }
                 var xi: [Case] = []
-                xi += squad.filter { $0.pos == 1 }.sorted { $0.actual > $1.actual }.prefix(1)
-                xi += squad.filter { $0.pos == 2 }.sorted { $0.actual > $1.actual }.prefix(defs)
-                xi += squad.filter { $0.pos == 3 }.sorted { $0.actual > $1.actual }.prefix(mids)
-                xi += squad.filter { $0.pos == 4 }.sorted { $0.actual > $1.actual }.prefix(fwds)
+                xi += squad.filter { $0.pos == 1 }.sorted { rank($0) > rank($1) }.prefix(1)
+                xi += squad.filter { $0.pos == 2 }.sorted { rank($0) > rank($1) }.prefix(defs)
+                xi += squad.filter { $0.pos == 3 }.sorted { rank($0) > rank($1) }.prefix(mids)
+                xi += squad.filter { $0.pos == 4 }.sorted { rank($0) > rank($1) }.prefix(fwds)
                 guard xi.count == 11 else { continue }
-                let total = xi.reduce(0) { $0 + $1.actual }
+                let total = xi.reduce(0) { rank($1) + $0 }
                 if total > bestTotal { bestTotal = total; best = xi }
             }
         }
@@ -366,6 +372,15 @@ struct Eval {
 
     func objective(_ t: Tuning) -> Double { score(t, on: Self.seasons) }
 
+    static func setPos(_ t: inout Tuning, _ pos: Int, _ v: Double) {
+        var list = t.modelShareByPos ?? [Double](repeating: t.modelShare, count: 5)
+        list[pos] = v
+        t.modelShareByPos = list
+    }
+    static func readPos(_ t: Tuning, _ pos: Int) -> Double {
+        t.modelShareByPos?[pos] ?? t.modelShare
+    }
+
     struct Knob {
         let name: String
         let values: [Double]
@@ -390,6 +405,18 @@ struct Eval {
              apply: { $0.modelShare = $1 }, read: { $0.modelShare }),
         Knob(name: "ageFloor", values: [0.55, 0.65, 0.72, 0.82, 0.9],
              apply: { $0.ageFloor = $1 }, read: { $0.ageFloor }),
+        Knob(name: "durabilityPenalty", values: [0.0, 0.1, 0.2, 0.35, 0.5, 0.7],
+             apply: { $0.durabilityPenalty = $1 }, read: { $0.durabilityPenalty }),
+        Knob(name: "minutesShrinkGames", values: [0, 4, 8, 14, 22, 34, 50],
+             apply: { $0.minutesShrinkGames = $1 }, read: { $0.minutesShrinkGames }),
+        Knob(name: "modelShare GK", values: [0.0, 0.15, 0.32, 0.5, 0.7, 0.9],
+             apply: { setPos(&$0, 1, $1) }, read: { readPos($0, 1) }),
+        Knob(name: "modelShare DEF", values: [0.0, 0.15, 0.32, 0.5, 0.7, 0.9],
+             apply: { setPos(&$0, 2, $1) }, read: { readPos($0, 2) }),
+        Knob(name: "modelShare MID", values: [0.0, 0.15, 0.32, 0.5, 0.7, 0.9],
+             apply: { setPos(&$0, 3, $1) }, read: { readPos($0, 3) }),
+        Knob(name: "modelShare FWD", values: [0.0, 0.15, 0.32, 0.5, 0.7, 0.9],
+             apply: { setPos(&$0, 4, $1) }, read: { readPos($0, 4) }),
         Knob(name: "minutesPriorScale", values: [0.4, 0.5, 0.6, 0.75, 0.9, 1.0],
              apply: { $0.minutesPriorScale = $1 }, read: { $0.minutesPriorScale }),
         Knob(name: "agePenalty", values: [0.0, 0.04, 0.08, 0.11, 0.15, 0.22, 0.30],

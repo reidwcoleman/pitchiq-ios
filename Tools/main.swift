@@ -150,6 +150,81 @@ if CommandLine.arguments.contains("--tune") {
     exit(0)
 }
 
+if CommandLine.arguments.contains("--fullplay") {
+    let gw = boot.events.first { $0.is_next }?.id ?? 2
+    let eng = ProjectionEngine(boot: boot, fixtures: fixtures, gwFrom: gw, horizon: 6, pastForm: book)
+    let all = eng.buildPlayers(totalManagers: boot.total_players ?? 11_000_000)
+    guard let opening = Optimizer.optimize(players: all, budgetM: 100, fitOnly: true) else { exit(1) }
+
+    // Calibrate the injury model against what really happened: across three
+    // backtested seasons a squad expected to cover 85% of the available
+    // minutes covered about 70%, so a realised share near 0.82 of expectation.
+    print("\n=== calibrating the simulator's injuries to the historical record ===")
+    var chosen = SeasonSim.injuryChancePerGw
+    for rate in [0.01, 0.02, 0.035, 0.05, 0.07, 0.09, 0.12] {
+        SeasonSim.injuryChancePerGw = rate
+        let sim = SeasonSim(players: all, from: gw, end: 38)
+        let share = sim.realisedMinuteShare()
+        print(String(format: "  injury chance %.3f/GW → squads play %.0f%% of the minutes expected of them", rate, share * 100))
+        if abs(share - 0.82) < abs({ () -> Double in
+            SeasonSim.injuryChancePerGw = chosen
+            return SeasonSim(players: all, from: gw, end: 38).realisedMinuteShare()
+        }() - 0.82) { chosen = rate }
+        SeasonSim.injuryChancePerGw = rate
+    }
+    SeasonSim.injuryChancePerGw = chosen
+    print(String(format: "  using %.3f", chosen))
+
+    print("\n=== what the machinery the backtest could not use is worth ===")
+    PolicyBench.compare(players: all, start: opening.squad.map(\.id), budget: 1000,
+                        from: gw, end: 38, seasons: 400, rules: [
+                            PolicyBench.Rule(name: "frozen squad, as backtested", usePairs: false,
+                                             maxMoves: 0, enabled: false),
+                            PolicyBench.Rule(name: "transfers, as the app plans them",
+                                             usePairs: false, maxMoves: 4),
+                        ])
+    exit(0)
+}
+
+if CommandLine.arguments.contains("--seasonsweep") {
+    let raw = try! JSONSerialization.jsonObject(with: data("bootstrap.json")) as! [String: Any]
+    let eval = Eval(bootJSON: raw, boot: boot, fixtures: fixtures, rawPast: rawPast)
+    let back = Backtest(eval: eval)
+    print("\n  15 squads per setting: three seasons × five budgets")
+    print("  knob / value       season points ± se     rho    top50")
+    for knob in Eval.knobs {
+        var any = false
+        for value in knob.values {
+            var t = Tuning.default
+            knob.apply(&t, value)
+            let m = back.meanPoints(tuning: t)
+            guard m.points > 0 else { continue }
+            var rhos: [Double] = [], tops: [Double] = []
+            for season in Eval.seasons {
+                let s = eval.measure(t, on: season)
+                rhos.append(s.rho); tops.append(s.top50)
+            }
+            if !any { print("\n\(knob.name)  (shipped \(knob.read(.default)))"); any = true }
+            let mark = value == knob.read(.default) ? "  <- shipped" : ""
+            print(String(format: "  %8.3f            %6.0f ± %4.0f      %.3f  %.3f%@", value,
+                         m.points, m.spread,
+                         rhos.reduce(0,+) / Double(rhos.count),
+                         tops.reduce(0,+) / Double(tops.count), mark as NSString))
+        }
+    }
+    exit(0)
+}
+
+if CommandLine.arguments.contains("--season") {
+    let raw = try! JSONSerialization.jsonObject(with: data("bootstrap.json")) as! [String: Any]
+    let eval = Eval(bootJSON: raw, boot: boot, fixtures: fixtures, rawPast: rawPast)
+    let curveJSON = (try? JSONSerialization.jsonObject(with: data("rankcurve.json")))
+        as? [String: [[Int]]] ?? [:]
+    Backtest(eval: eval).report(tuning: .default,
+                                curve: Backtest.RankCurve(json: curveJSON))
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--eval") {
     let raw = try! JSONSerialization.jsonObject(with: data("bootstrap.json")) as! [String: Any]
     let eval = Eval(bootJSON: raw, boot: boot, fixtures: fixtures, rawPast: rawPast)
