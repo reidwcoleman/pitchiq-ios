@@ -177,9 +177,19 @@ final class AppState: ObservableObject {
     var matchesInPlay: Bool { liveFixtures.contains { $0.liveState.isLive } }
 
     /// Live points for the whole gameweek, refreshed while matches are on.
+    ///
+    /// Once every match in a round is over its points are final, so there is
+    /// nothing to fetch until the next round kicks off — this used to pull the
+    /// whole payload again on every launch and every return to the app.
     func refreshLive() async {
         guard boot != nil, !liveRefreshing else { return }
         let gw = liveGw
+        let settled = !live.isEmpty && live.gw == gw && !matchesInPlay
+            && liveFixtures.allSatisfy { $0.liveState == .finished }
+        if settled, Date().timeIntervalSince(live.fetched) < 6 * 3600 {
+            if Self.verbose { print("[feeds] live: GW\(gw) is finished, nothing to fetch") }
+            return
+        }
         liveRefreshing = true
         defer { liveRefreshing = false }
         guard let payload = try? await FPLService.fetchLive(gw: gw) else { return }
@@ -216,8 +226,14 @@ final class AppState: ObservableObject {
     // MARK: - loading
 
     /// Draw from disk first, and only go to the network when the cache is
-    /// actually stale. A cold launch used to download 1.3 MB and re-decode it
-    /// before showing anything, every single time.
+    /// actually stale.
+    ///
+    /// The three background feeds — live scores, recent minutes, prior seasons
+    /// — used to be awaited one after another, each finishing with its own full
+    /// rebuild. A cold launch therefore ran the 38-gameweek planner four times
+    /// and pulled about thirteen megabytes, most of it data it already had. Now
+    /// they run together, off the path to first paint, and the work they cause
+    /// is coalesced into a single rebuild at the end.
     func load() async {
         if boot == nil {
             let cached = await Task.detached(priority: .userInitiated) {
@@ -233,6 +249,7 @@ final class AppState: ObservableObject {
         // FPL prices move once a day and injury news a few times a day; a
         // fifteen-minute cache costs nothing and removes the wait entirely.
         if age > 15 * 60 { await refresh() }
+
         // testing hook, alongside `-tab`: launch with `-entry N` to connect a
         // team without typing an id into the simulator
         let args = ProcessInfo.processInfo.arguments
@@ -240,47 +257,67 @@ final class AppState: ObservableObject {
            let id = Int(args[i + 1]), team?.entryId != id {
             await connect(entryId: id)
         }
-        await refreshLive()
-        await refreshRecentMinutesIfNeeded()
-        await refreshPastFormIfNeeded()
+
+        await backgroundFeeds()
     }
 
-    /// One request per recent gameweek, and only when the gameweek has moved
-    /// on — the answer cannot change until a match is played.
-    private func refreshRecentMinutesIfNeeded() async {
+    /// Everything that can happen after the screen is already drawn, in
+    /// parallel, with one rebuild between them all.
+    private func backgroundFeeds() async {
+        guard boot != nil else { return }
+        async let live: Void = refreshLive()
+        async let minutes = fetchRecentMinutesIfNeeded()
+        async let past = fetchPastFormIfNeeded()
+        let (_, newMinutes, newPast) = await (live, minutes, past)
+
+        var changed = false
+        if let newMinutes { recentMinutes = newMinutes; changed = true }
+        if let newPast { pastForm = newPast; changed = true }
+        if Self.verbose {
+            print("[feeds] recent minutes \(newMinutes == nil ? "already current" : "topped up to GW\(newMinutes!.throughGw)"), "
+                  + "prior seasons \(newPast == nil ? "already complete" : "now \(newPast!.byId.count) players"), "
+                  + "rebuild \(changed ? "queued" : "not needed")")
+        }
+        guard changed else { return }
+        engine = nil
+        engineGw = nil
+        modelPlayers = []
+        cachedPlanKey = nil
+        rebuild()
+    }
+
+    /// One request per gameweek the table is missing, which after a normal week
+    /// is none and after a round ends is one.
+    private func fetchRecentMinutesIfNeeded() async -> RecentMinutes? {
         let latest = liveGw
-        guard latest >= 1, recentMinutes.throughGw < latest || recentMinutes.isEmpty else { return }
-        let fetched = await FPLService.fetchRecentMinutes(through: latest)
-        guard !fetched.isEmpty else { return }
-        recentMinutes = fetched
+        guard latest >= 1, let year = seasonYear else { return nil }
+        guard let fetched = await FPLService.topUpRecentMinutes(recentMinutes, through: latest,
+                                                               season: year) else { return nil }
         DataCache.write(recent: fetched)
-        engine = nil
-        engineGw = nil
-        modelPlayers = []
-        cachedPlanKey = nil
-        rebuild()
+        return fetched
     }
 
-    /// Six hundred requests, so this runs at most once a week — and once
-    /// whenever the player list has moved on far enough that the cache no
-    /// longer covers it (a January window, or a fresh install mid-season).
-    private func refreshPastFormIfNeeded() async {
-        guard let boot else { return }
+    /// Only the players the book has never been asked about. Previous seasons
+    /// are finished, so once a player is in the book he never needs fetching
+    /// again — this is six hundred requests on a fresh install and a handful in
+    /// January.
+    private func fetchPastFormIfNeeded() async -> PastFormBook? {
+        guard let boot, let year = seasonYear else { return nil }
         let ids = boot.elements.map(\.id)
-        let covered = ids.filter { pastForm[$0] != nil }.count
-        let stale = Date().timeIntervalSince(pastForm.built) > 7 * 24 * 3600
-        // Roughly a fifth of any squad list is academy players with no senior
-        // record, so full coverage is never expected — half is the signal that
-        // the cache is genuinely for a different season.
-        guard stale || Double(covered) < Double(ids.count) * 0.5 else { return }
-        let book = await FPLService.fetchPastForm(ids: ids)
-        guard !book.isEmpty else { return }
-        pastForm = book
-        engine = nil
-        engineGw = nil
-        modelPlayers = []
-        cachedPlanKey = nil
-        rebuild()
+        let wanted = pastForm.outstanding(ids, season: year)
+        guard !wanted.isEmpty else { return nil }
+        let book = await FPLService.fetchPastForm(ids: wanted, into: pastForm, season: year)
+        return book.isEmpty ? nil : book
+    }
+
+    /// `-verbose` prints what the background feeds actually did, which is the
+    /// only way to see that a launch fetched nothing.
+    static let verbose = ProcessInfo.processInfo.arguments.contains("-verbose")
+
+    /// The calendar year this season kicked off in.
+    var seasonYear: Int? {
+        guard let first = boot?.events.min(by: { $0.id < $1.id })?.deadline_time else { return nil }
+        return Int(first.prefix(4))
     }
 
     /// Fetch live data. Keeps whatever is on screen if the network fails.
@@ -316,10 +353,15 @@ final class AppState: ObservableObject {
         rebuild()
     }
 
+    /// Coming back to the app. Refresh the core payloads if they have gone
+    /// stale, then let the background feeds decide whether they need anything —
+    /// which, most of the time, is nothing at all.
     func refreshIfStale() {
-        Task { await refreshLive() }
-        guard let last = lastUpdated, Date().timeIntervalSince(last) > 15 * 60 else { return }
-        Task { await refresh() }
+        Task {
+            let stale = lastUpdated.map { Date().timeIntervalSince($0) > 15 * 60 } ?? true
+            if stale { await refresh() }
+            await backgroundFeeds()
+        }
     }
 
     // MARK: - connecting an FPL team

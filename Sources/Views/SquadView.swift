@@ -259,6 +259,15 @@ struct ActionCard: View {
                     .font(.system(size: 12)).foregroundColor(Theme.inkDim)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if isFirst, state.isConnected, !gwPlan.transfers.isEmpty {
+                HandoffButton(
+                    summary: gwPlan.transfers
+                        .map { "\($0.out.name) → \($0.inn.name)" }
+                        .joined(separator: ", "),
+                    title: gwPlan.chip == nil ? "Make it in FPL" : "Open FPL",
+                    accent: accent)
+                    .padding(.top, 2)
+            }
             if isFirst && !state.isConnected {
                 Text("Connect your FPL team in Settings and this becomes advice on your own fifteen instead of a suggested squad.")
                     .font(.system(size: 11.5)).foregroundColor(Theme.inkDim)

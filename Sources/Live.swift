@@ -259,15 +259,22 @@ extension FPLService {
 // gameweek does.
 
 struct RecentMinutes: Codable {
-    /// player id → minutes, most recent gameweek first
-    var byId: [Int: [Int]] = [:]
-    var throughGw = 0
-    var gameweeks = 0
+    /// player id → gameweek → minutes. Keyed by gameweek rather than by
+    /// position in a list, which is what makes it possible to keep what we
+    /// already have and fetch only what we don't.
+    var byId: [Int: [Int: Int]] = [:]
+    /// The gameweeks held, most recent first.
+    var gws: [Int] = []
+    /// Which season this belongs to, so a new one starts clean.
+    var season = 0
 
-    var isEmpty: Bool { byId.isEmpty || gameweeks == 0 }
+    var throughGw: Int { gws.first ?? 0 }
+    var isEmpty: Bool { byId.isEmpty || gws.isEmpty }
 
-    /// How much of a 90-minute match the player has averaged lately, and how
-    /// often he has started, with the most recent weeks counting most.
+    /// How many weeks back the rotation signal is worth carrying.
+    static let window = 6
+
+    /// The weight on each gameweek back from the most recent one.
     static let weights: [Double] = [1.0, 0.82, 0.66, 0.5, 0.36, 0.24]
 
     struct Read {
@@ -277,11 +284,12 @@ struct RecentMinutes: Codable {
     }
 
     func read(_ id: Int) -> Read? {
-        guard let mins = byId[id], !mins.isEmpty else { return nil }
+        guard let mins = byId[id], !mins.isEmpty, !gws.isEmpty else { return nil }
         var out = Read()
         var total = 0.0
-        for (i, m) in mins.enumerated() {
+        for (i, gw) in gws.enumerated() {
             guard i < Self.weights.count else { break }
+            let m = mins[gw] ?? 0
             let w = Self.weights[i]
             total += w
             // 60 minutes is the line the game itself draws, and it separates a
@@ -295,33 +303,58 @@ struct RecentMinutes: Codable {
         out.evidence = total
         return out
     }
+
+    /// Which gameweeks are missing, given where the season has got to. After a
+    /// gameweek ends this is one week, not six — the previous version threw the
+    /// whole table away and re-downloaded 2.6 MB every time the round changed.
+    func missing(through gw: Int, season: Int) -> [Int] {
+        guard season == self.season else {
+            return Array(stride(from: gw, through: max(gw - Self.window + 1, 1), by: -1))
+        }
+        let held = Set(gws)
+        return stride(from: gw, through: max(gw - Self.window + 1, 1), by: -1)
+            .filter { !held.contains($0) }
+    }
+
+    mutating func absorb(gw: Int, minutes: [Int: Int]) {
+        for (id, m) in minutes { byId[id, default: [:]][gw] = m }
+        if !gws.contains(gw) { gws.append(gw) }
+        gws.sort(by: >)
+        // Forget anything past the window, including the players who only
+        // appear in it, so the file cannot grow across a season.
+        let keep = Set(gws.prefix(Self.window))
+        gws = gws.filter { keep.contains($0) }
+        for (id, weeks) in byId {
+            let trimmed = weeks.filter { keep.contains($0.key) }
+            if trimmed.isEmpty { byId.removeValue(forKey: id) } else { byId[id] = trimmed }
+        }
+    }
 }
 
 extension FPLService {
-    /// Per-gameweek minutes for the whole league over the last few gameweeks.
-    /// Six requests, and only when the gameweek has moved on.
-    static func fetchRecentMinutes(through gw: Int, weeks: Int = 6) async -> RecentMinutes {
-        var out = RecentMinutes()
-        out.throughGw = gw
-        let range = stride(from: gw, through: max(gw - weeks + 1, 1), by: -1)
-        for (offset, g) in range.enumerated() {
+    /// Top the table up to `gw`, fetching only the gameweeks it does not
+    /// already hold — one request after a round ends, none the rest of the
+    /// week, and all six only on a fresh install or a new season.
+    static func topUpRecentMinutes(_ existing: RecentMinutes, through gw: Int,
+                                   season: Int) async -> RecentMinutes? {
+        let wanted = existing.missing(through: gw, season: season)
+        guard !wanted.isEmpty else { return nil }
+        var out = existing.season == season ? existing : RecentMinutes()
+        out.season = season
+        var gained = false
+        for g in wanted {
             guard let payload = try? await fetchLive(gw: g) else { continue }
-            var any = false
-            for element in payload.elements where element.stats.minutes > 0 || element.stats.starts > 0 {
-                any = true
-                var row = out.byId[element.id] ?? []
-                while row.count < offset { row.append(0) }
-                row.append(element.stats.minutes)
-                out.byId[element.id] = row
+            var minutes: [Int: Int] = [:]
+            for element in payload.elements where element.stats.minutes > 0 {
+                minutes[element.id] = element.stats.minutes
             }
-            // A gameweek nobody has played yet is not evidence of anything.
-            if any { out.gameweeks += 1 } else { break }
+            // A gameweek nobody has played yet is not evidence of anything —
+            // skip it rather than stopping, or a round that has had its
+            // deadline but not its kick-off would hide the weeks before it.
+            guard !minutes.isEmpty else { continue }
+            out.absorb(gw: g, minutes: minutes)
+            gained = true
         }
-        // Pad the players who missed a week entirely, so position in the array
-        // still means "how many gameweeks ago".
-        for (id, row) in out.byId where row.count < out.gameweeks {
-            out.byId[id] = row + [Int](repeating: 0, count: out.gameweeks - row.count)
-        }
-        return out
+        return gained ? out : nil
     }
 }

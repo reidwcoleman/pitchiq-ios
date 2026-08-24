@@ -71,6 +71,42 @@ every number is set in tabular figures so columns stop shivering as they update,
 and the loading state is the shape of the screen that is coming rather than a
 spinner on an empty page.
 
+### What it fetches, and when
+
+A cold launch used to pull about thirteen megabytes across six hundred and
+twenty requests, then run the 38-gameweek planner four times as each feed
+landed. Almost all of it was data the app already had.
+
+| feed | before | now |
+|---|---|---|
+| bootstrap + fixtures | every 15 min | unchanged (gzips to ~130 KB) |
+| live scores | every launch and every return | only while a round is unfinished |
+| recent minutes | six gameweeks re-downloaded whenever the round changed | only the gameweeks missing — one after a round ends, none the rest of the week |
+| prior seasons | all 609 players, weekly | only players never asked about: 609 once, then a handful in January |
+| rebuilds per launch | up to four | one, and none at all when nothing arrived |
+
+Previous seasons are finished and cannot change, so there is no such thing as a
+stale entry — only a missing one. The book records which ids came back with no
+senior record too, or every academy player is re-requested for ever. A warm
+launch now fetches nothing beyond the fifteen-minute price refresh and rebuilds
+nothing; `-verbose` prints what the feeds actually did, which is the only way to
+see a launch do no work.
+
+### Making the transfer
+
+It can't, and it won't pretend otherwise. FPL's read endpoints are open —
+everything here comes from them without a login — but `/api/transfers/` and
+`/api/my-team/{id}/` both answer 403 without a session cookie, and there is no
+OAuth, token exchange or developer programme to get one. The only way a
+third-party app can post a transfer is to take your Premier League password,
+sign in as you and hold the session: credential harvesting whatever the
+intention, against the game's terms, and one login change away from stranding
+everyone using it.
+
+So the button copies the move and opens the official transfer page, where you
+make it yourself. Universal links hand off to the FPL app when it's installed.
+Two taps instead of one, and nobody types their password into this.
+
 ### Connect your team
 
 Settings → paste your FPL team ID (the number in

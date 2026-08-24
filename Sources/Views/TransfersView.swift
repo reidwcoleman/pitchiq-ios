@@ -60,13 +60,25 @@ struct TransfersView: View {
                 verdictCard(board.holdReason, color: Theme.cyan, icon: "tray.and.arrow.down.fill",
                             title: "Recommendation: hold")
             } else if let best = board.bestSingle {
-                verdictCard(
-                    "\(best.out.name) → \(best.inn.name) is the strongest single move available: "
-                    + String(format: "+%.1f points on your starting eleven over the next %d gameweeks, +%.1f across the next %d.",
-                             best.gainWeighted, Planner.transferLookahead,
-                             best.gainWindow, state.horizon),
-                    color: Theme.lime, icon: "arrow.left.arrow.right",
-                    title: "Recommendation: make one transfer")
+                VStack(alignment: .leading, spacing: Theme.Space.m) {
+                    verdictCard(
+                        "\(best.out.name) → \(best.inn.name) is the strongest single move available: "
+                        + (Planner.transferLookahead == state.horizon
+                           ? String(format: "+%.1f points on your starting eleven over the next %d gameweeks.",
+                                    best.gainWeighted, state.horizon)
+                           : String(format: "+%.1f points on your starting eleven over the next %d gameweeks, +%.1f across the next %d.",
+                                    best.gainWeighted, Planner.transferLookahead,
+                                    best.gainWindow, state.horizon)),
+                        color: Theme.lime, icon: "arrow.left.arrow.right",
+                        title: "Recommendation: make one transfer")
+                    if state.isConnected {
+                        VStack(alignment: .leading, spacing: Theme.Space.s) {
+                            HandoffButton(summary: "\(best.out.name) → \(best.inn.name)")
+                            HandoffNote()
+                        }
+                        .padding(.horizontal, 2)
+                    }
+                }
             }
 
             hitCard

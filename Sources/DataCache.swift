@@ -24,7 +24,9 @@ enum DataCache {
     private static var bootURL: URL { dir.appendingPathComponent("bootstrap.json") }
     private static var fixturesURL: URL { dir.appendingPathComponent("fixtures.json") }
     private static var pastURL: URL { dir.appendingPathComponent("pastform.json") }
-    private static var recentURL: URL { dir.appendingPathComponent("recentminutes.json") }
+    // v2: the table is keyed by gameweek now, so old files are ignored rather
+    // than migrated — it is a cache, and the cost of a miss is one request.
+    private static var recentURL: URL { dir.appendingPathComponent("recentminutes2.json") }
 
     /// Decoded cached payload, or nil when there's nothing usable on disk.
     /// Runs off the main actor — decoding 1.3 MB is not free.
@@ -110,8 +112,10 @@ enum FPLService {
     /// Prior-season digests for every player. Cheap to keep, expensive to
     /// rebuild, and the difference between a sane August projection and a
     /// nonsense one.
-    static func fetchPastForm(ids: [Int]) async -> PastFormBook {
-        let book = await PastFormService.fetch(ids: ids, session: session)
+    static func fetchPastForm(ids: [Int], into existing: PastFormBook,
+                              season: Int) async -> PastFormBook {
+        let book = await PastFormService.fetch(ids: ids, into: existing,
+                                               season: season, session: session)
         if !book.isEmpty { DataCache.write(pastForm: book) }
         return book
     }

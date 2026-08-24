@@ -200,9 +200,24 @@ struct PastForm: Codable {
 struct PastFormBook: Codable {
     var byId: [Int: PastForm] = [:]
     var built = Date.distantPast
+    /// The season these ids belong to. Element ids are reassigned every July,
+    /// so a change here is the one event that invalidates the whole book.
+    var season = 0
+    /// Ids already asked about that came back with no senior record. Without
+    /// this, every academy player is re-requested for ever.
+    var barren: Set<Int> = []
 
     subscript(id: Int) -> PastForm? { byId[id] }
     var isEmpty: Bool { byId.isEmpty }
+
+    /// Who we still need to ask about. Previous seasons are finished and
+    /// cannot change, so this is the entire squad list once and then only the
+    /// players who have arrived since — the old code re-downloaded all six
+    /// hundred every week for data that was identical every time.
+    func outstanding(_ ids: [Int], season: Int) -> [Int] {
+        guard season == self.season else { return ids }
+        return ids.filter { byId[$0] == nil && !barren.contains($0) }
+    }
 }
 
 // MARK: - Fetching
@@ -212,8 +227,10 @@ enum PastFormService {
     /// digest. ~600 small requests; run eight at a time so it finishes in about
     /// ten seconds on a phone, and cache the result for a week — previous seasons
     /// do not change.
-    static func fetch(ids: [Int], session: URLSession) async -> PastFormBook {
-        var book = PastFormBook()
+    static func fetch(ids: [Int], into existing: PastFormBook, season: Int,
+                      session: URLSession) async -> PastFormBook {
+        var book = existing.season == season ? existing : PastFormBook()
+        book.season = season
         book.built = Date()
         await withTaskGroup(of: (Int, PastForm?).self) { group in
             var next = 0
@@ -224,7 +241,7 @@ enum PastFormService {
                 next += 1
             }
             for await (id, form) in group {
-                if let form, !form.isEmpty { book.byId[id] = form }
+                if let form, !form.isEmpty { book.byId[id] = form } else { book.barren.insert(id) }
                 if next < ids.count {
                     let queued = ids[next]
                     group.addTask { (queued, try? await one(id: queued, session: session)) }
