@@ -76,13 +76,25 @@ struct LiveView: View {
                 Spacer()
                 if let c = squad.captain {
                     VStack(alignment: .trailing, spacing: 3) {
-                        Text("CAPTAIN").font(.label(8)).tracking(1.2).foregroundColor(Theme.inkDim)
-                        PlayerShot(player: c.player, size: 40)
-                        Text("\(c.counted)")
-                            .font(.mono(14, .bold)).foregroundColor(Theme.magenta)
+                        Text("CAPTAIN").font(.system(size: 8, weight: .heavy)).tracking(1.2)
+                            .foregroundColor(Theme.inkFaint)
+                        PlayerShot(player: c.player, size: 42)
+                            .overlay(alignment: .bottomLeading) {
+                                Text("\(c.counted)")
+                                    .font(.mono(11, .black)).foregroundColor(.white).figures()
+                                    .padding(.horizontal, 5).padding(.vertical, 2)
+                                    .background(Capsule().fill(Theme.magenta))
+                                    .overlay(Capsule().stroke(Theme.panel, lineWidth: 1.5))
+                                    .offset(x: -6, y: 4)
+                            }
+                        Text(c.player.name).font(.system(size: 10, weight: .bold))
+                            .foregroundColor(Theme.inkDim).lineLimit(1)
+                            .frame(maxWidth: 76)
                     }
                 }
             }
+            // how far through the gameweek the squad is
+            Meter(fraction: Double(squad.played) / 11, color: Theme.lime, height: 4)
             HStack(spacing: 8) {
                 pill("\(squad.played)/11", "played", Theme.lime)
                 pill("\(squad.toPlay)", "to play", squad.toPlay > 0 ? Theme.cyan : Theme.inkDim)
@@ -255,13 +267,21 @@ struct LiveRow: View {
             }
             Spacer(minLength: 4)
             Text("\(line.counted)")
-                .font(.mono(17, .bold))
-                .foregroundColor(line.effectiveMultiplier == 0 ? Theme.inkDim : Theme.ink)
+                .font(.mono(17, .heavy)).figures()
+                .foregroundColor(pointsColor)
                 .frame(minWidth: 30, alignment: .trailing)
         }
         .padding(.vertical, 7)
         .opacity(dimmed ? 0.55 : 1)
         .contentShape(Rectangle())
+    }
+
+    /// A returning player should be visible at a glance in a list of eleven.
+    var pointsColor: Color {
+        if line.effectiveMultiplier == 0 { return Theme.inkFaint }
+        if line.counted >= 6 { return Theme.lime }
+        if line.counted <= 1 && line.state == .finished { return Theme.inkFaint }
+        return Theme.ink
     }
 
     func badge(_ t: String, _ c: Color) -> some View {
@@ -388,7 +408,6 @@ struct StandingsSheet: View {
                 }
             }
         }
-        .preferredColorScheme(.light)
         .task {
             defer { loading = false }
             guard let standings = try? await FPLService.fetchStandings(leagueId: league.id) else {

@@ -64,12 +64,7 @@ struct FixturesView: View {
             if !embedded {
                 AppHeader(subtitle: "Fixtures · GW \(state.gwFrom)–\(gws.last ?? state.gwFrom)")
             }
-            Picker("", selection: $lens) {
-                Text("Overall").tag(0)
-                Text("For attack").tag(1)
-                Text("For defence").tag(2)
-            }
-            .pickerStyle(.segmented)
+            SegmentBar(titles: ["Overall", "For attack", "For defence"], selection: $lens)
             .padding(.horizontal, 16)
 
             HStack {

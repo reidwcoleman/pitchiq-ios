@@ -67,7 +67,8 @@ struct PlayersView: View {
                             Button(m.rawValue) { sortMode = m }
                         }
                     } label: {
-                        pill("arrow.up.arrow.down", sortMode.rawValue, Theme.cyan)
+                        pill("arrow.up.arrow.down", sortMode.rawValue, Theme.ink,
+                             active: sortMode != .proj)
                     }
                     Menu {
                         Button("Any price") { maxPrice = 16 }
@@ -77,12 +78,15 @@ struct PlayersView: View {
                     } label: {
                         pill("sterlingsign.circle",
                              maxPrice >= 16 ? "Any price" : "≤ £\(String(format: "%.1f", maxPrice))m",
-                             Theme.cyan)
+                             Theme.ink, active: maxPrice < 16)
                     }
-                    Button { ownedOnly.toggle() } label: {
-                        pill("checkmark.circle", "In my squad",
-                             ownedOnly ? Theme.lime : Theme.inkDim)
+                    Button {
+                        Haptics.select()
+                        withAnimation(.easeInOut(duration: 0.18)) { ownedOnly.toggle() }
+                    } label: {
+                        pill("checkmark.circle", "In my squad", Theme.ink, active: ownedOnly)
                     }
+                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 16)
             }
@@ -102,16 +106,19 @@ struct PlayersView: View {
         .sheet(item: $detail) { p in PlayerDetailSheet(player: p) }
     }
 
-    func pill(_ icon: String, _ text: String, _ color: Color) -> some View {
+    /// A filter chip. It reads as *set* or *not set* — the old version painted
+    /// every chip blue whether it was doing anything or not, so the row gave no
+    /// clue which filters were actually on.
+    func pill(_ icon: String, _ text: String, _ color: Color, active: Bool = false) -> some View {
         HStack(spacing: 5) {
-            Image(systemName: icon).font(.system(size: 9, weight: .semibold))
-            Text(text).font(.mono(11))
+            Image(systemName: icon).font(.system(size: 9, weight: .bold))
+            Text(text).font(.system(size: 11.5, weight: active ? .bold : .semibold))
         }
-        .foregroundColor(color)
+        .foregroundColor(active ? .white : Theme.ink)
         .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(Theme.panel)
+        .background(active ? Theme.lime : Theme.panel)
         .clipShape(Capsule())
-        .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
+        .overlay(Capsule().stroke(active ? Color.clear : Theme.line, lineWidth: 1))
     }
 }
 

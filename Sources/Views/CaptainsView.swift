@@ -9,6 +9,10 @@ struct CaptainsView: View {
     @EnvironmentObject var state: AppState
     @State private var detail: Player?
     @State private var fromSquad = true
+    /// `SegmentBar` works in indices; the rest of this screen thinks in a Bool.
+    private var scopeIndex: Binding<Int> {
+        Binding(get: { fromSquad ? 0 : 1 }, set: { fromSquad = $0 == 0 })
+    }
 
     var picks: [Advisor.CaptainPick] {
         let squad = fromSquad ? state.squad?.squad : nil
@@ -19,12 +23,9 @@ struct CaptainsView: View {
         ScrollView {
             VStack(spacing: 12) {
                 AppHeader(subtitle: "Captain · GW \(state.gwFrom)")
-                Picker("", selection: $fromSquad) {
-                    Text(state.isConnected ? "Your squad" : "Your XV").tag(true)
-                    Text("Whole league").tag(false)
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal, 16)
+                SegmentBar(titles: [state.isConnected ? "Your squad" : "Your XV", "Whole league"],
+                           selection: scopeIndex, accent: Theme.magenta)
+                    .padding(.horizontal, Theme.Space.l)
 
                 let list = picks
                 if let top = list.first { headline(top) }
@@ -108,11 +109,12 @@ struct CaptainRow: View {
     let maxCeiling: Double
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Text(String(format: "%02d", rank))
-                .font(.mono(15, .bold))
-                .foregroundColor(rank == 1 ? Theme.magenta : Theme.inkDim)
-                .frame(width: 26)
+                .font(.mono(14, .heavy)).figures()
+                .foregroundColor(rank == 1 ? Theme.magenta : Theme.inkFaint)
+                .frame(width: 22)
+            PlayerShot(player: pick.player, size: 38)
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 7) {
                     Text(pick.player.name).font(.system(size: 14, weight: .heavy)).foregroundColor(Theme.ink)
@@ -129,21 +131,23 @@ struct CaptainRow: View {
             }
             VStack(alignment: .trailing, spacing: 1) {
                 Text(String(format: "%.1f", pick.expected * 2))
-                    .font(.mono(18, .bold)).foregroundColor(Theme.lime)
-                Text("×2").font(.label(8)).foregroundColor(Theme.inkDim)
+                    .font(.mono(19, .heavy)).foregroundColor(Theme.lime).figures()
+                Text("×2").font(.system(size: 8, weight: .heavy)).foregroundColor(Theme.inkFaint)
             }
         }
-        .padding(.horizontal, 14).padding(.vertical, 11)
+        .padding(.horizontal, Theme.Space.m).padding(.vertical, 10)
         .background(Theme.panel)
-        .overlay(RoundedRectangle(cornerRadius: 14)
-            .stroke(rank == 1 ? Theme.magenta.opacity(0.45) : Theme.line, lineWidth: 1))
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(rank == 1 ? Theme.magenta.opacity(0.45) : Theme.line, lineWidth: 1)
+        )
     }
 
     func label(_ v: String, _ k: String) -> some View {
         HStack(spacing: 3) {
-            Text(v).font(.mono(10, .bold)).foregroundColor(Theme.ink)
-            Text(k).font(.label(7.5)).foregroundColor(Theme.inkDim)
+            Text(v).font(.mono(10, .heavy)).foregroundColor(Theme.ink).figures()
+            Text(k).font(.system(size: 7.5, weight: .semibold)).foregroundColor(Theme.inkFaint)
         }
     }
 }

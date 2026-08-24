@@ -4,11 +4,24 @@ import SwiftUI
 struct PitchIQApp: App {
     @StateObject private var state = AppState()
 
+    /// Testing hook, alongside `-tab` and `-entry`: `-appearance light|dark`
+    /// pins the colour scheme so both can be screenshotted from a script. Nil
+    /// in normal use, which is what lets the app follow the phone.
+    static var forcedScheme: ColorScheme? {
+        let args = ProcessInfo.processInfo.arguments
+        guard let i = args.firstIndex(of: "-appearance"), i + 1 < args.count else { return nil }
+        switch args[i + 1] {
+        case "light": return .light
+        case "dark": return .dark
+        default: return nil
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(state)
-                .preferredColorScheme(.light)
+                .preferredColorScheme(Self.forcedScheme)
         }
     }
 }
@@ -51,9 +64,13 @@ struct MainTabs: View {
     @State private var tab: Int
 
     init() {
+        // The bar was pinned to white, which in dark mode is a white slab at
+        // the bottom of a black screen. It follows the palette now.
         let appearance = UITabBarAppearance()
         appearance.configureWithOpaqueBackground()
-        appearance.backgroundColor = UIColor.white
+        appearance.backgroundColor = UIColor { traits in
+            UIColor(hex: traits.userInterfaceStyle == .dark ? 0x111612 : 0xFFFFFF)
+        }
         appearance.shadowColor = UIColor(Theme.line)
         UITabBar.appearance().standardAppearance = appearance
         UITabBar.appearance().scrollEdgeAppearance = appearance
@@ -90,13 +107,9 @@ struct BrowseView: View {
             AppHeader(subtitle: mode == 0
                       ? "Rankings · next \(state.horizon) GW"
                       : "Fixtures · from GW \(state.gwFrom)")
-            Picker("", selection: $mode) {
-                Text("Players").tag(0)
-                Text("Fixtures").tag(1)
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 14)
-            .padding(.bottom, 8)
+            SegmentBar(titles: ["Players", "Fixtures"], selection: $mode)
+                .padding(.horizontal, Theme.Space.l)
+                .padding(.bottom, Theme.Space.s)
             if mode == 0 { PlayersView(embedded: true) } else { FixturesView(embedded: true) }
         }
         .background(Theme.bg)
@@ -114,34 +127,39 @@ struct AppHeader: View {
     @State private var showSettings = false
 
     var body: some View {
-        HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
+        HStack(alignment: .center, spacing: Theme.Space.s) {
+            VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 0) {
-                    Text("PITCH").font(.system(size: 20, weight: .black)).foregroundColor(Theme.ink)
-                    Text("IQ").font(.system(size: 20, weight: .black)).foregroundColor(Theme.lime)
+                    Text("PITCH").font(.system(size: 21, weight: .black)).foregroundColor(Theme.ink)
+                    Text("IQ").font(.system(size: 21, weight: .black)).foregroundColor(Theme.lime)
                 }
+                .kerning(-0.4)
                 Text(subtitle.uppercased())
-                    .font(.label(8.5)).tracking(1.4).foregroundColor(Theme.inkDim)
+                    .font(.system(size: 9, weight: .heavy)).tracking(1.5)
+                    .foregroundColor(Theme.inkDim)
                     .lineLimit(1).minimumScaleFactor(0.75)
             }
-            Spacer(minLength: 6)
-            DeadlineChip()
+            Spacer(minLength: 4)
             if state.working || state.refreshing {
-                ProgressView().tint(Theme.limeDim).scaleEffect(0.75)
+                ProgressView().tint(Theme.limeDim).scaleEffect(0.7)
+                    .transition(.opacity)
             }
-            Button { showSettings = true } label: {
+            DeadlineChip()
+            Button { Haptics.tap(); showSettings = true } label: {
                 Image(systemName: state.isConnected ? "person.crop.circle.fill" : "slider.horizontal.3")
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(state.isConnected ? Theme.lime : Theme.ink)
-                    .frame(width: 36, height: 36)
+                    .frame(width: 34, height: 34)
                     .background(Theme.panel)
                     .clipShape(Circle())
                     .overlay(Circle().stroke(Theme.line, lineWidth: 1))
             }
+            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 4)
-        .padding(.bottom, 8)
+        .animation(.easeInOut(duration: 0.2), value: state.working)
+        .padding(.horizontal, Theme.Space.l)
+        .padding(.top, 2)
+        .padding(.bottom, Theme.Space.s)
         .sheet(isPresented: $showSettings) { SettingsSheet() }
     }
 }
@@ -157,13 +175,20 @@ struct DeadlineChip: View {
         if let next = state.nextDeadline {
             let left = next.date.timeIntervalSince(now)
             let color: Color = left < 2 * 3600 ? Theme.red : (left < 12 * 3600 ? Theme.amber : Theme.inkDim)
-            VStack(alignment: .trailing, spacing: 0) {
-                Text(Self.format(left))
-                    .font(.mono(12.5, .bold)).foregroundColor(color)
-                    .monospacedDigit()
-                Text("GW \(next.gw) DEADLINE")
-                    .font(.label(7)).tracking(0.8).foregroundColor(Theme.inkDim)
+            HStack(spacing: 5) {
+                Circle().fill(color).frame(width: 5, height: 5)
+                VStack(alignment: .leading, spacing: -1) {
+                    Text(Self.format(left))
+                        .font(.mono(12, .heavy)).foregroundColor(color).figures()
+                    Text("GW \(next.gw)")
+                        .font(.system(size: 8, weight: .heavy)).tracking(0.7)
+                        .foregroundColor(Theme.inkFaint)
+                }
             }
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .background(Theme.bg2)
+            .clipShape(Capsule())
+            .overlay(Capsule().stroke(Theme.line, lineWidth: 1))
             .onReceive(tick) { now = $0 }
         }
     }
@@ -203,7 +228,6 @@ struct SettingsSheet: View {
                 }
             }
         }
-        .preferredColorScheme(.light)
         .onAppear { entryText = state.team.map { String($0.entryId) } ?? "" }
     }
 

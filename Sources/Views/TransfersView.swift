@@ -12,14 +12,9 @@ struct TransfersView: View {
     var body: some View {
         VStack(spacing: 0) {
             AppHeader(subtitle: state.isConnected ? "Your moves" : "Suggested moves")
-            Picker("", selection: $section) {
-                Text("Moves").tag(0)
-                Text("Squad check").tag(1)
-                Text("Market").tag(2)
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
-            .padding(.bottom, 10)
+            SegmentBar(titles: ["Moves", "Squad check", "Market"], selection: $section)
+                .padding(.horizontal, Theme.Space.l)
+                .padding(.bottom, Theme.Space.m)
 
             ScrollView {
                 VStack(spacing: 12) {
@@ -67,8 +62,9 @@ struct TransfersView: View {
             } else if let best = board.bestSingle {
                 verdictCard(
                     "\(best.out.name) → \(best.inn.name) is the strongest single move available: "
-                    + String(format: "+%.1f points on your starting eleven over the next four gameweeks, +%.1f across the next %d.",
-                             best.gainWeighted, best.gainWindow, state.horizon),
+                    + String(format: "+%.1f points on your starting eleven over the next %d gameweeks, +%.1f across the next %d.",
+                             best.gainWeighted, Planner.transferLookahead,
+                             best.gainWindow, state.horizon),
                     color: Theme.lime, icon: "arrow.left.arrow.right",
                     title: "Recommendation: make one transfer")
             }
@@ -76,9 +72,14 @@ struct TransfersView: View {
             hitCard
 
             VStack(alignment: .leading, spacing: 10) {
-                SectionLabel(text: "Every move, ranked")
-                Text("Sorted by what each move adds to your **starting eleven** over the next four gameweeks — not by the incoming player's own projection, since bench points don't count. Four, because that's roughly how long you hold a player before the next move. Tap a row for the reasoning.")
-                    .font(.system(size: 11.5)).foregroundColor(Theme.inkDim)
+                HStack {
+                    SectionLabel(text: "Every move, ranked")
+                    Spacer()
+                    Text("tap a row for why")
+                        .font(.system(size: 10)).foregroundColor(Theme.inkFaint)
+                }
+                WhyNote(text: "Sorted by what each move adds to your **starting eleven** over the next \(Planner.transferLookahead) gameweeks — not by the incoming player's own projection, since bench points don't count. \(Planner.transferLookahead), because judging a transfer over one gameweek costs about fifty points a season and the curve flattens after six.",
+                        label: "How this is ranked")
                 ForEach(board.options.prefix(20)) { o in
                     TransferOptionRow(option: o, horizon: state.horizon)
                         .onTapGesture { detail = o.inn }
@@ -302,23 +303,37 @@ struct TransferOptionRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 7) {
-                Tag(text: option.outStarts ? option.out.posShort : "BENCH",
-                    color: option.outStarts ? option.out.posColor : Theme.inkDim)
-                Text(option.out.name)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(Theme.inkDim).strikethrough().lineLimit(1)
-                Image(systemName: "arrow.right").font(.system(size: 9, weight: .bold))
-                    .foregroundColor(Theme.lime)
-                Text(option.inn.name).font(.system(size: 13.5, weight: .heavy))
-                    .foregroundColor(Theme.ink).lineLimit(1)
+            HStack(spacing: 8) {
+                // the two faces, so a move reads as two players rather than as
+                // two names in a sentence
+                ZStack(alignment: .leading) {
+                    PlayerShot(player: option.out, size: 30, showBadge: false)
+                        .opacity(0.5).offset(x: 0)
+                    PlayerShot(player: option.inn, size: 32).offset(x: 19)
+                }
+                .frame(width: 53, alignment: .leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 5) {
+                        Text(option.inn.name).font(.system(size: 13.5, weight: .heavy))
+                            .foregroundColor(Theme.ink).lineLimit(1)
+                        Tag(text: option.outStarts ? option.out.posShort : "BENCH",
+                            color: option.outStarts ? option.out.posColor : Theme.inkDim)
+                    }
+                    HStack(spacing: 4) {
+                        Text("for").font(.system(size: 10)).foregroundColor(Theme.inkFaint)
+                        Text(option.out.name)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(Theme.inkDim).strikethrough().lineLimit(1)
+                    }
+                }
                 Spacer(minLength: 4)
-                VStack(alignment: .trailing, spacing: 1) {
+                VStack(alignment: .trailing, spacing: 0) {
                     Text(String(format: "%+.1f", option.gainWeighted))
-                        .font(.mono(13, .bold))
+                        .font(.mono(15, .heavy)).figures()
                         .foregroundColor(option.gainWeighted > 0.05 ? Theme.green
                                          : (option.gainWeighted < -0.05 ? Theme.red : Theme.inkDim))
-                    Text("gain").font(.label(7.5)).foregroundColor(Theme.inkDim)
+                    Text("gain").font(.system(size: 7.5, weight: .heavy))
+                        .foregroundColor(Theme.inkFaint)
                 }
             }
             HStack(spacing: 12) {
@@ -327,10 +342,17 @@ struct TransferOptionRow: View {
                 metric(option.spend == 0 ? "level"
                        : String(format: "%+.1fm", Double(option.spend) / 10), "price")
                 Spacer()
-                Button { withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() } } label: {
-                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 10, weight: .bold)).foregroundColor(Theme.inkDim)
+                Button {
+                    Haptics.tap()
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) { expanded.toggle() }
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .black)).foregroundColor(Theme.inkFaint)
+                        .rotationEffect(.degrees(expanded ? 180 : 0))
+                        .frame(width: 26, height: 22)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
             }
             if expanded {
                 ForEach(Array(option.reasons.enumerated()), id: \.offset) { _, r in
@@ -342,14 +364,16 @@ struct TransferOptionRow: View {
                 }
             }
         }
-        .padding(.vertical, 9)
-        .overlay(alignment: .bottom) { Divider().background(Theme.line) }
+        .padding(.vertical, 10)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Theme.line).frame(height: 1)
+        }
     }
 
     func metric(_ v: String, _ k: String) -> some View {
         HStack(spacing: 4) {
-            Text(v).font(.mono(11, .bold)).foregroundColor(Theme.ink)
-            Text(k).font(.label(8)).foregroundColor(Theme.inkDim)
+            Text(v).font(.mono(11, .heavy)).foregroundColor(Theme.ink).figures()
+            Text(k).font(.system(size: 8, weight: .semibold)).foregroundColor(Theme.inkFaint)
         }
     }
 }

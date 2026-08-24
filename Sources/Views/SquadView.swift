@@ -44,7 +44,7 @@ struct SquadView: View {
                     ChipStrip(plan: plan).padding(.horizontal, 14)
                     SeasonSummary(plan: plan).padding(.horizontal, 14)
                 } else if case .loading = state.phase {
-                    ProgressView().tint(Theme.lime).frame(maxWidth: .infinity, minHeight: 260)
+                    LoadingSkeleton().padding(.horizontal, 14)
                 } else {
                     EmptyNote(icon: "questionmark.circle",
                               title: "No feasible squad",
@@ -73,46 +73,86 @@ struct SquadView: View {
         return sorted.count > 1 ? sorted[1].id : -1
     }
 
+    /// The season as a rail you scrub through. Each gameweek shows its
+    /// projected score as a column whose height is that score against the best
+    /// week on the rail, so the shape of the run is visible at a glance —
+    /// previously they were six identical white boxes with a number in them and
+    /// the shape of the season was invisible.
     func gwPicker(_ plan: SeasonPlan, idx: Int) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(Array(plan.gws.enumerated()), id: \.element.gw) { i, gp in
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.14)) { selected = i }
-                    } label: {
-                        gwChip(gp, active: i == idx)
+        let peak = max(plan.gws.map(\.projPts).max() ?? 1, 1)
+        let floor = min(plan.gws.map(\.projPts).min() ?? 0, peak - 1)
+        return VStack(alignment: .leading, spacing: Theme.Space.s) {
+            SectionLabel(text: "The season ahead").padding(.horizontal, Theme.Space.l)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(Array(plan.gws.enumerated()), id: \.element.gw) { i, gp in
+                        Button {
+                            Haptics.select()
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                selected = i
+                            }
+                        } label: {
+                            gwChip(gp, active: i == idx,
+                                   height: (gp.projPts - floor) / max(peak - floor, 1))
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
+                .padding(.horizontal, Theme.Space.l)
+                .padding(.vertical, 2)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 2)
         }
     }
 
-    func gwChip(_ gp: GWPlan, active: Bool) -> some View {
-        VStack(spacing: 3) {
-            Text("GW \(gp.gw)").font(.mono(12, .bold))
-            Text(String(format: "%.0f", gp.projPts)).font(.mono(9, .medium))
-            if let chip = gp.chip {
-                Text(chipShortName(chip))
-                    .font(.mono(8, .heavy)).foregroundColor(.white)
-                    .padding(.horizontal, 5).padding(.vertical, 1.5)
-                    .background(Theme.magenta).clipShape(Capsule())
-            } else if !gp.transfers.isEmpty {
-                Text("\(gp.transfers.count) ⇄")
-                    .font(.mono(8, .bold))
-                    .foregroundColor(active ? .white.opacity(0.9) : Theme.cyan)
-            } else {
-                Text("hold").font(.mono(8, .medium))
-                    .foregroundColor(active ? .white.opacity(0.75) : Theme.inkDim)
+    func gwChip(_ gp: GWPlan, active: Bool, height: Double) -> some View {
+        let accent: Color = gp.chip != nil ? Theme.magenta
+            : (gp.transfers.isEmpty ? Theme.inkFaint : Theme.cyan)
+        return VStack(spacing: 4) {
+            Text("GW \(gp.gw)")
+                .font(.system(size: 9.5, weight: .heavy)).figures()
+                .foregroundColor(active ? .white.opacity(0.9) : Theme.inkDim)
+            Text(String(format: "%.0f", gp.projPts))
+                .font(.mono(17, .heavy)).figures()
+                .foregroundColor(active ? .white : Theme.ink)
+            // this week's score against the best week on the rail
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(active ? Color.white.opacity(0.28) : Theme.line)
+                    .frame(height: 3)
+                Capsule()
+                    .fill(active ? Color.white : Theme.lime)
+                    .frame(width: 8 + 26 * min(max(height, 0), 1), height: 3)
             }
+            .frame(width: 34)
+            Group {
+                if let chip = gp.chip {
+                    Text(chipShortName(chip))
+                        .font(.system(size: 8, weight: .black)).foregroundColor(.white)
+                        .padding(.horizontal, 5).padding(.vertical, 1.5)
+                        .background(Theme.magenta).clipShape(Capsule())
+                } else if !gp.transfers.isEmpty {
+                    HStack(spacing: 2) {
+                        Image(systemName: "arrow.left.arrow.right")
+                            .font(.system(size: 6.5, weight: .black))
+                        Text("\(gp.transfers.count)").font(.system(size: 8.5, weight: .black))
+                    }
+                    .foregroundColor(active ? .white.opacity(0.92) : accent)
+                } else {
+                    Text("hold").font(.system(size: 8.5, weight: .bold))
+                        .foregroundColor(active ? .white.opacity(0.75) : Theme.inkFaint)
+                }
+            }
+            .frame(height: 12)
         }
-        .foregroundColor(active ? .white : Theme.ink)
-        .padding(.horizontal, 13).padding(.vertical, 8)
+        .frame(width: 58)
+        .padding(.vertical, 8)
         .background(active ? Theme.lime : Theme.panel)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12)
-            .stroke(active ? Theme.lime : Theme.line, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .stroke(active ? Color.clear : Theme.line, lineWidth: 1)
+        )
+        .shadow(color: active ? Theme.lime.opacity(0.3) : .clear, radius: 8, y: 3)
     }
 
     func gwTiles(_ gp: GWPlan) -> some View {
@@ -139,6 +179,16 @@ struct ActionCard: View {
     let gwPlan: GWPlan
     let isFirst: Bool
     let plan: SeasonPlan
+    @State private var expanded = false
+
+    /// A wildcard is fifteen rows, and fifteen rows of small print pushed the
+    /// one thing the screen exists for — your team — clean off the bottom of
+    /// the phone. Long lists start folded.
+    private var foldLimit: Int { 4 }
+    private var needsFolding: Bool { gwPlan.transfers.count > foldLimit }
+    private var shown: [TransferMove] {
+        needsFolding && !expanded ? Array(gwPlan.transfers.prefix(foldLimit)) : gwPlan.transfers
+    }
 
     var accent: Color {
         if gwPlan.chip != nil { return Theme.magenta }
@@ -170,12 +220,36 @@ struct ActionCard: View {
                 Image(systemName: icon).font(.system(size: 17, weight: .semibold))
                     .foregroundColor(accent).frame(width: 24)
                 Text(gwPlan.action)
-                    .font(.system(size: 17, weight: .heavy)).foregroundColor(Theme.ink)
+                    .font(.system(size: 18, weight: .heavy)).foregroundColor(Theme.ink)
+                    .lineSpacing(1)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if !gwPlan.transfers.isEmpty {
                 VStack(spacing: 6) {
-                    ForEach(gwPlan.transfers) { t in TransferRow(move: t, chip: gwPlan.chip) }
+                    ForEach(shown) { t in TransferRow(move: t, chip: gwPlan.chip) }
+                }
+                if needsFolding {
+                    Button {
+                        Haptics.tap()
+                        withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
+                            expanded.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(expanded
+                                 ? "Show fewer"
+                                 : "Show all \(gwPlan.transfers.count) moves")
+                            Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 9, weight: .black))
+                        }
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(accent)
+                        .padding(.vertical, 7)
+                        .frame(maxWidth: .infinity)
+                        .background(accent.opacity(0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
                 }
             }
             if gwPlan.transfers.isEmpty && gwPlan.chip == nil,
@@ -191,12 +265,9 @@ struct ActionCard: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(15)
+        .padding(Theme.Space.l)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.panel)
-        .clipShape(RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(accent.opacity(0.35), lineWidth: 1.5))
-        .shadow(color: Color.black.opacity(0.05), radius: 10, x: 0, y: 3)
+        .accentPanel(accent)
     }
 }
 
@@ -205,19 +276,22 @@ struct TransferRow: View {
     var chip: String?
 
     var body: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: 6) {
             if move.out.flagged {
-                Image(systemName: "cross.case.fill").font(.system(size: 10)).foregroundColor(Theme.red)
+                Image(systemName: "cross.case.fill").font(.system(size: 9)).foregroundColor(Theme.red)
             }
+            TeamBadge(teamId: move.out.team, size: 15).opacity(0.55)
             Text(move.out.name)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(Theme.inkDim).strikethrough()
                 .lineLimit(1)
-            Image(systemName: "arrow.right").font(.system(size: 9, weight: .bold))
+            Image(systemName: "arrow.right").font(.system(size: 9, weight: .black))
                 .foregroundColor(Theme.lime)
+            TeamBadge(teamId: move.inn.team, size: 15)
             Text(move.inn.name).font(.system(size: 13, weight: .bold))
                 .foregroundColor(Theme.ink).lineLimit(1)
-            Text("£\(move.inn.price)").font(.mono(10, .medium)).foregroundColor(Theme.inkDim)
+            Text("£\(move.inn.price)").font(.mono(10, .medium))
+                .foregroundColor(Theme.inkFaint).figures()
             Spacer(minLength: 4)
             if chip != "wildcard" {
                 Text(String(format: "%+.1f", move.gain))
@@ -244,16 +318,20 @@ struct ReasonCard: View {
         VStack(alignment: .leading, spacing: 0) {
             SectionLabel(text: title).padding(.bottom, 8)
             ForEach(Array(notes.enumerated()), id: \.offset) { i, n in
-                HStack(alignment: .top, spacing: 8) {
-                    Text("▸").foregroundColor(Theme.lime).font(.system(size: 11))
+                HStack(alignment: .top, spacing: Theme.Space.s) {
+                    Circle().fill(Theme.lime).frame(width: 4, height: 4)
+                        .padding(.top, 6)
                     Text(n).font(.system(size: 13)).foregroundColor(Theme.ink)
+                        .lineSpacing(2.5)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.vertical, 7)
-                if i < notes.count - 1 { Divider().background(Theme.line) }
+                .padding(.vertical, Theme.Space.s)
+                if i < notes.count - 1 {
+                    Rectangle().fill(Theme.line).frame(height: 1)
+                }
             }
         }
-        .padding(15)
+        .padding(Theme.Space.l)
         .frame(maxWidth: .infinity, alignment: .leading)
         .panel()
     }
@@ -384,6 +462,68 @@ struct SeasonSummary: View {
 }
 
 // MARK: - pitch
+//
+// The team screen is the one people open the app for, and it was a pale green
+// rectangle with two white lines on it. A pitch is a specific, recognisable
+// thing — mown stripes running away from you, a centre circle, a penalty box at
+// the far end, the grass darker at the edges — and drawing it properly costs
+// one Shape and a gradient.
+
+struct PitchMarkings: Shape {
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let w = rect.width, h = rect.height
+        let inset: CGFloat = 10
+        let field = CGRect(x: inset, y: inset, width: w - inset * 2, height: h - inset * 2)
+
+        p.addRoundedRect(in: field, cornerSize: CGSize(width: 6, height: 6))
+
+        // halfway line and centre circle, placed where a keeper's own half ends
+        let midY = field.minY + field.height * 0.62
+        p.move(to: CGPoint(x: field.minX, y: midY))
+        p.addLine(to: CGPoint(x: field.maxX, y: midY))
+        let r = min(field.width * 0.17, field.height * 0.12)
+        p.addEllipse(in: CGRect(x: field.midX - r, y: midY - r, width: r * 2, height: r * 2))
+        p.addEllipse(in: CGRect(x: field.midX - 2, y: midY - 2, width: 4, height: 4))
+
+        // the box behind the goalkeeper
+        let boxW = field.width * 0.52, boxH = field.height * 0.13
+        p.addRect(CGRect(x: field.midX - boxW / 2, y: field.minY, width: boxW, height: boxH))
+        let sixW = field.width * 0.26, sixH = boxH * 0.42
+        p.addRect(CGRect(x: field.midX - sixW / 2, y: field.minY, width: sixW, height: sixH))
+        // the arc at the top of the box
+        var arc = Path()
+        arc.addArc(center: CGPoint(x: field.midX, y: field.minY + boxH * 0.72),
+                   radius: field.width * 0.13, startAngle: .degrees(20),
+                   endAngle: .degrees(160), clockwise: false)
+        p.addPath(arc)
+        return p
+    }
+}
+
+struct PitchBackground: View {
+    var body: some View {
+        ZStack {
+            // mown stripes, running across the pitch and fading with distance
+            GeometryReader { geo in
+                let bands = 9
+                VStack(spacing: 0) {
+                    ForEach(0..<bands, id: \.self) { i in
+                        (i % 2 == 0 ? Theme.pitchLight : Theme.pitchDeep)
+                            .frame(height: geo.size.height / CGFloat(bands))
+                    }
+                }
+            }
+            // depth: the far end of the pitch sits in shade
+            LinearGradient(colors: [Color.black.opacity(0.18), Color.black.opacity(0),
+                                    Color.black.opacity(0.10)],
+                           startPoint: .top, endPoint: .bottom)
+            RadialGradient(colors: [Color.white.opacity(0.10), Color.clear],
+                           center: .init(x: 0.5, y: 0.28), startRadius: 4, endRadius: 320)
+            PitchMarkings().stroke(Theme.pitchLine.opacity(0.5), lineWidth: 1.4)
+        }
+    }
+}
 
 struct PitchGrid: View {
     let xi: [Player]
@@ -396,92 +536,89 @@ struct PitchGrid: View {
     }
 
     func cardWidth(_ n: Int) -> CGFloat {
-        let available = UIScreen.main.bounds.width - 28 - 20 - CGFloat(max(n - 1, 0)) * 8
-        return min(84, available / CGFloat(max(n, 1)))
+        let available = UIScreen.main.bounds.width - 28 - 16 - CGFloat(max(n - 1, 0)) * 6
+        return min(80, available / CGFloat(max(n, 1)))
     }
 
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 14) {
             ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     ForEach(row) { p in
                         PlayerCard(player: p,
                                    isCaptain: p.id == captainId,
                                    isVice: p.id == viceId,
                                    width: cardWidth(row.count))
-                            .onTapGesture { onTap(p) }
+                            .onTapGesture { Haptics.tap(); onTap(p) }
                     }
                 }
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 20)
-        .background(pitchBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 20))
-        .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color(hex: 0xBFDCB4), lineWidth: 1))
-        .shadow(color: Color.black.opacity(0.05), radius: 12, x: 0, y: 4)
-    }
-
-    var pitchBackground: some View {
-        ZStack {
-            VStack(spacing: 0) {
-                ForEach(0..<8, id: \.self) { i in
-                    (i % 2 == 0 ? Theme.pitchLight : Theme.pitchDark)
-                }
-            }
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.white.opacity(0.75), lineWidth: 1.5)
-                .padding(10)
-            Circle().stroke(Color.white.opacity(0.6), lineWidth: 1.5)
-                .frame(width: 110, height: 110)
-        }
+        .padding(.vertical, 22)
+        .padding(.horizontal, 8)
+        .background(PitchBackground())
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
+                .stroke(Color.black.opacity(0.18), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.16), radius: 16, x: 0, y: 6)
     }
 }
 
+/// One player on the grass. Small, dense, and legible against a green ground —
+/// which is why it is a light card rather than a transparent label.
 struct PlayerCard: View {
     let player: Player
     var isCaptain = false
     var isVice = false
     var compact = false
-    var width: CGFloat = 82
+    var width: CGFloat = 80
 
     var body: some View {
-        VStack(spacing: 4) {
-            PlayerShot(player: player, size: 38)
+        VStack(spacing: 3) {
+            PlayerShot(player: player, size: 36)
             Text(player.name)
-                .font(.system(size: 11, weight: .bold)).foregroundColor(Theme.ink)
+                .font(.system(size: 10.5, weight: .bold)).foregroundColor(Theme.ink)
                 .lineLimit(1).minimumScaleFactor(0.7)
-            Text("\(player.teamShort) £\(player.price)")
-                .font(.mono(8.5, .medium)).foregroundColor(Theme.inkDim)
+            Text("\(player.teamShort) · £\(player.price)")
+                .font(.mono(8.5, .medium)).foregroundColor(Theme.inkDim).figures()
             Text(String(format: "%.1f", player.proj))
-                .font(.mono(11, .bold)).foregroundColor(Theme.lime)
-                .frame(maxWidth: .infinity).padding(.vertical, 2)
-                .background(Theme.lime.opacity(0.09))
-                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .font(.mono(11, .heavy)).foregroundColor(Theme.lime).figures()
+                .frame(maxWidth: .infinity).padding(.vertical, 2.5)
+                .background(Theme.lime.opacity(0.13))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
-        .padding(6)
-        .frame(width: compact ? 76 : width)
-        .background(Theme.panel)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .shadow(color: Color.black.opacity(0.08), radius: 5, x: 0, y: 2)
+        .padding(.horizontal, 5).padding(.vertical, 6)
+        .frame(width: compact ? 74 : width)
+        .background(Theme.panel.opacity(0.96))
+        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .stroke(Color.white.opacity(0.35), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.22), radius: 5, x: 0, y: 2)
         .overlay(alignment: .topLeading) {
             if player.flagged {
                 Image(systemName: "cross.case.fill")
-                    .font(.system(size: 9)).foregroundColor(.white)
-                    .frame(width: 17, height: 17)
+                    .font(.system(size: 8, weight: .bold)).foregroundColor(.white)
+                    .frame(width: 16, height: 16)
                     .background(Theme.red).clipShape(Circle())
+                    .overlay(Circle().stroke(Color.white.opacity(0.6), lineWidth: 1))
                     .offset(x: -4, y: -4)
             }
         }
         .overlay(alignment: .topTrailing) {
             if isCaptain || isVice {
                 Text(isCaptain ? "C" : "V")
-                    .font(.system(size: 11, weight: .heavy)).foregroundColor(.white)
-                    .frame(width: 20, height: 20)
+                    .font(.system(size: 10, weight: .black)).foregroundColor(.white)
+                    .frame(width: 18, height: 18)
                     .background(isCaptain ? Theme.magenta : Theme.cyan)
                     .clipShape(Circle())
-                    .shadow(color: Color.black.opacity(0.15), radius: 3, x: 0, y: 1)
-                    .offset(x: 6, y: -6)
+                    .overlay(Circle().stroke(Color.white.opacity(0.55), lineWidth: 1))
+                    .shadow(color: Color.black.opacity(0.25), radius: 3, x: 0, y: 1)
+                    .offset(x: 5, y: -5)
             }
         }
     }
@@ -581,7 +718,6 @@ struct SwapSheet: View {
                 }
             }
         }
-        .preferredColorScheme(.light)
     }
 
     func row(_ p: Player) -> some View {

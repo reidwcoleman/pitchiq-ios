@@ -47,6 +47,30 @@ gives five tabs before it starts hiding screens behind a More button.
 
 The deadline counts down in the header of every screen.
 
+### Look and feel
+
+One palette, one type scale, one six-step spacing scale, all in `Theme.swift`,
+and every colour defined in both appearances. The app previously hard-coded a
+light palette and pinned `.preferredColorScheme(.light)` on top of it, which is
+a way of telling anyone who runs their phone dark that you never finished. Dark
+mode is not an inversion of the light one: the page goes to near-black, cards
+lift by getting *lighter* rather than by casting a shadow, and the greens are
+brightened so they still read as one accent rather than as mud.
+
+The team screen is the one people open the app for, and it was a pale rectangle
+with two white lines on it. A pitch is a specific, recognisable thing — mown
+stripes running away from you, a centre circle, a penalty box at the far end,
+the grass in shade at the edges — and drawing it properly costs one `Shape` and
+a gradient. The season below it is a rail you scrub through, each week's
+projected score drawn as a bar against the best week on it, so the shape of the
+run is visible rather than being six identical boxes with numbers in them.
+
+Long explanations are folded behind a quiet toggle instead of standing between
+the reader and the list, a fifteen-move wildcard shows four and offers the rest,
+every number is set in tabular figures so columns stop shivering as they update,
+and the loading state is the shape of the screen that is coming rather than a
+spinner on an empty page.
+
 ### Connect your team
 
 Settings → paste your FPL team ID (the number in

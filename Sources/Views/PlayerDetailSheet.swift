@@ -36,7 +36,6 @@ struct PlayerDetailSheet: View {
                 }
             }
         }
-        .preferredColorScheme(.light)
     }
 
     var header: some View {
