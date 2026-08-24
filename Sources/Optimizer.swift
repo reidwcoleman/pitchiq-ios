@@ -17,16 +17,39 @@ enum Optimizer {
 
     struct XI {
         let total: Double        // best starting XI
-        let benchSum: Double     // the other four
-        let capProj: Double      // best single projection in the XI
+        let benchSum: Double     // the other four, raw
+        let capProj: Double      // what the armband adds, vice-captain included
+        let capBase: Double      // ... ignoring the vice, for A/B testing
+        let autosub: Double      // what the bench is expected to be paid
         let d: Int, m: Int, f: Int
         var formation: String { "\(d)-\(m)-\(f)" }
     }
 
-    /// Best legal XI from a 15-man squad. Allocation-free.
+    /// Best legal XI from a 15-man squad, plus what the bench and the armband
+    /// are actually worth. Allocation-free.
+    ///
+    /// Two things here were previously fudged, and both are worth real points:
+    ///
+    /// **The bench.** It used to be scored at a flat tenth of its projection —
+    /// a number with no derivation. What a substitute is really worth is the
+    /// chance he is *needed*: FPL brings him on exactly when a starter records
+    /// no minutes. With ten outfield starters who each appear about 85% of the
+    /// time, the chance at least one of them doesn't is not small, it is around
+    /// three in four. So the first man on the bench is worth most of his own
+    /// projection, not a tenth of it, and the fourth is worth almost nothing.
+    /// Pricing that correctly is the whole argument for a playing bench, and
+    /// the old constant argued the opposite.
+    ///
+    /// **The armband.** Captaincy was scored as one extra copy of the best
+    /// player's projection. But if the captain doesn't play, the vice takes the
+    /// armband — so what it is really worth is the captain's projection plus
+    /// the vice's, weighted by the chance the captain is missing. That is what
+    /// makes a nailed-on vice behind a doubtful captain worth owning.
     static func evaluate(_ squad: [Pick]) -> XI? {
         guard squad.count == 15 else { return nil }
-        return withUnsafeTemporaryAllocation(of: Double.self, capacity: 15) { buf -> XI? in
+        return withUnsafeTemporaryAllocation(of: Double.self, capacity: 30) { buf -> XI? in
+            // buf[0..<15]  projections, sorted descending within position block
+            // buf[15..<30] the matching appearance probabilities
             var c1 = 0, c2 = 0, c3 = 0, c4 = 0
             var all = 0.0
             for p in squad {
@@ -42,9 +65,11 @@ enum Optimizer {
                 var i = off + n
                 while i > off, buf[i - 1] < p.proj {
                     buf[i] = buf[i - 1]
+                    buf[i + 15] = buf[i + 14]
                     i -= 1
                 }
                 buf[i] = p.proj
+                buf[i + 15] = Double(p.play)
             }
             guard c1 == 2, c2 == 5, c3 == 5, c4 == 3 else { return nil }
 
@@ -72,25 +97,61 @@ enum Optimizer {
             consider(d5 + m2 + f3, 5, 2, 3)
             consider(d5 + m3 + f2, 5, 3, 2)
             consider(d5 + m4 + f1, 5, 4, 1)
-
             let total = gk + best
-            let cap = max(max(buf[0], buf[2]), max(buf[7], buf[12]))
-            return XI(total: total, benchSum: all - total, capProj: cap,
-                      d: bd, m: bm, f: bf)
+
+            // --- the armband: captain, plus the vice for the weeks he is out
+            var top = -1.0, second = -1.0, topPlay = 1.0
+            @inline(__always) func offer(_ v: Double, _ play: Double) {
+                if v > top { second = top; top = v; topPlay = play }
+                else if v > second { second = v }
+            }
+            offer(buf[0], buf[15])
+            for i in 0..<bd { offer(buf[2 + i], buf[17 + i]) }
+            for i in 0..<bm { offer(buf[7 + i], buf[22 + i]) }
+            for i in 0..<bf { offer(buf[12 + i], buf[27 + i]) }
+            let capProj = max(top, 0) + (1 - topPlay) * max(second, 0)
+
+            // --- the bench: how often each seat is actually called on
+            //
+            // The number of starters who fail to appear is a sum of ten
+            // independent indicators; its Poisson approximation is accurate to
+            // well within the noise here and costs three multiplications.
+            var blanks = 0.0
+            for i in 0..<bd { blanks += 1 - buf[17 + i] }
+            for i in 0..<bm { blanks += 1 - buf[22 + i] }
+            for i in 0..<bf { blanks += 1 - buf[27 + i] }
+            let e = exp(-blanks)
+            let atLeast1 = 1 - e
+            let atLeast2 = 1 - e * (1 + blanks)
+            let atLeast3 = 1 - e * (1 + blanks + blanks * blanks / 2)
+
+            // Outfield substitutes in the order a manager would rank them.
+            var subs: [Double] = []
+            subs.reserveCapacity(3)
+            for i in bd..<5 { subs.append(buf[2 + i]) }
+            for i in bm..<5 { subs.append(buf[7 + i]) }
+            for i in bf..<3 { subs.append(buf[12 + i]) }
+            subs.sort(by: >)
+            var autosub = (1 - buf[15]) * buf[1]           // the reserve keeper
+            let odds = [atLeast1, atLeast2, atLeast3]
+            for (i, v) in subs.prefix(3).enumerated() { autosub += odds[i] * v }
+
+            return XI(total: total, benchSum: all - total, capProj: capProj,
+                      capBase: max(top, 0), autosub: max(autosub, 0), d: bd, m: bm, f: bf)
         }
     }
 
     @inline(__always)
     static func objective(_ squad: [Pick]) -> Double {
         guard let r = evaluate(squad) else { return -1e9 }
-        return r.total + r.capProj + 0.12 * r.benchSum
+        return r.total + r.capProj + r.autosub
     }
 
-    /// What a bench place is worth relative to a starting place when judging a
-    /// transfer. Not zero — a substitute covers a starter who doesn't play, and
-    /// counts in full under Bench Boost — but close to it. A fourth-choice
-    /// forward scores you nothing on a normal weekend.
-    static let benchValue = 0.10
+    /// A last sliver of weight on the bench beyond what the autosub model
+    /// already pays it, standing in for the things it doesn't price: a Bench
+    /// Boost later in the season, and the freedom a sellable substitute gives
+    /// you when an injury forces a move.
+    static let benchValue = 0.04
 
     /// The points a fifteen actually contributes in one gameweek: the best legal
     /// XI, the captain counted twice, and a small allowance for the bench.
@@ -103,7 +164,7 @@ enum Optimizer {
     @inline(__always)
     static func scoringValue(_ squad: [Pick]) -> Double {
         guard let r = evaluate(squad) else { return -1e9 }
-        return r.total + r.capProj + benchValue * r.benchSum
+        return r.total + r.capProj + r.autosub + benchValue * r.benchSum
     }
 
     /// Budget and the max-three-per-club rule. Allocation-free.
@@ -173,8 +234,9 @@ enum Optimizer {
     /// already on screen is what stops the app rewriting the team on refresh.
     static func optimize(players: [Player], budgetM: Double, fitOnly: Bool,
                          seeds: [[Int]] = [], incumbent: [Int]? = nil,
-                         incumbentMargin: Double = 0, benchWeight: Double = 0.12,
-                         exactCaptain: Bool = true) -> SquadResult? {
+                         incumbentMargin: Double = 0, benchWeight: Double = SquadSolver.Weights().bench,
+                         exactCaptain: Bool = true,
+                         weightOverride: SquadSolver.Weights? = nil) -> SquadResult? {
         let budget = Int((budgetM * 10).rounded())
         let pool = candidatePool(players, fitOnly: fitOnly)
         // The incumbent must survive pool reduction even if it has gone stale,
@@ -187,8 +249,8 @@ enum Optimizer {
                 picks.append(p.pick(p.proj))
             }
         }
-        var weights = SquadSolver.Weights()
-        weights.bench = benchWeight
+        var weights = weightOverride ?? SquadSolver.Weights()
+        if weightOverride == nil { weights.bench = benchWeight }
         guard let chosen = SquadSolver.solve(
             pool: picks, budget: budget, weights: weights,
             seeds: seeds.map { $0.map(Int32.init) },

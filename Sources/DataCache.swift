@@ -24,6 +24,7 @@ enum DataCache {
     private static var bootURL: URL { dir.appendingPathComponent("bootstrap.json") }
     private static var fixturesURL: URL { dir.appendingPathComponent("fixtures.json") }
     private static var pastURL: URL { dir.appendingPathComponent("pastform.json") }
+    private static var recentURL: URL { dir.appendingPathComponent("recentminutes.json") }
 
     /// Decoded cached payload, or nil when there's nothing usable on disk.
     /// Runs off the main actor — decoding 1.3 MB is not free.
@@ -61,6 +62,18 @@ enum DataCache {
     static func write(pastForm book: PastFormBook) {
         guard let data = try? JSONEncoder().encode(book) else { return }
         try? data.write(to: pastURL, options: .atomic)
+    }
+
+    static func readRecentMinutes() -> RecentMinutes? {
+        guard let data = try? Data(contentsOf: recentURL),
+              let r = try? JSONDecoder().decode(RecentMinutes.self, from: data),
+              !r.isEmpty else { return nil }
+        return r
+    }
+
+    static func write(recent: RecentMinutes) {
+        guard let data = try? JSONEncoder().encode(recent) else { return }
+        try? data.write(to: recentURL, options: .atomic)
     }
 
     static var age: TimeInterval? {

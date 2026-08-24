@@ -278,6 +278,8 @@ struct PlayerRates {
     var formMult = 1.0    // recent form as a multiplier on attacking output
     var startSecurity = 0.0   // how safe the starting place looks, 0…1
     var defScale = 1.0    // this player's own concession rate vs his team's
+    var modelShare = 0.62 // weight on the rate model vs the history anchor
+    var formShare = 0.28  // weight on 30-day form inside the history anchor
 
     struct Components {
         var appearance = 0.0
@@ -316,12 +318,18 @@ struct PlayerRates {
         // *appearance*, so scaling by P(play) converts it to points per
         // gameweek — the unit everything else in this model uses.
         let hist = ppg * fx.histMult * max(pPlay, 0.3)
-        // form also scales the rate model above, so its share here is smaller
-        // than it was when the anchor was the only place it appeared
-        c.anchor = form > 0 ? 0.72 * hist + 0.28 * form * fx.histMult : hist
+        // Form is points per match over the last thirty days. In August that
+        // is one match, and taking it at a fixed share of the projection meant
+        // a single opening-day haul rewrote a player's whole season: a wing-back
+        // who scored seventeen once was projected above Haaland, and Haaland,
+        // who had a quiet afternoon, was marked down by a point and a half a
+        // week for it. The share now grows with the number of matches actually
+        // behind the average, exactly as it does where form scales the rate
+        // model.
+        c.anchor = form > 0 ? (1 - formShare) * hist + formShare * form * fx.histMult : hist
         c.ep = epNext * fx.histMult
 
-        let blended = 0.62 * c.model + 0.38 * c.anchor
+        let blended = modelShare * c.model + (1 - modelShare) * c.anchor
         // Smooth handoff to FPL's own estimate for thin-data players instead of
         // a hard cliff at 700 minutes, which made projections jump
         // discontinuously as minutes accumulated. `epWeight` is deliberately a
@@ -338,6 +346,56 @@ struct PlayerRates {
     func project(_ fx: FixtureContext) -> Double { components(fx).final }
 }
 
+/// The constants the model is most sensitive to, gathered in one place so they
+/// can be swept by the evaluation harness rather than guessed at. Everything
+/// here is fitted against out-of-sample data — see `README.md`, "Fitting".
+struct Tuning: Equatable {
+    /// Minutes at which the prior seasons carry half their opening weight.
+    var priorHalfLife = 900.0
+    /// Ceiling on prior minutes, so one huge season can't dominate forever.
+    var priorCap = 2600.0
+    /// The minutes model trusts the prior less than the scoring rates do: a
+    /// move, a new manager or a breakout changes minutes far faster than it
+    /// changes finishing.
+    var minutesPriorScale = 0.6
+    /// Pooled minutes at which a player's own rates are trusted 50%.
+    var credHalf = 540.0
+    /// Pooled minutes at which FPL's own cold-start estimate is dropped.
+    var epFade = 900.0
+    /// How hard 30-day form pulls attacking output, at full season length.
+    var formWeight = 0.4
+    /// Weight on the rate model against the points-per-appearance anchor. The
+    /// anchor — points per appearance — is a coarse number that quietly knows
+    /// everything the component model cannot see: the player's role, the
+    /// quality of the side around him, who takes the penalties. Out of sample
+    /// it beats the rate model outright when there is nothing but last season
+    /// to go on, so the rate model earns its weight as real minutes accumulate
+    /// rather than being handed it.
+    var modelShare = 0.32
+    var modelShareFull = 0.62
+    /// Recency weights on prior seasons, most recent first. Scoring rates are
+    /// stable and carry three seasons; minutes are not and barely carry one.
+    var recency: [Double] = [1.0, 0.45, 0.18]
+    var minutesRecency: [Double] = [1.0, 0.05, 0.0]
+    /// Decline applied per year of age past the peak, and where the peak sits.
+    var peakAge = 27.0
+    var agePenalty = 0.0
+    var ageFloor = 0.72
+    /// Extra minutes uncertainty for a player who changed club this summer.
+    var newClubMinutesDamp = 1.0
+    /// Weighted gameweeks of recent evidence at which the last few matches
+    /// carry as much weight as the whole season behind them.
+    var recentMinutesHalf = 1.6
+    /// Minutes fall away at the end of a career faster than finishing does.
+    var minutesPeakAge = 29.0
+    var minutesAgePenalty = 0.0
+    /// Replay support: the year the season being modelled kicked off, when it
+    /// isn't the one in the loaded fixture list.
+    var seasonYearOverride: Int?
+
+    static let `default` = Tuning()
+}
+
 struct ProjectionEngine {
     let boot: Bootstrap
     let fixtures: [APIFixture]
@@ -345,7 +403,13 @@ struct ProjectionEngine {
     let horizon: Int
     let statGames: Int
     let seasonUnderway: Bool
+    /// The calendar year this season kicked off in, taken from the first
+    /// deadline rather than from the clock, so a headless replay of an old
+    /// season ages its players correctly.
+    let seasonStartYear: Int
     let pastForm: PastFormBook
+    let recent: RecentMinutes
+    let tuning: Tuning
     private let ratings: TeamRatings
     private let ctx: [[[FixtureContext]]]        // team → gw → fixtures
 
@@ -395,7 +459,10 @@ struct ProjectionEngine {
     private static let bpsToBonus: [Double] = [0, 0, 0.01735, 0.01880, 0.03542]
 
     init(boot: Bootstrap, fixtures: [APIFixture], gwFrom: Int, horizon: Int,
-         pastForm: PastFormBook = PastFormBook()) {
+         pastForm: PastFormBook = PastFormBook(), recent: RecentMinutes = RecentMinutes(),
+         tuning: Tuning = .default) {
+        self.tuning = tuning
+        self.recent = recent
         self.boot = boot
         self.fixtures = fixtures
         self.gwFrom = gwFrom
@@ -411,6 +478,9 @@ struct ProjectionEngine {
         // one match per gameweek, so his minutes divided by 90 *is* the number
         // of gameweeks the totals cover, and in pre-season it lands on 38 by
         // itself.
+        let firstDeadline = boot.events.min { $0.id < $1.id }?.deadline_time ?? ""
+        self.seasonStartYear = Int(firstDeadline.prefix(4))
+            ?? Calendar.current.component(.year, from: Date())
         let maxMins = boot.elements.map(\.minutes).max() ?? 0
         let observed = Int((Double(maxMins) / 90).rounded(.up))
         self.statGames = max(observed, 1)
@@ -473,6 +543,43 @@ struct ProjectionEngine {
         (gwFrom..<min(gwFrom + horizon, 39)).flatMap { teamFixtures(teamId, gw: $0) }
     }
 
+    // MARK: - player context the feed only hints at
+
+    /// Rough age in years at the start of this season.
+    func age(of p: FPLElement) -> Double? {
+        guard let raw = p.birth_date, raw.count >= 4,
+              let year = Double(raw.prefix(4)) else { return nil }
+        return Double(tuning.seasonYearOverride ?? seasonStartYear) - year
+    }
+
+    /// Minutes fall away at the end of a career sooner and harder than
+    /// finishing does — a thirty-four-year-old who scored every other week last
+    /// season will still score, but he will start twenty games instead of
+    /// thirty-four.
+    func minutesAgeScale(of p: FPLElement) -> Double {
+        guard tuning.minutesAgePenalty > 0, let a = age(of: p),
+              a > tuning.minutesPeakAge else { return 1 }
+        return max(1 - tuning.minutesAgePenalty * (a - tuning.minutesPeakAge), 0.35)
+    }
+
+    /// Multiplier on attacking output for age. Fitted rather than assumed — see
+    /// the harness — and applied only past the peak, since the young end of the
+    /// curve is dominated by minutes rather than by rate.
+    func ageScale(of p: FPLElement) -> Double {
+        guard tuning.agePenalty > 0, let a = age(of: p), a > tuning.peakAge else { return 1 }
+        return max(1 - tuning.agePenalty * (a - tuning.peakAge), tuning.ageFloor)
+    }
+
+    /// How much of the minutes prior survives a summer move. A player's start
+    /// rate at his old club is evidence about the player; it is much weaker
+    /// evidence about what a new manager will do with him.
+    func minutesDamp(_ p: FPLElement) -> Double {
+        guard tuning.newClubMinutesDamp < 1,
+              let joined = p.team_join_date, joined.count >= 4,
+              let year = Int(joined.prefix(4)), year >= seasonStartYear else { return 1 }
+        return tuning.newClubMinutesDamp
+    }
+
     // MARK: player projections
 
     /// Derive a player's rate profile from their season stats — pooled with
@@ -500,9 +607,12 @@ struct ProjectionEngine {
         // The cap stops a 3,000-minute season from outweighing the current one
         // indefinitely, and `pScale` restates the prior's totals as if they had
         // been accumulated over `pMin` minutes, so pooling is just addition.
-        let past = pastForm[p.id] ?? PastForm()
-        let lam = 900 / (900 + mins)
-        let pMin = min(past.minutes, 2600) * lam
+        let history = pastForm[p.id] ?? PastForm()
+        let season = tuning.seasonYearOverride ?? seasonStartYear
+        let past = history.weighted(tuning.recency, season: season)
+        let pastMins = history.weighted(tuning.minutesRecency, season: season)
+        let lam = tuning.priorHalfLife / (tuning.priorHalfLife + mins)
+        let pMin = min(past.minutes, tuning.priorCap) * lam
         let pScale = past.minutes > 90 ? pMin / past.minutes : 0
         let effMins = mins + pMin
 
@@ -512,9 +622,9 @@ struct ProjectionEngine {
         }
 
         // ---- credibility: how much to trust the pooled rate estimates
-        let cred = effMins / (effMins + 540)          // ~6 full matches → 50%
+        let cred = effMins / (effMins + tuning.credHalf)   // ~6 full matches → 50%
         r.cred = cred
-        r.epWeight = 1 - min(effMins / 900, 1)        // gone by ~10 full matches
+        r.epWeight = 1 - min(effMins / tuning.epFade, 1)   // gone by ~10 full matches
 
         // ---- minutes model
         // Starts are the strongest available minutes signal, and the one that
@@ -523,10 +633,10 @@ struct ProjectionEngine {
         // carries proportionally less weight here than it does on scoring
         // rates, because a move, a new manager or a breakout changes minutes
         // far faster than it changes finishing.
-        let sScale = 0.6 * lam
-        let pGames = past.seasons * 38 * sScale
-        let pStarts = past.starts * sScale
-        let pMinsG = past.minutes * sScale
+        let sScale = tuning.minutesPriorScale * lam * minutesDamp(p)
+        let pGames = pastMins.seasons * 38 * sScale
+        let pStarts = pastMins.starts * sScale * minutesAgeScale(of: p)
+        let pMinsG = pastMins.minutes * sScale * minutesAgeScale(of: p)
         let effGames = games + pGames
         let effStarts = starts + pStarts
         let effMinsG = mins + pMinsG
@@ -535,8 +645,19 @@ struct ProjectionEngine {
         // modelled as P(appears | doesn't start) rather than inferred from
         // leftover minutes: residual-minute models break down because minutes
         // per start vary far more between players than the cameo rate does.
-        let startRate = min(effStarts / max(effGames, 1), 1)
-        let mpg = min(effMinsG / max(effGames, 1), 90)
+        var startRate = min(effStarts / max(effGames, 1), 1)
+        var mpg = min(effMinsG / max(effGames, 1), 90)
+
+        // What he has actually been doing lately. A season aggregate cannot
+        // tell a player who has started thirty and been dropped from one who
+        // has started thirty and is still first choice; the last six gameweeks
+        // can, and that distinction is worth more than any refinement of the
+        // scoring rates.
+        if let lately = recent.read(p.id), lately.evidence > 0 {
+            let w = lately.evidence / (lately.evidence + tuning.recentMinutesHalf)
+            startRate = w * lately.startRate + (1 - w) * startRate
+            mpg = w * (lately.minShare * 90) + (1 - w) * mpg
+        }
         let cameoOdds = 0.24 + 0.24 * min(startRate / 0.5, 1)
         r.pPlay = min(startRate + (1 - startRate) * cameoOdds, 1)
         r.p60 = startRate * 0.93           // cameos essentially never reach 60'
@@ -616,8 +737,9 @@ struct ProjectionEngine {
             || (p.direct_freekicks_order ?? 99) == 1
         if setPieces { xa90 *= 1.10 + 0.10 * (1 - cred) }
 
-        r.goalPts90 = Self.goalPts[pos] * xg90
-        r.assistPts90 = 3 * xa90
+        let age = ageScale(of: p)
+        r.goalPts90 = Self.goalPts[pos] * xg90 * age
+        r.assistPts90 = 3 * xa90 * age
 
         // ---- defensive contribution (2 pts at 10 CBIT / 12 CBIRT)
         // The per-90 feed only populates once the season is under way, and the
@@ -669,11 +791,17 @@ struct ProjectionEngine {
         // penalty box. Pooled the same way as everything else, so a player with
         // one gameweek behind him is anchored to what he actually is rather
         // than to what one afternoon said.
-        let pooledPoints = Double(p.total_points) + past.points * sScale
+        // Points and the games they were scored in must come from the same
+        // weighting, or the ratio is not a rate at all. Both use the minutes
+        // profile, which is the one the denominator is built from.
+        let pooledPoints = Double(p.total_points) + pastMins.points * sScale
         let apps = max(effGames * r.pPlay, 1)
         r.ppg = pooledPoints / apps
         r.form = Double(p.form ?? "") ?? 0
         r.epNext = Double(p.ep_next ?? "") ?? 0
+        r.modelShare = tuning.modelShare
+            + (tuning.modelShareFull - tuning.modelShare) * min(mins / 900, 1)
+        r.formShare = 0.28 * min(games / 4, 1)
 
         // ---- form
         // Form is points per match over the last 30 days; the anchor above is
@@ -688,7 +816,7 @@ struct ProjectionEngine {
         // the previous build ended up rating Haaland below a full-back.
         if seasonUnderway, r.ppg > 0.5, r.form > 0 {
             let trend = r.form / r.ppg
-            let weight = 0.4 * min(games / 4, 1)
+            let weight = tuning.formWeight * min(games / 4, 1)
             r.formMult = min(max(1 + weight * (trend - 1), 0.72), 1.45)
             r.goalPts90 *= r.formMult
             r.assistPts90 *= r.formMult
@@ -865,6 +993,7 @@ struct ProjectionEngine {
             pl.setPieces = (p.corners_and_indirect_freekicks_order ?? 99) == 1
                 || (p.direct_freekicks_order ?? 99) == 1
             pl.startRate = min(r.p60 / 0.93, 1)
+            pl.playProb = max(min(r.pPlay * r.avail, 1), 0.02)
             pl.startSecurity = r.startSecurity
             pl.formMult = r.formMult
             pl.ceiling = dist.ceiling; pl.haulProb = dist.haul; pl.blankProb = dist.blank

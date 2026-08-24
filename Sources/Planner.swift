@@ -119,7 +119,8 @@ final class PlanContext {
     let pool: [Int]                // compact indices of transfer candidates
     let picks: [Pick]              // identity/cost/team, proj filled per use
 
-    init(players: [Player], pool poolPlayers: [Player], from: Int, end: Int) {
+    init(players: [Player], pool poolPlayers: [Player], from: Int, end: Int,
+         decay: Double = Planner.decay) {
         self.players = players
         self.from = from
         self.end = end
@@ -138,7 +139,7 @@ final class PlanContext {
             var acc = 0.0
             var k = span - 1
             while k >= 0 {
-                acc = proj[base + k] + Planner.decay * acc
+                acc = proj[base + k] + decay * acc
                 weighted[base + k] = acc
                 k -= 1
             }
@@ -174,8 +175,18 @@ enum Planner {
 
     /// Extra gain a move must show before it is worth taking a −4. Four points
     /// is the cost; the margin on top covers the fact that a projection made
-    /// weeks out is an estimate, not a promise.
-    static let hitGainThreshold = 6.0
+    /// Extra gain a move must show before it is worth taking a −4.
+    ///
+    /// The break-even value is four: that is literally what the hit costs. This
+    /// was set at six, a conservatism premium with nothing behind it, and over
+    /// five hundred simulated seasons that premium measured as costing about
+    /// five and a half points a year — the planner was passing up moves that
+    /// paid for themselves. Refusing hits altogether costs thirty-six. The half
+    /// point above break-even is deliberate and is the one part of this the
+    /// simulation cannot price: it draws outcomes from the model's own
+    /// projections, so it never sees the model be wrong in a way that a real
+    /// season will.
+    static let hitGainThreshold = 4.5
 
     /// The floor under every transfer decision. A move has to add at least this
     /// much to the eleven that actually score before it is worth making at all,
@@ -664,6 +675,7 @@ enum Planner {
                 // four moves a week — past that the plan stops being something a
                 // person would actually sit down and execute.
                 var made = 0
+
                 while made < 4 {
                     guard let best = bestTransfer(ctx: ctx, squad: squad, bank: bank, from: g,
                                                   boughtAt: boughtAt, soldAt: soldAt)
@@ -714,9 +726,12 @@ enum Planner {
 
             for (k, i) in squad.enumerated() { gwPicks[k] = ctx.pick(i, g) }
             guard let r = Optimizer.evaluate(gwPicks) else { continue }
-            var pts = r.total + r.capProj - Double(hitPts)
+            // A bench boost pays the bench in full, so the auto-substitution
+            // allowance must come off — those points are already counted once
+            // in `benchSum` and cannot be earned twice.
+            var pts = r.total + r.capProj + r.autosub - Double(hitPts)
             if case .tripleCaptain? = chips[g] { pts += r.capProj }   // ×3 in total
-            if case .benchBoost? = chips[g] { pts += r.benchSum }
+            if case .benchBoost? = chips[g] { pts += r.benchSum - r.autosub }
 
             res.totalPts += pts
             if chipName != "wildcard" { res.totalTransfers += moves.count }
@@ -835,7 +850,11 @@ enum Planner {
     /// Four is both the most active and the highest scoring — the shorter window
     /// is not a trade-off against accuracy, it is a better model of how the team
     /// is actually managed.
-    static let transferLookahead = 4
+    /// How many gameweeks a transfer is judged over. Measured against
+    /// simulated seasons: judging on the next week alone costs fifty points a
+    /// season, two weeks twenty-seven, three weeks eight. The curve flattens
+    /// after six, which is roughly how long a fixture run holds its shape.
+    static let transferLookahead = 6
 
     /// The best transfer available, measured by what the squad actually scores.
     ///
@@ -847,13 +866,144 @@ enum Planner {
     /// with a slightly better fourth-choice forward looked exactly as valuable
     /// as the same upgrade to a starter, and the planner duly spent free
     /// transfers on players who could not score it a single point.
-    private static func bestTransfer(ctx: PlanContext, squad: [Int], bank: Int, from g: Int,
-                                     boughtAt: [Int: Int] = [:], soldAt: [Int: Int] = [:])
+    /// The best *pair* of moves, including pairs where one of them is a
+    /// downgrade.
+    ///
+    /// Shown to the reader, never taken automatically. Taking pairs was tried
+    /// and measured over two hundred simulated seasons: it loses points at
+    /// every threshold, because spending two transfers in one week burns the
+    /// banked one that the following week — with a fresh injury list — would
+    /// have spent better. A pair is a thing a manager sometimes has a reason to
+    /// do; it is not a thing a planner should do on its own.
+    ///
+    /// This is the move set the old planner could not see. It made transfers
+    /// one at a time, each judged on its own, so the most valuable pattern in
+    /// the game — sell a midfielder you can live without to afford the striker
+    /// you can't — was invisible: step one loses points on its own and was
+    /// rejected before step two was ever considered. The search below scores
+    /// both legs together, against the same eleven, over the same window.
+    ///
+    /// Exhaustive pairing is fifteen slots by a dozen candidates squared, so it
+    /// is bounded instead: every slot's best possible gain is known in advance,
+    /// which caps what any pair containing it can be worth, and both loops stop
+    /// as soon as that cap falls below the best pair already found.
+    struct PairMove {
+        var outA: Int, innA: Int
+        var outB: Int, innB: Int
+        var gain: Double
+    }
+
+    static func bestPair(ctx: PlanContext, squad: [Int], bank: Int, from g: Int,
+                         boughtAt: [Int: Int] = [:], soldAt: [Int: Int] = [:]) -> PairMove? {
+        let last = min(g + transferLookahead - 1, ctx.end)
+        guard g <= last, squad.count == 15 else { return nil }
+        let weeks = Array(g...last)
+        var base: [[Pick]] = weeks.map { h in squad.map { ctx.pick($0, h) } }
+        let baseValue = base.map { Optimizer.scoringValue($0) }
+        let squadSet = Set(squad)
+        var clubs = [Int](repeating: 0, count: 32)
+        for i in squad { clubs[Int(ctx.picks[i].team)] += 1 }
+
+        // The most cash any single other slot can release, which is what a
+        // funded upgrade is allowed to spend beyond the bank.
+        var release = 0
+        for out in squad {
+            let outPick = ctx.picks[out]
+            let cheapest = ctx.pool
+                .filter { ctx.picks[$0].pos == outPick.pos && !squadSet.contains($0) }
+                .map { Int(ctx.picks[$0].cost) }.min() ?? Int(outPick.cost)
+            release = max(release, Int(outPick.cost) - cheapest)
+        }
+
+        struct Candidate { let slot: Int, out: Int, inn: Int, delta: Double, spend: Int }
+        var perSlot: [[Candidate]] = []
+        var slotBest = [Double](repeating: -.infinity, count: 15)
+        for (slot, out) in squad.enumerated() {
+            let outPick = ctx.picks[out]
+            let outValue = ctx.weighted(out, g)
+            let ceiling = Int(outPick.cost) + bank + release
+            var options: [Candidate] = []
+            for inn in ctx.pool {
+                let innPick = ctx.picks[inn]
+                guard innPick.pos == outPick.pos, !squadSet.contains(inn),
+                      Int(innPick.cost) <= ceiling else { continue }
+                let count = clubs[Int(innPick.team)] - (innPick.team == outPick.team ? 1 : 0)
+                guard count < 3 else { continue }
+                options.append(Candidate(slot: slot, out: out, inn: inn,
+                                         delta: ctx.weighted(inn, g) - outValue,
+                                         spend: Int(innPick.cost) - Int(outPick.cost)))
+            }
+            options.sort { $0.delta != $1.delta ? $0.delta > $1.delta : $0.inn < $1.inn }
+            // Keep the best upgrades, and separately the moves that raise the
+            // most money for the least loss — the funding half of a pair.
+            var kept = Array(options.prefix(10))
+            let funders = options
+                .filter { $0.spend < 0 }
+                .sorted { $0.delta / Double(-$0.spend + 1) > $1.delta / Double(-$1.spend + 1) }
+                .prefix(6)
+            for f in funders where !kept.contains(where: { $0.inn == f.inn }) { kept.append(f) }
+            slotBest[slot] = kept.first?.delta ?? -.infinity
+            perSlot.append(kept)
+        }
+
+        func churn(_ out: Int, _ inn: Int) -> Double {
+            var penalty = 0.0
+            if let b = boughtAt[out], g - b < holdingPeriod { penalty += churnCost }
+            if let sld = soldAt[inn], g - sld < holdingPeriod { penalty += churnCost }
+            return penalty
+        }
+
+        var best: PairMove?
+        let order = (0..<15).sorted { slotBest[$0] > slotBest[$1] }
+        for (oi, sa) in order.enumerated() {
+            for sb in order.dropFirst(oi + 1) {
+                // nothing in this slot pair can beat what we already have
+                if let best, slotBest[sa] + slotBest[sb] <= best.gain { continue }
+                for a in perSlot[sa] {
+                    if let best, a.delta + slotBest[sb] <= best.gain { break }
+                    for b in perSlot[sb] {
+                        if let best, a.delta + b.delta <= best.gain { break }
+                        guard a.inn != b.inn, a.spend + b.spend <= bank else { continue }
+                        // the max-three rule applies to the pair, not each leg
+                        let ta = Int(ctx.picks[a.inn].team), tb = Int(ctx.picks[b.inn].team)
+                        var counts = clubs
+                        counts[Int(ctx.picks[a.out].team)] -= 1
+                        counts[Int(ctx.picks[b.out].team)] -= 1
+                        counts[ta] += 1
+                        counts[tb] += 1
+                        guard counts[ta] <= 3, counts[tb] <= 3 else { continue }
+
+                        var total = 0.0
+                        var w = 1.0
+                        for (k, h) in weeks.enumerated() {
+                            let ka = base[k][sa], kb = base[k][sb]
+                            base[k][sa] = ctx.pick(a.inn, h)
+                            base[k][sb] = ctx.pick(b.inn, h)
+                            total += (Optimizer.scoringValue(base[k]) - baseValue[k]) * w
+                            base[k][sa] = ka
+                            base[k][sb] = kb
+                            w *= decay
+                        }
+                        total -= churn(a.out, a.inn) + churn(b.out, b.inn)
+                        if best == nil || total > best!.gain {
+                            best = PairMove(outA: a.out, innA: a.inn,
+                                            outB: b.out, innB: b.inn, gain: total)
+                        }
+                    }
+                }
+            }
+        }
+        return best
+    }
+
+    static func bestTransfer(ctx: PlanContext, squad: [Int], bank: Int, from g: Int,
+                             boughtAt: [Int: Int] = [:], soldAt: [Int: Int] = [:],
+                             lookahead: Int = transferLookahead)
         -> (out: Int, inn: Int, gain: Double)? {
         var clubs = [Int](repeating: 0, count: 32)
         for i in squad { clubs[Int(ctx.picks[i].team)] += 1 }
         let squadSet = Set(squad)
-        let last = min(g + transferLookahead - 1, ctx.end)
+        let last = min(g + max(lookahead, 1) - 1, ctx.end)
         guard g <= last else { return nil }
         let weeks = Array(g...last)
 

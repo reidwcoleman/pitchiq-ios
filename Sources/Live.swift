@@ -243,3 +243,85 @@ extension FPLService {
         return try JSONDecoder().decode(EntryPicks.self, from: data)
     }
 }
+
+// MARK: - Recent minutes
+//
+// A season-long start rate is a lagging indicator, and it lags in exactly the
+// situation that costs the most points: a player who lost his place a month ago
+// still reads as nailed-on for weeks, because thirty starts in the bank drown
+// out four on the bench. Between seasons the model already weights the recent
+// past far more heavily than the distant past; within a season it was doing the
+// opposite, treating August and last Saturday as the same evidence.
+//
+// The fix needs per-gameweek minutes, and those are already published in the
+// payload the live screen reads. Six small requests — one per recent gameweek —
+// give the whole league's rotation history, and they only change when a
+// gameweek does.
+
+struct RecentMinutes: Codable {
+    /// player id → minutes, most recent gameweek first
+    var byId: [Int: [Int]] = [:]
+    var throughGw = 0
+    var gameweeks = 0
+
+    var isEmpty: Bool { byId.isEmpty || gameweeks == 0 }
+
+    /// How much of a 90-minute match the player has averaged lately, and how
+    /// often he has started, with the most recent weeks counting most.
+    static let weights: [Double] = [1.0, 0.82, 0.66, 0.5, 0.36, 0.24]
+
+    struct Read {
+        var startRate = 0.0     // weighted share of recent matches started
+        var minShare = 0.0      // weighted share of 90 minutes played
+        var evidence = 0.0      // weighted number of gameweeks behind it
+    }
+
+    func read(_ id: Int) -> Read? {
+        guard let mins = byId[id], !mins.isEmpty else { return nil }
+        var out = Read()
+        var total = 0.0
+        for (i, m) in mins.enumerated() {
+            guard i < Self.weights.count else { break }
+            let w = Self.weights[i]
+            total += w
+            // 60 minutes is the line the game itself draws, and it separates a
+            // start from a cameo more reliably than any other single number.
+            out.startRate += w * (m >= 60 ? 1 : 0)
+            out.minShare += w * min(Double(m) / 90, 1)
+        }
+        guard total > 0 else { return nil }
+        out.startRate /= total
+        out.minShare /= total
+        out.evidence = total
+        return out
+    }
+}
+
+extension FPLService {
+    /// Per-gameweek minutes for the whole league over the last few gameweeks.
+    /// Six requests, and only when the gameweek has moved on.
+    static func fetchRecentMinutes(through gw: Int, weeks: Int = 6) async -> RecentMinutes {
+        var out = RecentMinutes()
+        out.throughGw = gw
+        let range = stride(from: gw, through: max(gw - weeks + 1, 1), by: -1)
+        for (offset, g) in range.enumerated() {
+            guard let payload = try? await fetchLive(gw: g) else { continue }
+            var any = false
+            for element in payload.elements where element.stats.minutes > 0 || element.stats.starts > 0 {
+                any = true
+                var row = out.byId[element.id] ?? []
+                while row.count < offset { row.append(0) }
+                row.append(element.stats.minutes)
+                out.byId[element.id] = row
+            }
+            // A gameweek nobody has played yet is not evidence of anything.
+            if any { out.gameweeks += 1 } else { break }
+        }
+        // Pad the players who missed a week entirely, so position in the array
+        // still means "how many gameweeks ago".
+        for (id, row) in out.byId where row.count < out.gameweeks {
+            out.byId[id] = row + [Int](repeating: 0, count: out.gameweeks - row.count)
+        }
+        return out
+    }
+}

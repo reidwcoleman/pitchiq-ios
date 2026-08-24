@@ -149,6 +149,11 @@ struct FPLElement: Decodable {
     let influence: String?
     let expected_goal_involvements_per_90: Double?
     let starts_per_90: Double?
+    /// Age and the date the player joined his current club. Both matter: output
+    /// declines after the late twenties, and a player three weeks into a new
+    /// club has a minutes history that belongs to a different manager.
+    let birth_date: String?
+    let team_join_date: String?
     let clean_sheets_per_90: Double?
     let chance_of_playing_this_round: Int?
     let dreamteam_count: Int?
@@ -368,6 +373,10 @@ struct Pick {
     let team: Int8
     let cost: Int16
     var proj: Double
+    /// P(the player appears at all this gameweek). Carried into the optimiser
+    /// because it is what decides whether a bench is worth anything: a
+    /// substitute is paid exactly when a starter doesn't turn up.
+    let play: Float
 
     @inline(__always)
     init(_ p: Player, proj: Double) {
@@ -376,6 +385,7 @@ struct Pick {
         self.team = Int8(p.team)
         self.cost = Int16(p.cost)
         self.proj = proj
+        self.play = Float(p.playProb)
     }
 }
 
@@ -422,6 +432,7 @@ struct Player: Identifiable, Hashable {
     var penTaker = false
     var setPieces = false
     var startRate = 0.0     // P(starts) — the minutes-security number
+    var playProb = 0.85     // P(appears at all in a given gameweek)
     var startSecurity = 0.0 // how safe the starting place looks over months, 0…1
     var formMult = 1.0      // recent form as a multiplier on attacking output
 

@@ -6,8 +6,7 @@ import Foundation
 // also when transfers matter most. After one gameweek FPL's own feed says
 // Haaland's expected goals are 0.85/90 off ninety minutes and his points per
 // game is 2.0 — so a model that trusts only this season shrinks him toward a
-// generic forward and ranks a full-back who happened to score above him. That
-// is exactly what this app did.
+// generic forward and ranks a full-back who happened to score above him.
 //
 // The fix is not to distrust the current season; it is to stop pretending the
 // previous ones never happened. FPL publishes every player's per-season totals
@@ -15,10 +14,21 @@ import Foundation
 // expected goals conceded, BPS and starts, back to 2022/23. Those become the
 // prior. This season's numbers are then evidence *against* that prior, and by
 // October they dominate it on their own.
+//
+// The seasons are stored as they came, and weighted at the point of use. Two
+// different weightings are needed and they are not close: scoring rates carry
+// three seasons back because finishing is stable, while minutes barely carry
+// one, because a move, a new manager or a breakout rewrites a player's role in
+// a summer. Measured out of sample, splitting them is worth more than any other
+// single change in the model.
 
 /// One prior season as FPL publishes it. Only the fields the model reads.
 struct PastSeason: Decodable {
     let season_name: String
+    /// Price at the start and end of that season, which is what makes a
+    /// historical squad backtest possible at all.
+    let start_cost: Int?
+    let end_cost: Int?
     let minutes: Int
     let starts: Int?
     let total_points: Int
@@ -43,10 +53,68 @@ struct ElementSummary: Decodable {
     let history_past: [PastSeason]
 }
 
+/// One season, kept whole so it can be weighted differently by different parts
+/// of the model — and shown as-is on a player card.
+struct SeasonLine: Codable, Equatable {
+    var name = ""
+    var minutes = 0.0
+    var starts = 0.0
+    var points = 0.0
+    var goals = 0.0
+    var assists = 0.0
+    var cleanSheets = 0.0
+    var bonus = 0.0
+    var bps = 0.0
+    var defcon = 0.0
+    var saves = 0.0
+    var yellows = 0.0
+    var reds = 0.0
+    var xg = 0.0
+    var xa = 0.0
+    var xgc = 0.0
+    var threat = 0.0
+    var creativity = 0.0
+
+    /// The calendar year the season began, so a season can be weighted by how
+    /// long ago it was rather than by its position in a list. A player who
+    /// missed a whole year through injury has a "previous season" that is two
+    /// years old, and it should not be treated as if it were last May.
+    var startYear: Int { Int(name.prefix(4)) ?? 0 }
+
+    var per90: Double { minutes > 0 ? points / minutes * 90 : 0 }
+    var xg90: Double { minutes > 0 ? xg / minutes * 90 : 0 }
+    var xa90: Double { minutes > 0 ? xa / minutes * 90 : 0 }
+    /// Share of a 38-game season the player started.
+    var startShare: Double { min(starts / 38, 1) }
+
+    init(_ s: PastSeason) {
+        name = s.season_name
+        minutes = Double(s.minutes)
+        starts = Double(s.starts ?? 0)
+        points = Double(s.total_points)
+        goals = Double(s.goals_scored)
+        assists = Double(s.assists)
+        cleanSheets = Double(s.clean_sheets)
+        bonus = Double(s.bonus)
+        bps = Double(s.bps)
+        defcon = Double(s.defensive_contribution ?? 0)
+        saves = Double(s.saves)
+        yellows = Double(s.yellow_cards)
+        reds = Double(s.red_cards)
+        xg = Double(s.expected_goals ?? "") ?? 0
+        xa = Double(s.expected_assists ?? "") ?? 0
+        xgc = Double(s.expected_goals_conceded ?? "") ?? 0
+        threat = Double(s.threat ?? "") ?? 0
+        creativity = Double(s.creativity ?? "") ?? 0
+    }
+
+    init() {}
+}
+
 /// Recency-weighted totals across a player's previous seasons. Everything is a
 /// weighted *total*, not a rate, so it can be folded into this season's totals
 /// as pseudo-observations and read back as a per-90 in one place.
-struct PastForm: Codable {
+struct Weighted {
     var minutes = 0.0
     var starts = 0.0
     var seasons = 0.0          // weighted season count — the games denominator
@@ -65,84 +133,67 @@ struct PastForm: Codable {
     var cleanSheets = 0.0
     var threat = 0.0
     var creativity = 0.0
-    /// The most recent season on its own, unweighted — what a player card
-    /// shows when it says "last season".
-    var last: SeasonLine?
-
-    var isEmpty: Bool { minutes < 90 }
-
-    /// How much a season counts for, by how long ago it was. A player's last
-    /// season is the single best guide to the next one; two seasons back still
-    /// carries signal about level, three is mostly noise about a different
-    /// player. Weights fall off fast enough that a 30-year-old's peak four
-    /// years ago doesn't hold up his projection.
-    static let recency: [Double] = [1.0, 0.45, 0.18]
-
-    /// Build from `history_past`, most recent season last (the order FPL uses).
-    init(seasons list: [PastSeason]) {
-        if let recent = list.filter({ $0.minutes > 0 }).max(by: { $0.season_name < $1.season_name }) {
-            last = SeasonLine(recent)
-        }
-        let ordered = list.sorted { $0.season_name < $1.season_name }.suffix(Self.recency.count)
-        for (i, s) in ordered.enumerated().reversed() {
-            let age = ordered.count - 1 - i
-            guard age < Self.recency.count, s.minutes > 0 else { continue }
-            let w = Self.recency[age]
-            minutes += w * Double(s.minutes)
-            starts += w * Double(s.starts ?? 0)
-            seasons += w
-            points += w * Double(s.total_points)
-            goals += w * Double(s.goals_scored)
-            assists += w * Double(s.assists)
-            xg += w * (Double(s.expected_goals ?? "") ?? 0)
-            xa += w * (Double(s.expected_assists ?? "") ?? 0)
-            xgc += w * (Double(s.expected_goals_conceded ?? "") ?? 0)
-            bonus += w * Double(s.bonus)
-            bps += w * Double(s.bps)
-            defcon += w * Double(s.defensive_contribution ?? 0)
-            saves += w * Double(s.saves)
-            yellows += w * Double(s.yellow_cards)
-            reds += w * Double(s.red_cards)
-            cleanSheets += w * Double(s.clean_sheets)
-            threat += w * (Double(s.threat ?? "") ?? 0)
-            creativity += w * (Double(s.creativity ?? "") ?? 0)
-        }
-    }
-
-    init() {}
 }
 
-/// One season as a player card shows it.
-struct SeasonLine: Codable, Equatable {
-    var name = ""
-    var minutes = 0
-    var starts = 0
-    var points = 0
-    var goals = 0
-    var assists = 0
-    var cleanSheets = 0
-    var bonus = 0
-    var xg = 0.0
-    var xa = 0.0
+/// A player's previous seasons, most recent first.
+struct PastForm: Codable {
+    var lines: [SeasonLine] = []
 
-    var per90: Double { minutes > 0 ? Double(points) / Double(minutes) * 90 : 0 }
-    var xg90: Double { minutes > 0 ? xg / Double(minutes) * 90 : 0 }
-    var xa90: Double { minutes > 0 ? xa / Double(minutes) * 90 : 0 }
+    /// The most recent season on its own — what a player card shows when it
+    /// says "last season".
+    var last: SeasonLine? { lines.first }
+    var isEmpty: Bool { (lines.first?.minutes ?? 0) < 90 && totalMinutes < 90 }
+    var totalMinutes: Double { lines.reduce(0) { $0 + $1.minutes } }
 
-    init(_ s: PastSeason) {
-        name = s.season_name
-        minutes = s.minutes
-        starts = s.starts ?? 0
-        points = s.total_points
-        goals = s.goals_scored
-        assists = s.assists
-        cleanSheets = s.clean_sheets
-        bonus = s.bonus
-        xg = Double(s.expected_goals ?? "") ?? 0
-        xa = Double(s.expected_assists ?? "") ?? 0
+    /// Default weights on scoring rates: a player's last season is the best
+    /// guide to the next one, two seasons back still says something about his
+    /// level, three is mostly noise about a different player.
+    static let recency: [Double] = [1.0, 0.45, 0.18]
+    /// Minutes decay far faster. Fitted out of sample; see `Tuning`.
+    static let minutesRecency: [Double] = [1.0, 0.05, 0.0]
+
+    init(seasons list: [PastSeason]) {
+        lines = list
+            .filter { $0.minutes > 0 }
+            .sorted { $0.season_name > $1.season_name }
+            .prefix(4)
+            .map(SeasonLine.init)
     }
 
     init() {}
+
+    /// Weighted totals under an arbitrary recency profile. `season` is the
+    /// year the season being projected began; each line is weighted by how many
+    /// years back it was, not by where it sits in the list.
+    func weighted(_ recency: [Double], season: Int = 0) -> Weighted {
+        var w = Weighted()
+        let newest = lines.first?.startYear ?? 0
+        let reference = season > newest ? season : newest + 1
+        for (i, line) in lines.enumerated() {
+            let back = line.startYear > 0 ? reference - line.startYear : i + 1
+            guard back >= 1, back <= recency.count else { continue }
+            let k = recency[back - 1]
+            w.minutes += k * line.minutes
+            w.starts += k * line.starts
+            w.seasons += k
+            w.points += k * line.points
+            w.goals += k * line.goals
+            w.assists += k * line.assists
+            w.xg += k * line.xg
+            w.xa += k * line.xa
+            w.xgc += k * line.xgc
+            w.bonus += k * line.bonus
+            w.bps += k * line.bps
+            w.defcon += k * line.defcon
+            w.saves += k * line.saves
+            w.yellows += k * line.yellows
+            w.reds += k * line.reds
+            w.cleanSheets += k * line.cleanSheets
+            w.threat += k * line.threat
+            w.creativity += k * line.creativity
+        }
+        return w
+    }
 }
 
 /// Prior form for every player, keyed by this season's element id.

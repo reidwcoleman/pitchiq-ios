@@ -41,6 +41,9 @@ final class AppState: ObservableObject {
     /// Prior-season form for every player. Empty until the first fetch lands;
     /// the projections work without it and get materially better with it.
     @Published var pastForm = PastFormBook()
+    /// Per-gameweek minutes over the last few weeks — the rotation signal a
+    /// season aggregate cannot carry.
+    @Published var recentMinutes = RecentMinutes()
     /// The gameweek in progress: every player's points as they are scored.
     @Published var live = LiveBook()
     @Published var liveSquad = LiveSquad()
@@ -218,9 +221,10 @@ final class AppState: ObservableObject {
     func load() async {
         if boot == nil {
             let cached = await Task.detached(priority: .userInitiated) {
-                (DataCache.read(), DataCache.readPastForm())
+                (DataCache.read(), DataCache.readPastForm(), DataCache.readRecentMinutes())
             }.value
             if let book = cached.1 { pastForm = book }
+            if let r = cached.2 { recentMinutes = r }
             if let payload = cached.0 {
                 apply(boot: payload.boot, fixtures: payload.fixtures, stamp: payload.fetched)
             }
@@ -237,7 +241,24 @@ final class AppState: ObservableObject {
             await connect(entryId: id)
         }
         await refreshLive()
+        await refreshRecentMinutesIfNeeded()
         await refreshPastFormIfNeeded()
+    }
+
+    /// One request per recent gameweek, and only when the gameweek has moved
+    /// on — the answer cannot change until a match is played.
+    private func refreshRecentMinutesIfNeeded() async {
+        let latest = liveGw
+        guard latest >= 1, recentMinutes.throughGw < latest || recentMinutes.isEmpty else { return }
+        let fetched = await FPLService.fetchRecentMinutes(through: latest)
+        guard !fetched.isEmpty else { return }
+        recentMinutes = fetched
+        DataCache.write(recent: fetched)
+        engine = nil
+        engineGw = nil
+        modelPlayers = []
+        cachedPlanKey = nil
+        rebuild()
     }
 
     /// Six hundred requests, so this runs at most once a week — and once
@@ -339,7 +360,8 @@ final class AppState: ObservableObject {
             eng = e
         } else {
             eng = ProjectionEngine(boot: boot, fixtures: fixtures, gwFrom: gwFrom,
-                                   horizon: horizon, pastForm: pastForm)
+                                   horizon: horizon, pastForm: pastForm,
+                                   recent: recentMinutes)
             engine = eng
             engineGw = gwFrom
             modelPlayers = []

@@ -368,14 +368,127 @@ Sources/
   Views/              Live · Team · Transfers · Players+Fixtures · Captain
 ```
 
+## Is it any good?
+
+Nothing below is an opinion. Everything the model does that could be measured,
+was, and two ideas that seemed obviously right were measured, found to lose
+points, and thrown away.
+
+### Replaying finished seasons (`Tools/`, `bench --eval`)
+
+FPL publishes per-season totals back to 2022/23, which is as far back as
+expected goals go. So the model can be handed everything up to the end of one
+season — with every current-season number, including FPL's own `ep_next`,
+blanked — and asked about the next one. Three seasons can be replayed that way.
+
+| | before | after |
+|---|---|---|
+| rank correlation (Spearman) | 0.453 | 0.457 |
+| points held by the fifty players it liked most | 76% | 77% |
+| actual points of a £100m fifteen picked on its ranking | 1583 | 1596 |
+
+For scale: picking on last season's points alone scores about 1360, picking the
+most expensive squad you can afford about 1300, and perfect hindsight 2050.
+
+### Where the error is (`bench --diagnose`)
+
+This is the number that decided what to work on. Give the model the *real*
+minutes each player went on to play, and its scoring rates explain almost
+everything:
+
+| season | as shipped | with perfect minutes | with perfect rates |
+|---|---|---|---|
+| 2023/24 | r 0.49 | **r 0.85** | r 0.64 |
+| 2024/25 | r 0.51 | **r 0.90** | r 0.50 |
+| 2025/26 | r 0.41 | **r 0.85** | r 0.47 |
+
+The rate model is close to the ceiling. Essentially all the remaining error is
+in predicting who plays — which is why the minutes model gets its own recency
+profile, its own evidence-weighted shrinkage, and the last six gameweeks read
+straight from the live feed.
+
+### Fitting the constants (`bench --sweep`, `bench --tune --cv`)
+
+Coordinate descent over a dozen constants on three seasons finds something; the
+question is whether what it finds is real. Leave-one-season-out says the honest
+gain from fitting on top of the shipped values is under one percent, and the
+seasons disagree about most knobs. So the constants are swept one at a time with
+every season shown separately, and only changes that move all three the same way
+are kept. Three did:
+
+* **minutes carry their own recency.** Scoring rates are stable and take three
+  seasons; minutes take barely one. Splitting them was the largest single gain.
+* **seasons are weighted by how long ago they were**, not by their position in a
+  list — a player who missed a year has a "last season" that is two years old.
+* **the history anchor beats the rate model when there is nothing but last
+  season to go on.** Points per appearance quietly knows the things the
+  component model can't see: role, team quality, who takes the penalties. So the
+  rate model earns its weight as real minutes accumulate instead of being handed
+  it.
+
+An age penalty on scoring rates looked like a consistent winner right up until
+the anchor was reweighted, after which the fitter stopped reaching for it —
+it had been standing in for what the anchor already knew. It isn't in the model.
+
+### Simulating seasons to test decisions (`bench --policy`)
+
+Forecasts can be checked against history. Decisions can't: there is no record of
+what a squad would have scored had it been managed differently. So the decision
+layer is tested against drawn seasons instead — the model's own projections as
+the truth, plus the two things that make managing hard, players who don't turn up
+and players who get injured for weeks. Every policy sees the same draws, so a
+difference in final points is a difference in decision quality.
+
+Over 500 simulated seasons, starting from a squad that needs work:
+
+| | points |
+|---|---|
+| the old rules (4-gameweek view, −4 bar of 6) | 2185 |
+| **the rules now (6-gameweek view, −4 bar of 4.5)** | **2191** (+5.7 ± 4.2) |
+| never take a hit | 2181 (−4.2) |
+| at most one transfer a week | 2179 (−6.9) |
+
+**Two things were tried and rejected.** Judging transfers over one gameweek
+instead of six costs fifty points a season. And a search for the best *pair* of
+transfers — including the classic downgrade-to-fund-an-upgrade, which the app
+genuinely could not see before — turns out to *lose* points when the planner is
+allowed to act on it, at every threshold tested, because spending two transfers
+this week burns the banked one that next week's injury list would have spent
+better. The search is still there and still shown to you; the planner just
+doesn't take pairs on its own.
+
 ### Testing the engine without a simulator
 
 Every file above except `AppState`, `Theme` and `Views/` is Foundation-only, so
 the model can be compiled and run headlessly against cached JSON:
 
 ```bash
-swiftc -O -o bench main.swift \
+swiftc -O -o bench main.swift eval.swift \
+  Tools/{Simulate,PolicyBench}.swift \
   Sources/{Engine,Optimizer,Solver,Planner,Advisor,FPLModels,History,Live,DataCache}.swift
+```
+
+| command | what it answers |
+|---|---|
+| `bench --eval` | how well did it predict each replayable season |
+| `bench --diagnose` | is the error in the rates or in the minutes |
+| `bench --sweep` | what does each constant do, season by season |
+| `bench --tune --cv` | does fitting them generalise, or is it noise |
+| `bench --policy` | does a change to the decision rules win points |
+| `bench --why <name>` | where one player's projection came from, line by line |
+
+`--why` is the one to reach for first when a projection looks wrong. It prints
+the minutes model, the history anchor and every component of the rate model side
+by side, which is how the form bug below was found:
+
+```
+Haaland  (pos 4, £15.5m)
+  this season   90 mins, 1 starts, 2 pts
+  2025/26       2953 mins, 34 starts, 239 pts  (7.28 per 90)
+  minutes model  pPlay 0.95  p60 0.83  minShare 0.87 (78 mins/match)
+  anchor         6.38 pts per appearance × 0.95 = 6.03 per gameweek
+  rate model     appearance 1.78  goals 2.14  assists 0.29  bonus 0.76
+  blend          model 4.92 × 0.35  +  anchor 5.59 × 0.65  →  5.35
 ```
 
 The calibration check worth running after any engine change is the league-wide
@@ -392,6 +505,15 @@ opponents, averaged over all 38 matches, is its own season-long verdict on that
 club, and it separates Manchester City (4.50) from Coventry (2.00) before a ball
 is kicked. `TeamRatings.seedStrength` builds the prior from it, and a club's own
 expected goals only take over at half weight after eight matches.
+
+**Form is one match in August.** FPL's `form` field is points per match over
+the last thirty days, and it was used at a fixed 28% share of the projection.
+In gameweek 2 that is a single afternoon: a wing-back who scored seventeen once
+was projected above Haaland, and Haaland, who had a quiet opener, was marked
+down by a point and a half a week for it. The share now grows with the number of
+matches actually behind the average. The historical harness cannot catch this
+class of bug — it blanks the current season, so `form` is always zero there —
+which is what `--why` is for.
 
 **`price_change_percent` is a string.** So are `projected_percent`, `form`,
 `points_per_game` and every expected-goals field. `price_change_hourly_rate` and

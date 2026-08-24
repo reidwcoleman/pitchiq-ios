@@ -41,12 +41,17 @@ enum SquadSolver {
     ]
 
     struct Weights {
-        /// How much a bench place is worth relative to a starting place. Bench
-        /// players score only through auto-substitutions and Bench Boost, but a
-        /// squad whose bench is worthless is one injury from a hole in the XI.
-        var bench = 0.12
-        /// 1.0 = the captain's score is added a second time, as in the game.
+        /// Extra weight on the bench beyond the auto-substitution value the
+        /// evaluator already pays it — for the Bench Boost it will eventually
+        /// be used on, and for the freedom a sellable substitute buys when an
+        /// injury forces a move.
+        var bench = 0.04
+        /// 1.0 = the armband is worth what the game pays for it.
         var captain = 1.0
+        /// Test hooks: set to 0 to score a squad the way the app did before the
+        /// bench and the vice-captain were priced properly.
+        var autosub = 1.0
+        var vice = 1.0
     }
 
     // MARK: - objective
@@ -54,7 +59,8 @@ enum SquadSolver {
     @inline(__always)
     static func score(_ squad: [Pick], _ w: Weights) -> Double {
         guard let r = Optimizer.evaluate(squad) else { return -.infinity }
-        return r.total + w.captain * r.capProj + w.bench * r.benchSum
+        let armband = w.vice > 0 ? r.capProj : r.capBase
+        return r.total + w.captain * armband + w.autosub * r.autosub + w.bench * r.benchSum
     }
 
     @inline(__always)
