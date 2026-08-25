@@ -533,6 +533,52 @@ An age penalty on scoring rates looked like a consistent winner right up until
 the anchor was reweighted, after which the fitter stopped reaching for it —
 it had been standing in for what the anchor already knew. It isn't in the model.
 
+### Is it just chasing last week? (`bench --recency`)
+
+The failure mode of every fantasy model. Somebody scores 17 on the opening day,
+the model decides he is elite, and you buy him at the top of his price. The way
+to find out is to run the projection twice — once knowing what happened last
+gameweek, once with the season blanked — and see what the difference correlates
+with.
+
+Three things get mixed together in that difference and only one of them is a
+fault. A player with no Premier League record who has just started a match is
+genuinely new information. An injury is a fact, not a form reading. A settled
+player who scored well once is neither. So the measure that matters is
+established, available players:
+
+| | before | after |
+|---|---|---|
+| a 15-point haul moves an established player by | +2.15 pts/GW | **+0.70** |
+| correlation between the shift and last week's score | 0.62 | 0.46 |
+| last week's average score among the model's top 20 | 5.0 | 4.3 |
+| top-20 places owed to last week alone | 5 of 20 | 3 of 20 |
+
+One match against a season of prior evidence is worth about a fortieth of it, so
++2.15 was roughly six times what the information justified. Three things caused
+it, and the audit found all three:
+
+* **The wrong availability field.** FPL publishes `chance_of_playing_this_round`
+  and `chance_of_playing_next_round` and they mean different gameweeks. Taking
+  the lower of the two is right while the current round is open and wrong the
+  moment its deadline passes, because from then on `this_round` is a fact about
+  a match already played. Christie is listed fully available, 0% for the round
+  just gone and 100% for the next — and was being projected at **zero for the
+  rest of the season**. So were eleven others.
+* **Form shrunk by weight but not by value.** Scaling down the *share* a form
+  reading carries is not enough when the reading itself is a raw 17 against a
+  base of 2.5. Both now scale with how many matches actually stand behind it.
+* **The anchor's prior discounted like the minutes prior.** A move or a new
+  manager rewrites a player's role in a summer, which is why the minutes model
+  distrusts last season. How many points he scores per appearance is far more
+  stable, and discounting it there only made the anchor jump at whatever
+  happened on Saturday.
+
+What still moves, correctly, is minutes: the biggest risers are now players
+whose prior said they would not play and who started ninety minutes, and the
+biggest fallers are players who came off the bench for twenty. That is the
+signal you want a model to chase.
+
 ### Simulating seasons to test decisions (`bench --policy`)
 
 Forecasts can be checked against history. Decisions can't: there is no record of

@@ -280,6 +280,8 @@ struct PlayerRates {
     var defScale = 1.0    // this player's own concession rate vs his team's
     var modelShare = 0.62 // weight on the rate model vs the history anchor
     var formShare = 0.28  // weight on 30-day form inside the history anchor
+    var formRaw = 0.0     // form as FPL publishes it, for display only
+    var formTrust = 0.0   // how much evidence stands behind the form reading
 
     struct Components {
         var appearance = 0.0
@@ -360,10 +362,26 @@ struct Tuning: Equatable {
     var minutesPriorScale = 0.6
     /// Pooled minutes at which a player's own rates are trusted 50%.
     var credHalf = 540.0
+    /// How much of a prior season stands behind the points-per-appearance
+    /// anchor. The minutes model discounts the prior because a move or a new
+    /// manager rewrites a role in a summer; how many points a player scores per
+    /// appearance is far more stable, and discounting it there only made the
+    /// anchor jump at whatever happened last Saturday.
+    var anchorPriorScale = 1.0
     /// Pooled minutes at which FPL's own cold-start estimate is dropped.
     var epFade = 900.0
-    /// How hard 30-day form pulls attacking output, at full season length.
+    /// How hard 30-day form pulls attacking output.
     var formWeight = 0.4
+    /// Matches of evidence at which a form reading is worth as much as the
+    /// player's settled level. Form is an average over a thirty-day window, so
+    /// in August it is one match: scaling down its *share* was not enough,
+    /// because a raw 17 against a base of 2.5 dominates a projection even at a
+    /// weight of seven percent. The reading itself is shrunk toward the level
+    /// now, which is the only treatment that respects how little one match
+    /// says.
+    var formTrustGames = 3.0
+    /// Share of the history anchor that the (shrunk) form reading carries.
+    var formShare = 0.28
     /// Weight on the rate model against the points-per-appearance anchor. The
     /// anchor — points per appearance — is a coarse number that quietly knows
     /// everything the component model cannot see: the player's role, the
@@ -385,7 +403,13 @@ struct Tuning: Equatable {
     var newClubMinutesDamp = 1.0
     /// Weighted gameweeks of recent evidence at which the last few matches
     /// carry as much weight as the whole season behind them.
-    var recentMinutesHalf = 1.6
+    /// Weighted gameweeks of recent evidence at which the last few matches are
+    /// worth as much as everything behind them. At 1.6 a single gameweek took
+    /// 38% of the minutes estimate, which is not what one match is worth
+    /// against a full season; at 3.6 it takes 22%, and a settled four-week
+    /// pattern — which is what actually tells you someone has lost their place
+    /// — still takes 45%.
+    var recentMinutesHalf = 3.6
     /// Minutes regress to the mean hard, and the model was not regressing them
     /// at all. Fitted against three replayed seasons: a player's own record is
     /// worth about as much as the population average once he has this many
@@ -732,11 +756,22 @@ struct ProjectionEngine {
         if effMinsG < 45 { r.startSecurity = 0.42 }
 
         // ---- availability
+        //
+        // FPL publishes two figures and they mean different gameweeks.
+        // `this_round` is the round in progress; `next_round` is the one after
+        // it. Taking the lower of the two was right while the current round was
+        // still open and wrong the moment its deadline passed, because from
+        // then on `this_round` is a fact about a match that has already been
+        // played. It was zeroing players who missed last Saturday and are fully
+        // fit for next: Christie is listed available, 0% for the round just
+        // gone and 100% for the next one, and the model was projecting him at
+        // nothing for the rest of the season.
         var avail = 1.0
-        // Take the lower of the two published chances. FPL updates the
-        // this-round figure first when news breaks on a matchday.
+        let roundInProgress = boot.events.first { $0.is_current == true }?.id ?? gwFrom
         if let c = p.chance_of_playing_next_round { avail = Double(c) / 100 }
-        if let c = p.chance_of_playing_this_round { avail = min(avail, Double(c) / 100) }
+        if gwFrom <= roundInProgress, let c = p.chance_of_playing_this_round {
+            avail = min(avail, Double(c) / 100)
+        }
         switch p.status {
         case "u", "n": avail = min(avail, 0.02)
         case "i", "s": avail = min(avail, 0.08)
@@ -842,18 +877,35 @@ struct ProjectionEngine {
         // one gameweek behind him is anchored to what he actually is rather
         // than to what one afternoon said.
         // Points and the games they were scored in must come from the same
-        // weighting, or the ratio is not a rate at all. Both use the minutes
-        // profile, which is the one the denominator is built from.
-        let pooledPoints = Double(p.total_points) + pastMins.points * sScale
-        let apps = max(effGames * r.pPlay, 1)
+        // weighting, or the ratio is not a rate at all — so the anchor carries
+        // its own prior strength and its own denominator.
+        let aScale = tuning.anchorPriorScale * lam
+        let aGames = pastMins.seasons * 38 * aScale
+        let pooledPoints = Double(p.total_points) + pastMins.points * aScale
+        let apps = max((games + aGames) * r.pPlay, 1)
         r.ppg = pooledPoints / apps
-        r.form = Double(p.form ?? "") ?? 0
         r.epNext = Double(p.ep_next ?? "") ?? 0
+
+        // ---- form, shrunk toward the player's own level by how many matches
+        // are actually behind it. FPL's window is thirty days, so it holds at
+        // most four or five matches however long the season has been running.
+        // Two things have to scale with evidence here, not one. The *reading*
+        // is shrunk toward the player's own level, because one match is a poor
+        // estimate of a rate; and the *weight* that reading carries is scaled
+        // by the same trust, because a poor estimate should also count for
+        // less. Doing only the first is what made a single seventeen-point
+        // afternoon move a settled player by more than a point a week.
+        let rawForm = Double(p.form ?? "") ?? 0
+        r.formRaw = rawForm
+        let formGames = min(games, 4)
+        let trust = formGames / (formGames + tuning.formTrustGames)
+        r.formTrust = trust
+        r.form = rawForm > 0 ? trust * rawForm + (1 - trust) * r.ppg : 0
         let coldShare = tuning.modelShareByPos.map { $0[min(pos, $0.count - 1)] }
             ?? tuning.modelShare
         r.modelShare = coldShare
             + (tuning.modelShareFull - coldShare) * min(mins / 900, 1)
-        r.formShare = 0.28 * min(games / 4, 1)
+        r.formShare = tuning.formShare * trust
 
         // ---- form
         // Form is points per match over the last 30 days; the anchor above is
@@ -868,8 +920,7 @@ struct ProjectionEngine {
         // the previous build ended up rating Haaland below a full-back.
         if seasonUnderway, r.ppg > 0.5, r.form > 0 {
             let trend = r.form / r.ppg
-            let weight = tuning.formWeight * min(games / 4, 1)
-            r.formMult = min(max(1 + weight * (trend - 1), 0.72), 1.45)
+            r.formMult = min(max(1 + tuning.formWeight * r.formTrust * (trend - 1), 0.72), 1.45)
             r.goalPts90 *= r.formMult
             r.assistPts90 *= r.formMult
             r.bonusRate *= r.formMult
@@ -1033,7 +1084,7 @@ struct ProjectionEngine {
             pl.totalPoints = p.total_points; pl.goals = p.goals_scored
             pl.assists = p.assists; pl.cleanSheets = p.clean_sheets ?? 0
             pl.bonus = p.bonus; pl.saves = p.saves; pl.starts = p.starts ?? 0
-            pl.form = r.form
+            pl.form = r.formRaw
             pl.xg = Double(p.expected_goals ?? "") ?? 0
             pl.xa = Double(p.expected_assists ?? "") ?? 0
             pl.news = p.news ?? ""

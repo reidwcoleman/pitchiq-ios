@@ -28,6 +28,15 @@ struct Eval {
         return sa > 0 && sb > 0 ? sab / (sa*sb).squareRoot() : 0
     }
 
+    /// Least-squares slope of y on x, through the data rather than the origin.
+    static func slope(_ x: [Double], _ y: [Double]) -> Double {
+        let n = Double(x.count); guard n > 1 else { return 0 }
+        let mx = x.reduce(0,+)/n, my = y.reduce(0,+)/n
+        var num = 0.0, den = 0.0
+        for i in x.indices { num += (x[i]-mx)*(y[i]-my); den += (x[i]-mx)*(x[i]-mx) }
+        return den > 0 ? num/den : 0
+    }
+
     static func spearman(_ a: [Double], _ b: [Double]) -> Double {
         func ranks(_ v: [Double]) -> [Double] {
             let order = v.indices.sorted { v[$0] < v[$1] }

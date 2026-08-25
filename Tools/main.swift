@@ -37,6 +37,23 @@ if let w = CommandLine.arguments.firstIndex(of: "--why"), w + 1 < CommandLine.ar
     exit(0)
 }
 
+if CommandLine.arguments.contains("--recency") {
+    let raw = try! JSONSerialization.jsonObject(with: data("bootstrap.json")) as! [String: Any]
+    let eval = Eval(bootJSON: raw, boot: boot, fixtures: fixtures, rawPast: rawPast)
+    let livePayload = try! dec.decode(EventLive.self, from: data("live1.json"))
+    var stats: [Int: LiveStats] = [:]
+    var minutes: [Int: Int] = [:]
+    for e in livePayload.elements {
+        stats[e.id] = e.stats
+        if e.stats.minutes > 0 { minutes[e.id] = e.stats.minutes }
+    }
+    var recent = RecentMinutes()
+    recent.season = 2026
+    recent.absorb(gw: 1, minutes: minutes)
+    RecencyAudit(eval: eval, book: book, recent: recent).report(gw: 1, live: stats)
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--policy") {
     let gw = boot.events.first { $0.is_next }?.id ?? 2
     let eng = ProjectionEngine(boot: boot, fixtures: fixtures, gwFrom: gw, horizon: 6, pastForm: book)
