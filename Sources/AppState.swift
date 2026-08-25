@@ -106,6 +106,7 @@ final class AppState: ObservableObject {
     private var cachedPlan: SeasonPlan?
     private var cachedPlanKey: PlanKey?
     private var generation = 0
+    private var paintedOnce = false
 
     private struct PlanKey: Equatable {
         let gwFrom: Int
@@ -236,8 +237,18 @@ final class AppState: ObservableObject {
     /// is coalesced into a single rebuild at the end.
     func load() async {
         if boot == nil {
-            let cached = await Task.detached(priority: .userInitiated) {
-                (DataCache.read(), DataCache.readPastForm(), DataCache.readRecentMinutes())
+            Self.mark("load() begins")
+            let cached = await Task.detached(priority: .userInitiated) { () -> (DataCache.Payload?, PastFormBook?, RecentMinutes?) in
+                let t = Date()
+                let boot = DataCache.read()
+                Self.mark(String(format: "bootstrap + fixtures decoded from disk (%.0f ms)",
+                                 Date().timeIntervalSince(t) * 1000))
+                let t2 = Date()
+                let past = DataCache.readPastForm()
+                let recent = DataCache.readRecentMinutes()
+                Self.mark(String(format: "prior seasons + recent minutes decoded (%.0f ms)",
+                                 Date().timeIntervalSince(t2) * 1000))
+                return (boot, past, recent)
             }.value
             if let book = cached.1 { pastForm = book }
             if let r = cached.2 { recentMinutes = r }
@@ -312,7 +323,16 @@ final class AppState: ObservableObject {
 
     /// `-verbose` prints what the background feeds actually did, which is the
     /// only way to see that a launch fetched nothing.
-    static let verbose = ProcessInfo.processInfo.arguments.contains("-verbose")
+    nonisolated static let verbose = ProcessInfo.processInfo.arguments.contains("-verbose")
+
+    /// Wall clock from the moment the app object exists, so "how long until
+    /// something is on screen" is a measured number rather than a feeling.
+    nonisolated static let launchedAt = Date()
+    nonisolated static func mark(_ what: String) {
+        guard verbose else { return }
+        print(String(format: "[launch] %6.0f ms  %@",
+                     Date().timeIntervalSince(launchedAt) * 1000, what as NSString))
+    }
 
     /// The calendar year this season kicked off in.
     var seasonYear: Int? {
@@ -441,12 +461,15 @@ final class AppState: ObservableObject {
                                              horizon: horizon, engine: eng)
             let baseModel = cachedModel.isEmpty ? players : cachedModel
 
+            let computeStart = Date()
             let result = Self.compute(
                 players: players, gwFrom: gwFrom, horizon: horizon, window: window,
                 budgetM: budgetM, fitOnly: fit, customIds: customIds, team: connected,
                 incumbent: incumbent, chipsMeta: chipsMeta, doubleGws: dgws,
                 reusablePlan: reusablePlan)
 
+            AppState.mark(String(format: "model + plan computed (%.0f ms)",
+                                 Date().timeIntervalSince(computeStart) * 1000))
             await MainActor.run {
                 guard gen == self.generation else { return }   // a newer rebuild won
                 if result.staleCustom {
@@ -467,8 +490,11 @@ final class AppState: ObservableObject {
                     UserDefaults.standard.set(ids, forKey: Key.committed)
                 }
                 self.working = false
+                let firstPaint = !self.paintedOnce
+                self.paintedOnce = true
                 self.phase = .ready
                 self.rebuildLiveSquad()
+                if firstPaint { Self.mark("first paint — the team is on screen") }
             }
         }
     }

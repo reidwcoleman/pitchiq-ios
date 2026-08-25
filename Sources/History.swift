@@ -227,8 +227,13 @@ enum PastFormService {
     /// digest. ~600 small requests; run eight at a time so it finishes in about
     /// ten seconds on a phone, and cache the result for a week — previous seasons
     /// do not change.
+    /// `checkpoint` is called periodically with the book so far. Six hundred
+    /// requests take the better part of a minute on a phone, and a first run
+    /// that is interrupted — the user switches app, iOS suspends it — used to
+    /// throw away every one of them and start again from nothing next launch.
     static func fetch(ids: [Int], into existing: PastFormBook, season: Int,
-                      session: URLSession) async -> PastFormBook {
+                      session: URLSession,
+                      checkpoint: (PastFormBook) -> Void = { _ in }) async -> PastFormBook {
         var book = existing.season == season ? existing : PastFormBook()
         book.season = season
         book.built = Date()
@@ -240,8 +245,11 @@ enum PastFormService {
                 group.addTask { (id, try? await one(id: id, session: session)) }
                 next += 1
             }
+            var settled = 0
             for await (id, form) in group {
                 if let form, !form.isEmpty { book.byId[id] = form } else { book.barren.insert(id) }
+                settled += 1
+                if settled % 80 == 0 { checkpoint(book) }
                 if next < ids.count {
                     let queued = ids[next]
                     group.addTask { (queued, try? await one(id: queued, session: session)) }

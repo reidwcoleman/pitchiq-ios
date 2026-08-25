@@ -71,6 +71,38 @@ every number is set in tabular figures so columns stop shivering as they update,
 and the loading state is the shape of the screen that is coming rather than a
 spinner on an empty page.
 
+### Speed
+
+Measured on an iPhone 13, warm launch, with `-verbose`:
+
+```
+[launch]      0 ms  load() begins
+[launch]     23 ms  bootstrap + fixtures decoded from disk
+[launch]     33 ms  prior seasons + recent minutes decoded
+[launch]    153 ms  model + plan computed (117 ms)
+[launch]    153 ms  first paint — the team is on screen
+[feeds] recent minutes already current, prior seasons already complete, rebuild not needed
+```
+
+It used to be four seconds, and the reason is worth writing down because it is
+embarrassing and it is the sort of thing that happens again: the app was being
+installed as a **debug build**. Unoptimised Swift runs the projection and the
+planner about fifteen times slower — 3,821 ms of compute against 146 ms for the
+identical work with `-O`. No amount of caching would have fixed that, and
+nearly all of the time I first spent looking for the cause was spent in the
+wrong place, because the headless harness had always been compiled `-O` and
+reported 170 ms.
+
+Debug is now optimised too (`project.yml`). Nobody steps through this app in a
+debugger — it is diagnosed with `-verbose` prints — so the trade is not one
+worth leaving available to make by accident. **Install Release.**
+
+The two smaller wins, both worth having once the big one was found: the cache
+holds the *decoded* payload rather than the 1.6 MB that arrived, since the app
+reads about a third of the fields in it (25 ms to read instead of 65); and the
+six-hundred-request first run checkpoints every eighty players, so being
+suspended halfway no longer throws all of them away.
+
 ### What it fetches, and when
 
 A cold launch used to pull about thirteen megabytes across six hundred and

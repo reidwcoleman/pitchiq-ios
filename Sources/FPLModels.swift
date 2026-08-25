@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - FPL API payloads (fields we use)
 
-struct Bootstrap: Decodable {
+struct Bootstrap: Codable {
     let events: [GWEvent]
     let teams: [FPLTeam]
     let elements: [FPLElement]
@@ -10,7 +10,7 @@ struct Bootstrap: Decodable {
     let total_players: Int?
 }
 
-struct FPLChip: Decodable {
+struct FPLChip: Codable {
     let name: String          // "wildcard" | "freehit" | "bboost" | "3xc"
     let start_event: Int
     let stop_event: Int
@@ -49,7 +49,7 @@ struct SeededRandom: RandomNumberGenerator {
     }
 }
 
-struct GWEvent: Decodable {
+struct GWEvent: Codable {
     let id: Int
     let name: String
     let deadline_time: String
@@ -60,7 +60,7 @@ struct GWEvent: Decodable {
     var deadline: Date? { ISO8601DateFormatter().date(from: deadline_time) }
 }
 
-struct FPLTeam: Decodable, Identifiable {
+struct FPLTeam: Codable, Identifiable {
     let id: Int
     /// Club code, used for the crest asset. Also stable across seasons.
     let code: Int?
@@ -75,7 +75,7 @@ struct FPLTeam: Decodable, Identifiable {
     let strength_overall_away: Int?
 }
 
-struct FPLElement: Decodable {
+struct FPLElement: Codable {
     let id: Int
     /// Stable across seasons, and the key to the player's photograph on
     /// resources.premierleague.com. `id` is not — it is reassigned every July.
@@ -134,7 +134,7 @@ struct FPLElement: Decodable {
     let price_change_hourly_rate: Int?
     let price_change_projections: [PriceProjection]?
 
-    struct PriceProjection: Decodable {
+    struct PriceProjection: Codable {
         let offset: Int              // nights from now
         let projected_percent: String
         let likelihood: Int          // −5 … 5
@@ -279,7 +279,7 @@ struct LeagueStandings: Decodable {
     let standings: Page
 }
 
-struct APIFixture: Decodable, Identifiable {
+struct APIFixture: Codable, Identifiable {
     let id: Int?
     let event: Int?
     let team_h: Int

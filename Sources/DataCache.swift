@@ -42,9 +42,17 @@ enum DataCache {
         return Payload(boot: boot, fixtures: fixtures, fetched: stamp ?? .distantPast)
     }
 
-    static func write(boot: Data, fixtures: Data) {
-        try? boot.write(to: bootURL, options: .atomic)
-        try? fixtures.write(to: fixturesURL, options: .atomic)
+    /// Store the *decoded* payload, not the bytes that arrived.
+    ///
+    /// FPL's bootstrap is 1.6 MB of JSON and this app reads about a third of
+    /// the fields in it. Caching the download meant paying to parse the other
+    /// two thirds on every launch; caching what we actually decoded is a
+    /// smaller file and a faster read, and it costs one encode on a background
+    /// task at fetch time when nobody is waiting.
+    static func write(boot: Bootstrap, fixtures: [APIFixture]) {
+        let enc = JSONEncoder()
+        if let b = try? enc.encode(boot) { try? b.write(to: bootURL, options: .atomic) }
+        if let f = try? enc.encode(fixtures) { try? f.write(to: fixturesURL, options: .atomic) }
     }
 
     // MARK: prior-season form
@@ -105,7 +113,7 @@ enum FPLService {
         let dec = JSONDecoder()
         let boot = try dec.decode(Bootstrap.self, from: b)
         let fixtures = try dec.decode([APIFixture].self, from: f)
-        DataCache.write(boot: b, fixtures: f)
+        DataCache.write(boot: boot, fixtures: fixtures)
         return (boot, fixtures)
     }
 
@@ -114,8 +122,10 @@ enum FPLService {
     /// nonsense one.
     static func fetchPastForm(ids: [Int], into existing: PastFormBook,
                               season: Int) async -> PastFormBook {
-        let book = await PastFormService.fetch(ids: ids, into: existing,
-                                               season: season, session: session)
+        let book = await PastFormService.fetch(ids: ids, into: existing, season: season,
+                                               session: session) { partial in
+            DataCache.write(pastForm: partial)
+        }
         if !book.isEmpty { DataCache.write(pastForm: book) }
         return book
     }

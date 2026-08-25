@@ -11,6 +11,18 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     DEVELOPMENT_TEAM: JU6MZ954WS
     SWIFT_VERSION: "5.0"
+  configs:
+    # Debug is optimised too, deliberately.
+    #
+    # Nobody steps through this app in a debugger — it is diagnosed with
+    # `-verbose` prints — and unoptimised Swift runs the projection and the
+    # planner about fifteen times slower: measured, 3,821 ms of compute against
+    # 146 ms for the same work with `-O`. A debug build installed on a phone
+    # took four seconds to draw a team. That is not a trade worth having
+    # available to make by accident.
+    debug:
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
+      GCC_OPTIMIZATION_LEVEL: "s"
 targets:
   PitchIQ:
     type: application
