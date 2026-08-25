@@ -42,16 +42,32 @@ enum PolicyBench {
         var bankBar = 1.0           // multiplier on the value of holding a transfer
         var poolSize = 240
         var decay = Planner.decay
+        /// Chip policy. `chips: false` plays none of them — the floor a chip
+        /// strategy has to beat. The bars are the extra points a chip has to
+        /// promise this week, over what the same week would score without it,
+        /// before it is spent. Zero means "play it at the first opportunity".
+        var chips = true
+        var bbBar = Planner.chipThreshold("bboost")
+        var tcBar = Planner.chipThreshold("3xc")
+        var wcBar = Planner.chipThreshold("wildcard")
+        var fhBar = Planner.chipThreshold("freehit")
+        /// Gameweeks left in the half at which the bar falls away, because a
+        /// chip that expires unplayed is worth nothing at all.
+        var chipPanic = 3
     }
 
     /// How often each rule actually fired, so a null result can be told apart
     /// from a rule that never ran.
-    final class Counter { var pairs = 0; var singles = 0; var seasons = 0 }
+    final class Counter {
+        var pairs = 0, singles = 0, seasons = 0
+        var chips: [String: Int] = [:]
+        var chipGain = 0.0
+    }
 
     static func policy(_ rule: Rule, universe: [Player], poolSize: Int, end: Int,
                        counter: Counter) -> SeasonSim.Policy {
         return { board in
-            guard rule.enabled else { return [] }
+            guard rule.enabled else { return SeasonSim.Decision() }
             let squadIds = Set(board.squad)
             let believed = believedPlayers(universe, unavailable: { !board.available($0) },
                                            gw: board.gw, end: end)
@@ -68,12 +84,79 @@ enum PolicyBench {
             guard let compact = try? board.squad.map({ id -> Int in
                 guard let i = ctx.index[id] else { throw Err.missing }
                 return i
-            }) else { return [] }
+            }) else { return SeasonSim.Decision() }
 
             var moves: [SeasonSim.Move] = []
             var squad = compact
             var bank = board.bank
             var fts = board.freeTransfers
+
+            // ---- chips
+            //
+            // Each is judged the same way: what does playing it here add over
+            // playing this week normally? The bar it has to clear falls to
+            // nothing as the half runs out, because an unplayed chip scores
+            // zero and a mediocre one scores something.
+            if rule.chips, !board.chipsLeft.isEmpty {
+                let closing = board.weeksLeftInHalf <= rule.chipPanic
+                let gwPicks = squad.map { ctx.pick($0, board.gw) }
+                if let shape = Optimizer.evaluate(gwPicks) {
+                    // Bench Boost: the four substitutes score, and the
+                    // auto-substitution allowance is already inside the normal
+                    // week, so the gain is what the bench adds beyond it.
+                    let bbGain = shape.benchSum - shape.autosub
+                    // Triple Captain: one more copy of the captain.
+                    let tcGain = shape.capProj
+
+                    var choice: (String, Double)?
+                    func offer(_ name: String, _ gain: Double, _ bar: Double) {
+                        guard board.chipsLeft.contains(name),
+                              gain >= (closing ? 0 : bar) else { return }
+                        if choice == nil || gain > choice!.1 { choice = (name, gain) }
+                    }
+                    offer("bboost", bbGain, rule.bbBar)
+                    offer("3xc", tcGain, rule.tcBar)
+
+                    // Wildcard and Free Hit rebuild the squad. Worth asking
+                    // only if the rebuild is a big one; the optimiser is the
+                    // expensive call here, so it is guarded.
+                    if board.chipsLeft.contains("wildcard") || board.chipsLeft.contains("freehit") {
+                        let poolPlayers = subset.filter { !$0.flagged }
+                        var squadValue = 0
+                        for id in board.squad {
+                            squadValue += believed.first { $0.id == id }?.cost ?? 0
+                        }
+                        let budgetM = Double(board.bank + squadValue) / 10
+                        let freshSquad = Optimizer.optimize(players: poolPlayers,
+                                                            budgetM: budgetM, fitOnly: true)
+                        if let fresh = freshSquad, fresh.squad.count == 15,
+                           let freshShape = Optimizer.evaluate(
+                               fresh.squad.map { $0.pick($0.projByGw.at(board.gw)) }) {
+                            let now = shape.total + shape.capProj + shape.autosub
+                            let after = freshShape.total + freshShape.capProj + freshShape.autosub
+                            // A free hit is one week; a wildcard is the rest of
+                            // the season, so its gain is counted over the window
+                            // a transfer is judged over.
+                            let fhGain = after - now
+                            let wcGain = fhGain * Double(min(rule.lookahead, board.weeksLeftInHalf))
+                                / 2      // half of it, since transfers would close some of the gap anyway
+                            offer("freehit", fhGain, rule.fhBar)
+                            offer("wildcard", wcGain, rule.wcBar)
+                            if let picked = choice, picked.0 == "wildcard" || picked.0 == "freehit" {
+                                counter.chips[picked.0, default: 0] += 1
+                                counter.chipGain += picked.1
+                                return SeasonSim.Decision(moves: [], chip: picked.0,
+                                                          squad: fresh.squad.map(\.id))
+                            }
+                        }
+                    }
+                    if let picked = choice {
+                        counter.chips[picked.0, default: 0] += 1
+                        counter.chipGain += picked.1
+                        return SeasonSim.Decision(moves: [], chip: picked.0)
+                    }
+                }
+            }
 
             if rule.usePairs, fts >= 1,
                let pair = Planner.bestPair(ctx: ctx, squad: squad, bank: bank, from: board.gw),
@@ -91,7 +174,7 @@ enum PolicyBench {
                         moves.append(SeasonSim.Move(out: ctx.players[out].id,
                                                     inn: ctx.players[inn].id))
                     }
-                    return moves
+                    return SeasonSim.Decision(moves: moves)
                 }
             }
 
@@ -113,7 +196,7 @@ enum PolicyBench {
                 moves.append(SeasonSim.Move(out: ctx.players[best.out].id,
                                             inn: ctx.players[best.inn].id))
             }
-            return moves
+            return SeasonSim.Decision(moves: moves)
         }
     }
 
@@ -173,8 +256,15 @@ enum PolicyBench {
         let baseMean = baseline.reduce(0,+) / Double(baseline.count)
         func fired(_ name: String) -> String {
             guard let c = counters[name] else { return "" }
-            return String(format: "  [%.1f singles, %.1f pairs per season]",
-                          Double(c.singles) / Double(seasons), Double(c.pairs) / Double(seasons))
+            let chips = SeasonSim.chipNames
+                .compactMap { n -> String? in
+                    let used = c.chips[n] ?? 0
+                    guard used > 0 else { return nil }
+                    return String(format: "%@ %.1f", n, Double(used) / Double(seasons))
+                }
+                .joined(separator: ", ")
+            return String(format: "  [%.0f transfers%@]", Double(c.singles) / Double(seasons),
+                          chips.isEmpty ? "" : ", chips: " + chips)
         }
         print(String(format: "  %-28@ %7.1f pts%@", names[0] as NSString, baseMean,
                      fired(names[0]) as NSString))

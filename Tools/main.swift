@@ -37,6 +37,53 @@ if let w = CommandLine.arguments.firstIndex(of: "--why"), w + 1 < CommandLine.ar
     exit(0)
 }
 
+if CommandLine.arguments.contains("--chips") {
+    let gw = boot.events.first { $0.is_next }?.id ?? 2
+    let eng = ProjectionEngine(boot: boot, fixtures: fixtures, gwFrom: gw, horizon: 6, pastForm: book)
+    let all = eng.buildPlayers(totalManagers: boot.total_players ?? 11_000_000)
+    var counts: [Int: [Int: Int]] = [:]
+    for f in fixtures {
+        guard let g = f.event else { continue }
+        counts[g, default: [:]][f.team_h, default: 0] += 1
+        counts[g, default: [:]][f.team_a, default: 0] += 1
+    }
+    let dgws = Set(counts.filter { $0.value.values.contains { $0 >= 2 } }.keys)
+    let blanks = Set((gw...38).filter { g in (counts[g]?.count ?? 0) < 20 })
+    print("\n=== the fixture list ===")
+    print("  double gameweeks: \(dgws.sorted().map(String.init).joined(separator: ", "))")
+    print("  gameweeks where some clubs don't play: \(blanks.sorted().map(String.init).joined(separator: ", "))")
+
+    let chips = (boot.chips ?? []).map { ChipMeta(name: $0.name, start: $0.start_event, stop: $0.stop_event) }
+    print("\n=== chips the game offers ===")
+    for c in chips { print("  \(c.name)  GW\(c.start)–\(c.stop)") }
+
+    guard let opening = Optimizer.optimize(players: all, budgetM: 100, fitOnly: true) else { exit(1) }
+    let start = PlanStart(squadIds: opening.squad.map(\.id), bank: 0, budget: 1000,
+                          freeTransfers: 1, isUserTeam: false)
+    guard let plan = Planner.plan(players: all, fitOnly: true, from: gw, window: 38 - gw + 1,
+                                  start: start, chipsMeta: chips, doubleGws: dgws) else {
+        print("no plan"); exit(1)
+    }
+    print("\n=== what the planner schedules ===")
+    if plan.chips.isEmpty { print("  nothing") }
+    for c in plan.chips {
+        print(String(format: "  %-9@ GW%-3d gain %+5.1f%@", c.chip as NSString, c.gw, c.gain,
+                     (c.forced ? "  (forced — the window was closing)" : "") as NSString))
+    }
+    guard let bare = Planner.plan(players: all, fitOnly: true, from: gw, window: 38 - gw + 1,
+                                  start: start, chipsMeta: [], doubleGws: dgws) else { exit(1) }
+    print(String(format: "\n  season total with the chips scheduled: %.0f", plan.totalPts))
+    print(String(format: "  season total with no chips at all:     %.0f", bare.totalPts))
+    print(String(format: "  the chips are worth %+.0f points", plan.totalPts - bare.totalPts))
+
+    let scheduled = Set(plan.chips.map { "\($0.chip)-\($0.gw <= 19 ? 19 : 38)" })
+    let offered = Set(chips.map { "\($0.name)-\($0.stop)" })
+    let missed = offered.subtracting(scheduled)
+    print("\n  scheduled \(scheduled.count) of \(offered.count)")
+    if !missed.isEmpty { print("  NEVER PLAYED: \(missed.sorted().joined(separator: ", "))") }
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--recency") {
     let raw = try! JSONSerialization.jsonObject(with: data("bootstrap.json")) as! [String: Any]
     let eval = Eval(bootJSON: raw, boot: boot, fixtures: fixtures, rawPast: rawPast)
@@ -84,19 +131,23 @@ if CommandLine.arguments.contains("--policy") {
     let byOwnership = all.map { p -> Player in var c = p; c.proj = c.own; return c }
     guard let rough = Optimizer.optimize(players: byOwnership, budgetM: 100, fitOnly: true)
     else { exit(0) }
-    print("\n--- decision rules, starting from a template squad ---")
-    func rule(_ name: String, lookahead: Int = Planner.transferLookahead,
-              hit: Double = Planner.hitGainThreshold, moves: Int = 4) -> PolicyBench.Rule {
-        var r = PolicyBench.Rule(name: name, usePairs: false, maxMoves: moves)
-        r.lookahead = lookahead; r.hitBar = hit
+    print("\n--- chips: are the thresholds right? ---")
+    func rule(_ name: String, chips: Bool = true, bb: Double = Planner.chipThreshold("bboost"),
+              tc: Double = Planner.chipThreshold("3xc"), wc: Double = Planner.chipThreshold("wildcard"),
+              fh: Double = Planner.chipThreshold("freehit"), panic: Int = 3) -> PolicyBench.Rule {
+        var r = PolicyBench.Rule(name: name, usePairs: false, maxMoves: 4)
+        r.chips = chips; r.bbBar = bb; r.tcBar = tc; r.wcBar = wc; r.fhBar = fh
+        r.chipPanic = panic
         return r
     }
     PolicyBench.compare(players: all, start: rough.squad.map(\.id), budget: 1000,
-                        from: gw, end: 38, seasons: 500, rules: [
-                            rule("before: 4 GW view, −4 bar 6", lookahead: 4, hit: 6),
-                            rule("now: 6 GW view, −4 bar 4.5"),
-                            rule("never take a hit", hit: 99),
-                            rule("one move a week at most", moves: 1),
+                        from: gw, end: 38, seasons: 300, rules: [
+                            rule("no chips at all", chips: false),
+                            rule("shipped thresholds"),
+                            rule("play them immediately", bb: 0, tc: 0, wc: 0, fh: 0),
+                            rule("twice as fussy", bb: 16, tc: 10, wc: 16, fh: 24),
+                            rule("half as fussy", bb: 4, tc: 2.5, wc: 4, fh: 6),
+                            rule("hold to the deadline", bb: 999, tc: 999, wc: 999, fh: 999),
                         ])
     exit(0)
 }

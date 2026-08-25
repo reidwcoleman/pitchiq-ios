@@ -135,11 +135,30 @@ struct SeasonSim {
         let available: (Int) -> Bool
         let players: [Player]
         let index: [Int: Int]
+        /// Chips not yet spent in the half this gameweek falls in, and how many
+        /// gameweeks are left to spend them.
+        let chipsLeft: Set<String>
+        let weeksLeftInHalf: Int
     }
+
+    /// FPL gives a set of chips for each half of the season; anything unspent
+    /// when the half ends is lost.
+    static let chipNames = ["wildcard", "freehit", "bboost", "3xc"]
+    static func half(of gw: Int) -> Int { gw <= 19 ? 0 : 1 }
 
     struct Move { var out: Int; var inn: Int }
 
-    typealias Policy = (Board) -> [Move]
+    /// What a manager does at one deadline: some transfers, possibly a chip,
+    /// and — for the two chips that rebuild a squad — the fifteen to use.
+    struct Decision {
+        var moves: [Move] = []
+        var chip: String?
+        /// Wildcard: the new permanent squad. Free Hit: the squad for this week
+        /// only, after which the old one comes back.
+        var squad: [Int]?
+    }
+
+    typealias Policy = (Board) -> Decision
 
     /// Play out one season under one policy and return what it scored.
     func run(seed: UInt64, start: [Int], budget: Int, policy: Policy) -> Double {
@@ -148,35 +167,56 @@ struct SeasonSim {
         var fts = 1
         var bank = max(budget - squad.reduce(0) { $0 + players[index[$1]!].cost }, 0)
         var total = 0.0
+        var chipsLeft: [Int: Set<String>] = [0: Set(Self.chipNames), 1: Set(Self.chipNames)]
 
         for gw in from...end {
             let w = gw - from
             if gw > from { fts = min(fts + 1, 5) }
+            let h = Self.half(of: gw)
+            let halfEnd = h == 0 ? min(19, end) : end
 
             let board = Board(gw: gw, squad: squad, bank: bank, freeTransfers: fts,
                               available: { id in
                                   guard let row = self.index[id] else { return false }
                                   return truth.available[row][w]
                               },
-                              players: players, index: index)
-            let moves = policy(board)
-            for m in moves {
-                guard let slot = squad.firstIndex(of: m.out),
-                      let outRow = index[m.out], let inRow = index[m.inn] else { continue }
-                squad[slot] = m.inn
-                bank += players[outRow].cost - players[inRow].cost
-                if fts > 0 { fts -= 1 } else { total -= 4 }
+                              players: players, index: index,
+                              chipsLeft: chipsLeft[h] ?? [],
+                              weeksLeftInHalf: max(halfEnd - gw + 1, 0))
+            let decision = policy(board)
+
+            var chip: String?
+            if let played = decision.chip, chipsLeft[h]?.contains(played) == true {
+                chip = played
+                chipsLeft[h]?.remove(played)
             }
 
-            // Pick the eleven the manager believes is best, then score it for
-            // real — with the auto-substitutions the game would make.
-            let picks = squad.map { id -> Pick in
+            // A wildcard replaces the squad outright and costs nothing.
+            if chip == "wildcard", let fresh = decision.squad, fresh.count == 15 {
+                squad = fresh
+                bank = max(budget - squad.reduce(0) { $0 + players[index[$1]!].cost }, 0)
+            } else if chip != "freehit" {
+                for m in decision.moves {
+                    guard let slot = squad.firstIndex(of: m.out),
+                          let outRow = index[m.out], let inRow = index[m.inn] else { continue }
+                    squad[slot] = m.inn
+                    bank += players[outRow].cost - players[inRow].cost
+                    if fts > 0 { fts -= 1 } else { total -= 4 }
+                }
+            }
+
+            // A free hit is a squad for one week; the old one returns after it.
+            let scoring = (chip == "freehit" && decision.squad?.count == 15)
+                ? decision.squad! : squad
+
+            let picks = scoring.map { id -> Pick in
                 let p = players[index[id]!]
                 let fit = truth.available[index[id]!][w]
                 return Pick(p, proj: fit ? p.projByGw.at(gw) : 0)
             }
             guard let shape = Optimizer.evaluate(picks) else { continue }
-            total += score(squad: squad, shape: shape, truth: truth, week: w, gw: gw)
+            total += score(squad: scoring, shape: shape, truth: truth,
+                           week: w, gw: gw, chip: chip)
         }
         return total
     }
@@ -184,7 +224,8 @@ struct SeasonSim {
     /// Score a gameweek exactly as the game does: the chosen eleven, automatic
     /// substitutions for anyone who didn't appear, and the armband doubled —
     /// falling to the vice-captain when the captain doesn't play.
-    private func score(squad: [Int], shape: Optimizer.XI, truth: Truth, week w: Int, gw: Int) -> Double {
+    private func score(squad: [Int], shape: Optimizer.XI, truth: Truth,
+                       week w: Int, gw: Int, chip: String?) -> Double {
         var byPos: [Int: [(id: Int, believed: Double)]] = [:]
         for id in squad {
             let p = players[index[id]!]
@@ -224,14 +265,22 @@ struct SeasonSim {
             }
         }
 
-        var total = counted.reduce(0.0) { $0 + truth.points[index[$1]!][w] }
-        // armband
-        let ranked = counted.sorted { players[index[$0]!].projByGw.at(gw) > players[index[$1]!].projByGw.at(gw) }
+        // A bench boost pays all fifteen, so nothing is substituted and the
+        // four on the bench are simply added.
+        let scoringSet = chip == "bboost" ? squad : counted
+        var total = scoringSet.reduce(0.0) { $0 + truth.points[index[$1]!][w] }
+
+        // armband — doubled, or tripled with the chip, falling to the vice when
+        // the captain doesn't appear
+        let extra = chip == "3xc" ? 2.0 : 1.0
+        let ranked = counted.sorted {
+            players[index[$0]!].projByGw.at(gw) > players[index[$1]!].projByGw.at(gw)
+        }
         if let captain = ranked.first {
             if truth.played[index[captain]!][w] {
-                total += truth.points[index[captain]!][w]
+                total += extra * truth.points[index[captain]!][w]
             } else if ranked.count > 1 {
-                total += truth.points[index[ranked[1]]!][w]
+                total += extra * truth.points[index[ranked[1]]!][w]
             }
         }
         return total

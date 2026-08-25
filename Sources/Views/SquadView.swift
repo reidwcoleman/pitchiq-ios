@@ -422,28 +422,42 @@ struct ChipStrip: View {
         VStack(alignment: .leading, spacing: 10) {
             SectionLabel(text: "Chip plan")
             if plan.chips.isEmpty {
-                Text("Nothing scheduled yet. A chip is only worth playing when it clearly gains points, and on today's fixtures no week is worth one. They're re-checked every refresh, and as each deadline nears the bar drops so none expire unused.")
+                Text("Nothing scheduled. Every chip in these windows would lose points wherever it were played, which for a wildcard means the squad is already where a rebuild would put it.")
                     .font(.system(size: 12.5)).foregroundColor(Theme.inkDim)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(plan.chips) { c in
-                    HStack(spacing: 9) {
-                        Tag(text: chipShortName(c.chip), color: Theme.magenta, filled: true)
-                        Text(chipDisplayName(c.chip))
-                            .font(.system(size: 13, weight: .bold)).foregroundColor(Theme.ink)
-                        Text("GW \(c.gw)").font(.mono(11, .medium)).foregroundColor(Theme.inkDim)
-                        Spacer()
-                        if c.forced {
-                            Text("before it expires").font(.system(size: 10)).foregroundColor(Theme.amber)
+                    HStack(spacing: Theme.Space.s) {
+                        Tag(text: chipShortName(c.chip),
+                            color: c.provisional ? Theme.inkDim : Theme.magenta,
+                            filled: !c.provisional)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(chipDisplayName(c.chip))
+                                .font(.system(size: 13, weight: .bold)).foregroundColor(Theme.ink)
+                            if c.provisional {
+                                Text("pencilled in — no standout week yet")
+                                    .font(.system(size: 9.5)).foregroundColor(Theme.inkFaint)
+                            } else if c.forced {
+                                Text("before it expires")
+                                    .font(.system(size: 9.5)).foregroundColor(Theme.amber)
+                            }
                         }
-                        Text(String(format: "+%.0f", c.gain))
-                            .font(.mono(12, .bold)).foregroundColor(Theme.green)
+                        Spacer()
+                        Text("GW \(c.gw)").font(.mono(11, .bold))
+                            .foregroundColor(Theme.inkDim).figures()
+                        Text(String(format: "%+.0f", c.gain))
+                            .font(.mono(12, .heavy)).figures()
+                            .foregroundColor(c.provisional ? Theme.inkDim : Theme.green)
+                            .frame(width: 34, alignment: .trailing)
                     }
+                    .padding(.vertical, 2)
                 }
+                WhyNote(text: "Every chip is placed on the best week its window offers, because a chip that expires unplayed is worth nothing — measured over three hundred simulated seasons, holding them to the deadline costs about forty-six points against playing them at the best week available. A **pencilled-in** chip is the best week so far rather than a standout one; the plan re-checks every refresh and a real opportunity — a double gameweek, a run of easy fixtures — will move it.",
+                        label: "How chips are placed")
             }
             if !plan.heldChips.isEmpty {
                 Divider().background(Theme.line)
-                Text("Held back: \(heldSummary). Nothing in their windows clears the bar yet — double gameweeks in particular only get announced once postponed matches are rescheduled.")
+                Text("Held back: \(heldSummary). A wildcard is only held when every week in its window would lose points — the squad is already close to what a rebuild would buy. It is re-checked every refresh, and forced before the window shuts.")
                     .font(.system(size: 12)).foregroundColor(Theme.inkDim)
                     .fixedSize(horizontal: false, vertical: true)
             }

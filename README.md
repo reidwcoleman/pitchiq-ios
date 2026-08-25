@@ -579,6 +579,47 @@ whose prior said they would not play and who started ninety minutes, and the
 biggest fallers are players who came off the bench for twenty. That is the
 signal you want a model to chase.
 
+### Chips (`bench --chips`)
+
+The last part of the decision layer running on assertion rather than
+measurement, and it turned out to be badly wrong.
+
+Teaching the season simulator to play chips — bench boost scores all fifteen,
+triple captain takes a third copy, wildcard and free hit rebuild the squad —
+says chips are worth **+78 points a season**, and that holding them until the
+deadline forces them out costs **46** of that. What the thresholds are set to
+barely matters: playing them at the first opportunity, at twice the bar, or at
+half of it are all within noise of each other. Whether they get played at all is
+the entire question.
+
+Which made the audit of what the planner actually scheduled worth running:
+
+```
+=== what the planner schedules ===
+  nothing
+  scheduled 0 of 8
+  NEVER PLAYED: 3xc-19, 3xc-38, bboost-19, bboost-38, ...
+```
+
+All eight, every season. The bar for a bench boost or a triple captain was *30%
+better than a typical week*, which in practice means a double gameweek — and
+there are no double gameweeks in a fixture list until postponements create some,
+which is the normal state for most of a season. So no week ever qualified,
+every chip was held, and each one was eventually forced out three gameweeks
+before its deadline: exactly the policy the simulator prices at −46.
+
+Chips are now always placed on the best week their window offers. Below the bar
+they are marked **pencilled in** and pushed off the current gameweek where
+possible, so nothing is burned today on a week that is merely the least bad; the
+plan re-runs every refresh and a real opportunity displaces a pencilled-in one.
+The wildcard keeps a floor the others don't need, because unlike them it can be
+actively harmful — a rebuild judged worse than the free transfers it replaces —
+and a chip that expires costs nothing, so there is no case for pencilling in a
+negative one.
+
+On the planner's own model the chips are now worth **+42 points**, against zero
+before, and seven of eight are scheduled instead of none.
+
 ### Simulating seasons to test decisions (`bench --policy`)
 
 Forecasts can be checked against history. Decisions can't: there is no record of

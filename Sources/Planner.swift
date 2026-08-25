@@ -48,6 +48,10 @@ struct ChipPlay: Identifiable {
     let gw: Int
     let gain: Double
     let forced: Bool        // played only because the window was about to close
+    /// Pencilled in rather than recommended: this is the best week available,
+    /// but it isn't a standout, so a better one may yet appear. Shown as a
+    /// plan, not as an instruction.
+    var provisional = false
 }
 
 struct GWPlan: Identifiable {
@@ -467,6 +471,32 @@ enum Planner {
         }
         let basePts = Dictionary(uniqueKeysWithValues: base.gws.map { ($0.gw, $0.projPts) })
 
+        /// Where to pencil a chip in when no week clears its bar.
+        ///
+        /// The old answer was nowhere: the chip was held, the season plan
+        /// showed nothing about it for months, and it eventually got forced out
+        /// three gameweeks before the deadline. Measured over three hundred
+        /// simulated seasons, holding chips to the deadline costs about
+        /// forty-six points against playing them at the best week available —
+        /// and with no double gameweeks in the fixture list, which is the normal
+        /// state until postponements create some, *no* week ever cleared a bar
+        /// set at 30% above typical. So all eight chips were being held, every
+        /// season, by design.
+        ///
+        /// Now the best week is always chosen. Below the bar it is marked
+        /// provisional and pushed off the current gameweek where possible, so
+        /// nothing is burned today on a week that is merely the least bad —
+        /// the plan re-runs every week, and a real opportunity still displaces
+        /// a pencilled-in one.
+        func pencil(_ candidates: [(gw: Int, gain: Double)], from: Int,
+                    clears: Bool) -> (gw: Int, gain: Double)? {
+            guard !candidates.isEmpty else { return nil }
+            let best = candidates.max { $0.gain < $1.gain }
+            guard !clears else { return best }
+            let later = candidates.filter { $0.gw > from }
+            return (later.max { $0.gain < $1.gain }) ?? best
+        }
+
         for meta in sortedMeta {
             // a transfer chip can't be played the week the plan is already
             // inventing a fresh squad
@@ -501,9 +531,13 @@ enum Planner {
                     if gp.captain.proj > bestGain { bestGain = gp.captain.proj; bestGw = gp.gw }
                 }
                 let capBar = max(bar, closing ? 0 : typical(capPts) * 1.30)
-                if let g = bestGw, bestGain >= capBar {
-                    actions[g] = .tripleCaptain
-                    plays.append(ChipPlay(chip: "3xc", gw: g, gain: max(bestGain, 0), forced: closing))
+                let clears = (bestGw != nil) && bestGain >= capBar
+                let cands = base.gws.filter { freeSet.contains($0.gw) }
+                    .map { (gw: $0.gw, gain: $0.captain.proj) }
+                if let pick = pencil(cands, from: from, clears: clears) {
+                    actions[pick.gw] = .tripleCaptain
+                    plays.append(ChipPlay(chip: "3xc", gw: pick.gw, gain: max(pick.gain, 0),
+                                          forced: closing, provisional: !clears))
                 } else {
                     heldChips.append("3xc")
                 }
@@ -518,9 +552,13 @@ enum Planner {
                     if benchPts > bestGain { bestGain = benchPts; bestGw = gp.gw }
                 }
                 let benchBar = max(bar, closing ? 0 : typical(benchWeeks) * 1.30)
-                if let g = bestGw, bestGain >= benchBar {
-                    actions[g] = .benchBoost
-                    plays.append(ChipPlay(chip: "bboost", gw: g, gain: max(bestGain, 0), forced: closing))
+                let clears = (bestGw != nil) && bestGain >= benchBar
+                let cands = base.gws.filter { freeSet.contains($0.gw) }
+                    .map { (gw: $0.gw, gain: $0.bench.reduce(0) { $0 + $1.proj }) }
+                if let pick = pencil(cands, from: from, clears: clears) {
+                    actions[pick.gw] = .benchBoost
+                    plays.append(ChipPlay(chip: "bboost", gw: pick.gw, gain: max(pick.gain, 0),
+                                          forced: closing, provisional: !clears))
                 } else {
                     heldChips.append("bboost")
                 }
@@ -530,8 +568,9 @@ enum Planner {
                 // in the window, hold it — doubles appear mid-season when
                 // postponed matches are rescheduled, and the plan re-runs on
                 // every refresh.
+                // A Free Hit is at its best in a double gameweek, but holding
+                // it for one that never comes is how the chip expires unused.
                 let dgwCands = free.filter { doubleGws.contains($0) }
-                if dgwCands.isEmpty && !closing { heldChips.append("freehit"); continue }
                 let searchGws = dgwCands.isEmpty ? free : dgwCands
                 let cands = searchGws
                     .map { g -> (Int, Double) in
@@ -551,10 +590,10 @@ enum Planner {
                     let gain = pts - (basePts[g] ?? 0)
                     if best == nil || gain > best!.gain { best = (g, pts, gain, sq) }
                 }
-                if let b = best, b.gain >= bar {
+                if let b = best, b.gain >= bar || dgwCands.isEmpty {
                     actions[b.gw] = .freeHit(squad: b.sq, pts: b.pts)
                     plays.append(ChipPlay(chip: "freehit", gw: b.gw, gain: max(b.gain, 0),
-                                          forced: closing))
+                                          forced: closing, provisional: b.gain < bar))
                 } else {
                     heldChips.append("freehit")
                 }
@@ -590,9 +629,14 @@ enum Planner {
                 let best = evals
                     .filter { $0.changes >= 3 }
                     .max { $0.gain != $1.gain ? $0.gain < $1.gain : $0.gw > $1.gw }
-                if let b = best, b.gain >= bar {
+                // Unlike the other three, a wildcard can be actively harmful:
+                // a rebuild judged worse than the free-transfer path it
+                // replaces. A chip that expires unused costs nothing, so there
+                // is no case for pencilling in a negative one.
+                if let b = best, b.gain > 0 || closing {
                     actions[b.gw] = .wildcard(b.squad)
-                    plays.append(ChipPlay(chip: "wildcard", gw: b.gw, gain: b.gain, forced: closing))
+                    plays.append(ChipPlay(chip: "wildcard", gw: b.gw, gain: b.gain,
+                                          forced: closing, provisional: b.gain < bar))
                 } else {
                     heldChips.append("wildcard")
                 }
